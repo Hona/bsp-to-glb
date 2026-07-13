@@ -1,0 +1,248 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - id: version
+        name: Match tag to Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must be vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          version="$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
+          if [[ -z "$version" || "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo package version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Format, test, and lint
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install required Rust components
+        run: rustup component add clippy rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run tests
+        run: cargo test --locked --release
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  linux-x64:
+    name: Build Linux x64
+    needs: [validate, quality]
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Set build provenance and timestamp
+        shell: bash
+        run: |
+          echo "BSP_TO_GLB_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Test release target
+        run: cargo test --locked --release --target "$TARGET"
+      - name: Build release target
+        run: cargo build --locked --release --target "$TARGET"
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="bsp-to-glb-${GITHUB_REF_NAME}-${TARGET}"
+          archive="${package}.tar.gz"
+          stage="dist/${package}"
+          mkdir -p "$stage"
+          install -m 0755 "target/${TARGET}/release/bsp-to-glb" "$stage/bsp-to-glb"
+          install -m 0644 README.md LICENSE CAPABILITIES.md "$stage/"
+          "$stage/bsp-to-glb" --version-json > "dist/${package}.build.json"
+          cp "dist/${package}.build.json" "$stage/build-metadata.json"
+          jq -e \
+            --arg version "${{ needs.validate.outputs.version }}" \
+            --arg target "$TARGET" \
+            --arg commit "$BSP_TO_GLB_GIT_SHA" \
+            '.version == $version and .target == $target and .profile == "release" and .sourceCommit == $commit' \
+            "dist/${package}.build.json" > /dev/null
+          tar \
+            --sort=name \
+            --mtime="@${SOURCE_DATE_EPOCH}" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C dist \
+            -cf - \
+            "$package" | gzip -n -9 > "dist/$archive"
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
+      - name: Upload transient release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux-x64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.build.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  windows-x64:
+    name: Build Windows x64
+    needs: [validate, quality]
+    runs-on: windows-2025
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Set build provenance and timestamp
+        shell: pwsh
+        run: |
+          "BSP_TO_GLB_GIT_SHA=$(git rev-parse HEAD)" >> $env:GITHUB_ENV
+          "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> $env:GITHUB_ENV
+      - name: Test release target
+        run: cargo test --locked --release --target $env:TARGET
+      - name: Build release target
+        run: cargo build --locked --release --target $env:TARGET
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "bsp-to-glb-$env:GITHUB_REF_NAME-$env:TARGET"
+          $archive = "$package.zip"
+          $dist = Join-Path $PWD "dist"
+          $stage = Join-Path $dist $package
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "target/$env:TARGET/release/bsp-to-glb.exe" $stage
+          Copy-Item README.md, LICENSE, CAPABILITIES.md $stage
+
+          $metadata = & "$stage/bsp-to-glb.exe" --version-json
+          if ($LASTEXITCODE -ne 0) { throw "version metadata command failed" }
+          $metadataPath = Join-Path $dist "$package.build.json"
+          [IO.File]::WriteAllText($metadataPath, "$metadata`n", [Text.UTF8Encoding]::new($false))
+          Copy-Item $metadataPath (Join-Path $stage "build-metadata.json")
+          $parsed = $metadata | ConvertFrom-Json
+          if (
+            $parsed.version -ne "${{ needs.validate.outputs.version }}" -or
+            $parsed.target -ne $env:TARGET -or
+            $parsed.profile -ne "release" -or
+            $parsed.sourceCommit -ne $env:BSP_TO_GLB_GIT_SHA
+          ) {
+            throw "built binary metadata does not match the release"
+          }
+
+          $timestamp = [DateTimeOffset]::FromUnixTimeSeconds(
+            [int64]$env:SOURCE_DATE_EPOCH
+          ).UtcDateTime
+          Get-ChildItem $stage -Recurse -Force | ForEach-Object {
+            $_.LastWriteTimeUtc = $timestamp
+          }
+          (Get-Item $stage).LastWriteTimeUtc = $timestamp
+
+          Push-Location $dist
+          try {
+            & 7z a -tzip -mx=9 -mtc=off -mta=off $archive $package
+            if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+          $archivePath = Join-Path $dist $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            "$archivePath.sha256",
+            "$hash  $archive`n",
+            [Text.Encoding]::ASCII
+          )
+      - name: Upload transient release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/*.build.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  release:
+    name: Publish GitHub release
+    needs: [validate, linux-x64, windows-x64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Download tested release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify and assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat release-assets/*.sha256 | LC_ALL=C sort -k2 > release-assets/SHA256SUMS
+          (cd release-assets && sha256sum --check SHA256SUMS)
+          rm release-assets/*.sha256
+          test "$(find release-assets -maxdepth 1 -name '*.build.json' | wc -l)" -eq 2
+          source_commit="$(git rev-parse HEAD)"
+          for metadata in release-assets/*.build.json; do
+            jq -e \
+              --arg version "${{ needs.validate.outputs.version }}" \
+              --arg commit "$source_commit" \
+              '.version == $version and .profile == "release" and .sourceCommit == $commit' \
+              "$metadata" > /dev/null
+          done
+          cp CAPABILITIES.md release-assets/CAPABILITIES.md
+      - name: Create release from existing tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/*.tar.gz \
+            release-assets/*.zip \
+            release-assets/*.build.json \
+            release-assets/SHA256SUMS \
+            release-assets/CAPABILITIES.md \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "bsp-to-glb ${{ needs.validate.outputs.version }}" \
+            --generate-notes \
+            --notes "Tested Windows x64 and Linux x64 binaries are attached. Verify archives against SHA256SUMS before extraction. CAPABILITIES.md and target-specific build JSON files describe this release."

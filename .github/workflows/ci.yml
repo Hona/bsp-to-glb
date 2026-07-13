@@ -4,14 +4,21 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          components: clippy,rustfmt
+          persist-credentials: false
+      - run: rustup component add clippy rustfmt
       - run: cargo fmt --check
-      - run: cargo test --release
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked --release
+      - run: cargo clippy --locked --all-targets -- -D warnings
