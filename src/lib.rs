@@ -3,6 +3,16 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 
+mod materials;
+
+pub use materials::{
+    EmbeddedResourceMetadata, ManifestResource, ManifestTexture, MaterialLimitations,
+    MaterialResolver, PakResource, PakResourceKind, ResolvedMaterialResource, ResourceProvenance,
+    SourceMaterialEntry, SourceMaterialManifest, UnresolvedAsset, UnsupportedMaterialFeatures,
+    VmtFeatures, VmtMaterial, VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
+    parse_vmt, read_bsp_pak_resources,
+};
+
 const LUMP_ENTITIES: usize = 0;
 const LUMP_PLANES: usize = 1;
 const LUMP_TEXDATA: usize = 2;
@@ -12,6 +22,7 @@ const LUMP_FACES: usize = 7;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
+const LUMP_PAKFILE: usize = 40;
 const LUMP_VERTNORMALS: usize = 30;
 const LUMP_VERTNORMALINDICES: usize = 31;
 const LUMP_PRIMITIVES: usize = 37;
@@ -54,12 +65,15 @@ pub struct ExportStats {
     pub compiled_normal_vertices: usize,
     pub compiled_normal_opposed_vertices: usize,
     pub initially_rendered_faces: usize,
+    pub embedded_material_resources: usize,
+    pub unresolved_material_assets: usize,
 }
 
 #[derive(Debug)]
 pub struct ExportResult {
     pub glb: Vec<u8>,
     pub stats: ExportStats,
+    pub material_manifest: SourceMaterialManifest,
 }
 
 #[derive(Clone, Copy)]
@@ -1044,6 +1058,14 @@ fn encode_glb(mut document: Value, mut binary: Vec<u8>) -> Result<Vec<u8>, Strin
 }
 
 pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportResult, String> {
+    export_bsp_with_material_resolver(data, lightmap_json, None)
+}
+
+pub fn export_bsp_with_material_resolver(
+    data: &[u8],
+    lightmap_json: Option<&[u8]>,
+    material_resolver: Option<&dyn MaterialResolver>,
+) -> Result<ExportResult, String> {
     let bsp = parse_bsp(data)?;
     let planes = parse_planes(&bsp.lumps[LUMP_PLANES])?;
     let vertices = parse_vec3_lump(&bsp.lumps[LUMP_VERTEXES], "vertex")?;
@@ -1077,6 +1099,9 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         &bsp.lumps[LUMP_TEXDATA_STRING_DATA],
         &bsp.lumps[LUMP_TEXDATA_STRING_TABLE],
     )?;
+    let embedded_resources = materials::parse_embedded_resources(&bsp.lumps[LUMP_PAKFILE])?;
+    let material_manifest =
+        build_source_material_manifest(&material_names, &embedded_resources, material_resolver)?;
     let models = parse_models(&bsp.lumps[LUMP_MODELS])?;
     let entities = parse_entities(&bsp.lumps[LUMP_ENTITIES])?;
     let lightmaps = lightmap_json.map(LightmapLookup::parse).transpose()?;
@@ -1150,17 +1175,38 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
 
     let materials: Vec<_> = material_names
         .iter()
-        .map(|name| {
-            json!({
+        .enumerate()
+        .map(|(index, name)| {
+            let metadata = material_manifest.materials[index].metadata.as_ref();
+            let mut material = json!({
                 "name": name,
-                "doubleSided": false,
+                "doubleSided": metadata.is_some_and(|item| item.features.no_cull),
                 "pbrMetallicRoughness": {
                     "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
                     "metallicFactor": 0.0,
                     "roughnessFactor": 1.0
                 },
-                "extras": { "sourceMaterial": name }
-            })
+                "extras": {
+                    "sourceMaterial": name,
+                    "sourceMaterialManifestIndex": index,
+                    "sourceShaderFamily": metadata.map(|item| item.shader.family.as_str()),
+                    "sourceAdditive": metadata.is_some_and(|item| item.features.additive),
+                    "unsupportedProxies": metadata
+                        .map(|item| item.unsupported.proxies.as_slice())
+                        .unwrap_or_default(),
+                    "unsupportedAnimatedMaterial": metadata
+                        .is_some_and(|item| item.unsupported.animated)
+                }
+            });
+            if metadata.is_some_and(|item| item.features.translucent || item.features.additive) {
+                material["alphaMode"] = json!("BLEND");
+            } else if let Some(features) = metadata.map(|item| &item.features)
+                && features.alpha_test
+            {
+                material["alphaMode"] = json!("MASK");
+                material["alphaCutoff"] = json!(features.alpha_test_reference.unwrap_or(0.5));
+            }
+            material
         })
         .collect();
     let mut arrays = GlbArrays {
@@ -1174,6 +1220,8 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         models: models.len(),
         materials: material_names.len(),
         displacement_faces: displacements.len(),
+        embedded_material_resources: material_manifest.embedded_resources.len(),
+        unresolved_material_assets: material_manifest.unresolved_assets.len(),
         ..ExportStats::default()
     };
 
@@ -1452,5 +1500,9 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         "accessors": arrays.accessors
     });
     let glb = encode_glb(document, arrays.binary)?;
-    Ok(ExportResult { glb, stats })
+    Ok(ExportResult {
+        glb,
+        stats,
+        material_manifest,
+    })
 }

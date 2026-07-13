@@ -25,6 +25,9 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - compiled face polygons and referenced primitive triangulation
 - compiled vertex normals
 - texture UVs and material names
+- versioned Source material manifests with PAK-first VMT/VTF provenance
+- VMT shader-family inputs and common render flags
+- bounded BSP PAK parsing for embedded VMT/VTF resources
 - lightmap UVs supplied by existing atlas metadata
 - hidden-but-preserved sky, trigger and disabled brush models
 - LZMA-compressed BSP lumps
@@ -33,10 +36,11 @@ Unsupported domains are detected or reported explicitly:
 
 - displacement geometry aborts export instead of being silently dropped
 - static and dynamic prop model assets
-- VTF pixels and VMT shader behavior
+- VTF pixel conversion and full shader execution
+- material proxies and animated materials (identified as metadata only)
 - collision brushes and physics meshes
 - PVS/leaf visibility data
-- overlays, particles and animated materials
+- overlays and particles
 
 Do not describe output as full Source parity until those domains are implemented and tested.
 
@@ -98,11 +102,32 @@ cargo build --release
 bsp-to-glb \
   --bsp path/to/compiled.bsp \
   --out path/to/map.glb \
-  --lightmaps path/to/lightmap_data.json
+  --lightmaps path/to/lightmap_data.json \
+  --material-manifest path/to/map.materials.json
 ```
 
 `--lightmaps` is optional. The current input format is produced by the tf2jump map pipeline and
 will be replaced by direct atlas generation as the exporter matures.
+
+`--material-manifest` is optional. It writes schema version 1 with the original BSP material name,
+canonical Source lookup paths, shader-family metadata, embedded resource inventory, per-resource
+provenance and unresolved assets. Embedded PAK resources always win over an external resolver.
+
+## Material Resolution
+
+The library exposes `MaterialResolver` and `export_bsp_with_material_resolver` for callers that can
+provide resources from an installation or another asset store. A resolver receives canonical paths
+such as `materials/brick/wall.vtf` and must return real bytes plus a stable provenance label. The
+exporter does not include a game-asset resolver and does not emit placeholder textures.
+
+VMT parsing currently records shader inputs for unlit, translucency, additive blending, alpha test,
+no-cull, base texture, bump/SSBump, detail, self-illumination, envmap and surface properties. VTF
+resources are inventoried and resolved, but their pixels are not converted. Proxies and animated
+materials are retained as explicit unsupported metadata rather than represented as glTF parity.
+
+PAK parsing only exposes `materials/**/*.vmt` and `materials/**/*.vtf`. It rejects traversal,
+case-insensitive duplicate paths, oversized entries and malformed ZIP data, and applies bounded
+entry and decompression limits.
 
 ## Verification
 

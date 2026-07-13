@@ -1,5 +1,11 @@
 use bsp_to_glb::export_bsp;
 use serde_json::{Value, json};
+use std::fs;
+use std::io::{Cursor, Write};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 
 const HEADER_SIZE: usize = 4 + 4 + 64 * 16 + 4;
 
@@ -174,6 +180,21 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         put_i32(&mut bsp, header + 4, lump.len() as i32);
     }
     bsp
+}
+
+fn append_pak(bsp: &mut Vec<u8>, entries: &[(&str, &[u8])]) {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (path, data) in entries {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(data).unwrap();
+    }
+    let pak = writer.finish().unwrap().into_inner();
+    let offset = bsp.len();
+    bsp.extend_from_slice(&pak);
+    let header = 8 + 40 * 16;
+    put_i32(bsp, header, offset as i32);
+    put_i32(bsp, header + 4, pak.len() as i32);
 }
 
 fn glb_json(glb: &[u8]) -> Value {
@@ -432,4 +453,93 @@ fn matches_three_decimal_lightmap_vertices_without_f32_quantization_loss() {
 
     let result = export_bsp(&bsp, Some(lightmaps.to_string().as_bytes())).unwrap();
     assert_eq!(result.stats.lightmapped_faces, 1);
+}
+
+#[test]
+fn exports_pak_backed_source_material_manifest_and_safe_gltf_flags() {
+    let mut bsp = synthetic_bsp(false);
+    append_pak(
+        &mut bsp,
+        &[
+            (
+                "materials/brick/test.vmt",
+                br#"LightmappedGeneric {
+                    "$basetexture" "brick/test_diffuse"
+                    "$translucent" 1
+                    "$nocull" 1
+                    "$selfillum" 1
+                    Proxies { Sine { resultVar "$alpha" } }
+                }"#,
+            ),
+            ("materials/brick/test_diffuse.vtf", b"synthetic-vtf"),
+        ],
+    );
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let manifest = serde_json::to_value(&result.material_manifest).unwrap();
+    let gltf = glb_json(&result.glb);
+
+    assert_eq!(manifest["schemaVersion"], 1);
+    assert_eq!(manifest["materials"][0]["name"], "brick/test");
+    assert_eq!(
+        manifest["materials"][0]["metadata"]["shader"]["family"],
+        "lightmappedGeneric"
+    );
+    assert_eq!(
+        manifest["materials"][0]["metadata"]["unsupported"]["proxies"][0],
+        "Sine"
+    );
+    assert_eq!(manifest["unresolvedAssets"].as_array().unwrap().len(), 0);
+    assert_eq!(gltf["materials"][0]["doubleSided"], true);
+    assert_eq!(gltf["materials"][0]["alphaMode"], "BLEND");
+    assert_eq!(
+        gltf["materials"][0]["extras"]["sourceMaterialManifestIndex"],
+        0
+    );
+    assert!(gltf["materials"][0].get("emissiveFactor").is_none());
+}
+
+#[test]
+fn cli_writes_requested_versioned_material_sidecar() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "bsp-to-glb-material-test-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let bsp_path = directory.join("fixture.bsp");
+    let glb_path = directory.join("fixture.glb");
+    let manifest_path = directory.join("fixture.materials.json");
+    fs::write(&bsp_path, synthetic_bsp(false)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
+        .args([
+            "--bsp",
+            bsp_path.to_str().unwrap(),
+            "--out",
+            glb_path.to_str().unwrap(),
+            "--material-manifest",
+            manifest_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest["schemaVersion"], 1);
+    assert_eq!(manifest["lookupPolicy"], "pakFirst");
+    assert_eq!(
+        manifest["unresolvedAssets"][0]["lookupPath"],
+        "materials/brick/test.vmt"
+    );
+    assert!(glb_path.is_file());
+
+    fs::remove_dir_all(directory).unwrap();
 }
