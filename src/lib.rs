@@ -31,13 +31,19 @@ const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
 const LUMP_LEAFFACES: usize = 16;
-const LUMP_PAKFILE: usize = 40;
+const LUMP_DISPINFO: usize = 26;
 const LUMP_VERTNORMALS: usize = 30;
 const LUMP_VERTNORMALINDICES: usize = 31;
+const LUMP_DISP_VERTS: usize = 33;
 const LUMP_GAME_LUMP: usize = 35;
 const LUMP_PRIMITIVES: usize = 37;
 const LUMP_PRIMVERTS: usize = 38;
 const LUMP_PRIMINDICES: usize = 39;
+const LUMP_PAKFILE: usize = 40;
+const LUMP_CUBEMAPS: usize = 42;
+const LUMP_OVERLAYS: usize = 45;
+const LUMP_DISP_TRIS: usize = 48;
+const LUMP_WATEROVERLAYS: usize = 50;
 const LUMP_TEXDATA_STRING_DATA: usize = 43;
 const LUMP_TEXDATA_STRING_TABLE: usize = 44;
 const LUMP_LIGHTING_HDR: usize = 53;
@@ -56,6 +62,15 @@ const LEAF_VERSION_0_SIZE: usize = 56;
 const LEAF_VERSION_1_SIZE: usize = 32;
 
 pub const VISIBILITY_SIDECAR_VERSION: u32 = 1;
+const DISPINFO_SIZE: usize = 176;
+const DISP_VERT_SIZE: usize = 20;
+const OVERLAY_SIZE: usize = 352;
+const WATER_OVERLAY_SIZE: usize = 1120;
+const CUBEMAP_SIZE: usize = 16;
+
+const MIN_DISP_POWER: i32 = 2;
+const MAX_DISP_POWER: i32 = 4;
+const DISPTRI_TAG_REMOVE: u16 = 1 << 5;
 
 const SURF_SKY2D: i32 = 0x0002;
 const SURF_SKY: i32 = 0x0004;
@@ -120,6 +135,39 @@ pub struct ExportStats {
     pub solid_static_props: usize,
     pub dynamic_props: usize,
     pub unresolved_prop_models: usize,
+    pub displacement_vertices: usize,
+    pub displacement_triangles: usize,
+    pub capabilities: CapabilityReport,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityReport {
+    pub displacements: FeatureCapability,
+    pub overlays: FeatureCapability,
+    pub water_overlays: FeatureCapability,
+    pub cubemaps: FeatureCapability,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureCapability {
+    pub present: bool,
+    pub count: Option<usize>,
+    pub lump_versions: BTreeMap<String, i32>,
+    pub status: CapabilityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilityStatus {
+    Exported,
+    #[default]
+    DetectedOnly,
+    UnsupportedVersion,
+    Malformed,
 }
 
 #[derive(Debug)]
@@ -411,6 +459,36 @@ struct BspPrimitive {
 }
 
 #[derive(Clone, Copy)]
+struct DispInfo {
+    start_position: [f32; 3],
+    first_vertex: usize,
+    first_triangle: usize,
+    power: i32,
+    contents: i32,
+    map_face: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DispVert {
+    vector: [f32; 3],
+    distance: f32,
+    alpha: f32,
+}
+
+struct DisplacementGeometry {
+    positions: Vec<[f32; 3]>,
+    flat_positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    triangles: Vec<[usize; 3]>,
+    alphas: Vec<f32>,
+    triangle_tags: Vec<u16>,
+    source_triangle_tags: Vec<u16>,
+    dispinfo_index: usize,
+    power: i32,
+    contents: i32,
+}
+
+#[derive(Clone, Copy)]
 struct Model {
     mins: [f32; 3],
     maxs: [f32; 3],
@@ -489,6 +567,12 @@ struct PrimitiveData {
     face_light_offsets: Vec<i32>,
     face_lightmap_mins: Vec<[i32; 2]>,
     face_lightmap_sizes: Vec<[i32; 2]>,
+    displacement_alphas: Vec<f32>,
+    dispinfo_indices: Vec<usize>,
+    displacement_powers: Vec<i32>,
+    displacement_contents: Vec<i32>,
+    displacement_triangle_tags: Vec<Vec<u16>>,
+    displacement_source_triangle_tags: Vec<Vec<u16>>,
     triangles: usize,
 }
 
@@ -749,6 +833,187 @@ fn parse_primitives(data: &[u8]) -> Result<Vec<BspPrimitive>, String> {
             })
         })
         .collect()
+}
+
+fn require_lump_version(version: i32, lump: &str, present: bool) -> Result<(), String> {
+    if present && version != 0 {
+        return Err(format!(
+            "unsupported {lump} lump version {version}; export aborted"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_dispinfos(data: &[u8], version: i32) -> Result<Vec<DispInfo>, String> {
+    require_lump_version(version, "DISPINFO", !data.is_empty())?;
+    if !data.len().is_multiple_of(DISPINFO_SIZE) {
+        return Err(format!(
+            "DISPINFO lump length {} is not divisible by {DISPINFO_SIZE}",
+            data.len()
+        ));
+    }
+    (0..data.len() / DISPINFO_SIZE)
+        .map(|index| {
+            let offset = index * DISPINFO_SIZE;
+            let first_vertex = read_i32(data, offset + 12, "DISPINFO")?;
+            let first_triangle = read_i32(data, offset + 16, "DISPINFO")?;
+            let power = read_i32(data, offset + 20, "DISPINFO")?;
+            if first_vertex < 0 || first_triangle < 0 {
+                return Err(format!(
+                    "DISPINFO {index} has a negative vertex or triangle start"
+                ));
+            }
+            if !(MIN_DISP_POWER..=MAX_DISP_POWER).contains(&power) {
+                return Err(format!(
+                    "DISPINFO {index} has unsupported displacement power {power}"
+                ));
+            }
+            Ok(DispInfo {
+                start_position: [
+                    read_f32(data, offset, "DISPINFO")?,
+                    read_f32(data, offset + 4, "DISPINFO")?,
+                    read_f32(data, offset + 8, "DISPINFO")?,
+                ],
+                first_vertex: first_vertex as usize,
+                first_triangle: first_triangle as usize,
+                power,
+                contents: read_i32(data, offset + 32, "DISPINFO")?,
+                map_face: read_u16(data, offset + 36, "DISPINFO")? as usize,
+            })
+        })
+        .collect()
+}
+
+fn parse_dispverts(data: &[u8], version: i32) -> Result<Vec<DispVert>, String> {
+    require_lump_version(version, "DISP_VERTS", !data.is_empty())?;
+    if !data.len().is_multiple_of(DISP_VERT_SIZE) {
+        return Err(format!(
+            "DISP_VERTS lump length {} is not divisible by {DISP_VERT_SIZE}",
+            data.len()
+        ));
+    }
+    (0..data.len() / DISP_VERT_SIZE)
+        .map(|index| {
+            let offset = index * DISP_VERT_SIZE;
+            Ok(DispVert {
+                vector: [
+                    read_f32(data, offset, "DISP_VERTS")?,
+                    read_f32(data, offset + 4, "DISP_VERTS")?,
+                    read_f32(data, offset + 8, "DISP_VERTS")?,
+                ],
+                distance: read_f32(data, offset + 12, "DISP_VERTS")?,
+                alpha: read_f32(data, offset + 16, "DISP_VERTS")?,
+            })
+        })
+        .collect()
+}
+
+fn parse_disptris(data: &[u8], version: i32) -> Result<Vec<u16>, String> {
+    require_lump_version(version, "DISP_TRIS", !data.is_empty())?;
+    parse_u16_lump(data, "DISP_TRIS")
+}
+
+fn feature_versions(entries: &[(&str, i32)]) -> BTreeMap<String, i32> {
+    entries
+        .iter()
+        .map(|(name, version)| ((*name).to_owned(), *version))
+        .collect()
+}
+
+fn metadata_capability(
+    data: &[u8],
+    version: i32,
+    lump_name: &str,
+    record_size: usize,
+    validate: impl Fn(&[u8], usize) -> Result<(), String>,
+) -> FeatureCapability {
+    let present = !data.is_empty();
+    let lump_versions = feature_versions(&[(lump_name, version)]);
+    if !present {
+        return FeatureCapability {
+            present,
+            count: Some(0),
+            lump_versions,
+            status: CapabilityStatus::DetectedOnly,
+            detail: None,
+        };
+    }
+    if version != 0 {
+        return FeatureCapability {
+            present,
+            count: None,
+            lump_versions,
+            status: CapabilityStatus::UnsupportedVersion,
+            detail: Some(format!("unsupported {lump_name} lump version {version}")),
+        };
+    }
+    if !data.len().is_multiple_of(record_size) {
+        return FeatureCapability {
+            present,
+            count: None,
+            lump_versions,
+            status: CapabilityStatus::Malformed,
+            detail: Some(format!(
+                "{lump_name} lump length {} is not divisible by {record_size}",
+                data.len()
+            )),
+        };
+    }
+    let count = data.len() / record_size;
+    for index in 0..count {
+        if let Err(detail) = validate(data, index * record_size) {
+            return FeatureCapability {
+                present,
+                count: Some(count),
+                lump_versions,
+                status: CapabilityStatus::Malformed,
+                detail: Some(format!("{lump_name} record {index}: {detail}")),
+            };
+        }
+    }
+    FeatureCapability {
+        present,
+        count: Some(count),
+        lump_versions,
+        status: CapabilityStatus::DetectedOnly,
+        detail: None,
+    }
+}
+
+fn overlay_capability(data: &[u8], version: i32, water: bool) -> FeatureCapability {
+    let (name, record_size, max_faces) = if water {
+        ("WATEROVERLAYS", WATER_OVERLAY_SIZE, 256_usize)
+    } else {
+        ("OVERLAYS", OVERLAY_SIZE, 64_usize)
+    };
+    metadata_capability(data, version, name, record_size, |record, offset| {
+        read_i32(record, offset, name)?;
+        read_i16(record, offset + 4, name)?;
+        let face_count = (read_u16(record, offset + 6, name)? & 0x3fff) as usize;
+        if face_count > max_faces {
+            return Err(format!("face count {face_count} exceeds {max_faces}"));
+        }
+        for face in 0..face_count {
+            read_i32(record, offset + 8 + face * 4, name)?;
+        }
+        let vectors_offset = offset + 8 + max_faces * 4;
+        for component in (vectors_offset..offset + record_size).step_by(4) {
+            read_f32(record, component, name)?;
+        }
+        Ok(())
+    })
+}
+
+fn cubemap_capability(data: &[u8], version: i32) -> FeatureCapability {
+    metadata_capability(data, version, "CUBEMAPS", CUBEMAP_SIZE, |record, offset| {
+        read_i32(record, offset, "CUBEMAPS")?;
+        read_i32(record, offset + 4, "CUBEMAPS")?;
+        read_i32(record, offset + 8, "CUBEMAPS")?;
+        record
+            .get(offset + 12)
+            .ok_or_else(|| "missing cubemap size".to_owned())?;
+        Ok(())
+    })
 }
 
 fn parse_models(data: &[u8]) -> Result<Vec<Model>, String> {
@@ -2308,6 +2573,206 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn scale(value: [f32; 3], factor: f32) -> [f32; 3] {
+    [value[0] * factor, value[1] * factor, value[2] * factor]
+}
+
+fn lerp(a: [f32; 3], b: [f32; 3], amount: f32) -> [f32; 3] {
+    add(a, scale(sub(b, a), amount))
+}
+
+fn normalized(value: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let length_squared = dot(value, value);
+    if length_squared <= 1e-20 {
+        return fallback;
+    }
+    scale(value, length_squared.sqrt().recip())
+}
+
+fn push_displacement_triangles(
+    bottom_left: [usize; 2],
+    top_right: [usize; 2],
+    power: i32,
+    side: usize,
+    output: &mut Vec<[usize; 3]>,
+) {
+    let midpoint = [
+        (bottom_left[0] + top_right[0]) / 2,
+        (bottom_left[1] + top_right[1]) / 2,
+    ];
+    if power == 1 {
+        let winding = [
+            [bottom_left[0], midpoint[1]],
+            bottom_left,
+            [midpoint[0], bottom_left[1]],
+            [top_right[0], bottom_left[1]],
+            [top_right[0], midpoint[1]],
+            top_right,
+            [midpoint[0], top_right[1]],
+            [bottom_left[0], top_right[1]],
+            [bottom_left[0], midpoint[1]],
+        ];
+        let index = |point: [usize; 2]| point[1] * side + point[0];
+        for edge in winding.windows(2) {
+            output.push([index(edge[1]), index(edge[0]), index(midpoint)]);
+        }
+        return;
+    }
+    for (child_min, child_max) in [
+        (bottom_left, midpoint),
+        ([midpoint[0], bottom_left[1]], [top_right[0], midpoint[1]]),
+        ([bottom_left[0], midpoint[1]], [midpoint[0], top_right[1]]),
+        (midpoint, top_right),
+    ] {
+        push_displacement_triangles(child_min, child_max, power - 1, side, output);
+    }
+}
+
+fn build_displacement_geometry(
+    face: Face,
+    face_index: usize,
+    base_positions: &[[f32; 3]],
+    outward_normal: [f32; 3],
+    dispinfos: &[DispInfo],
+    dispverts: &[DispVert],
+    disptris: &[u16],
+) -> Result<DisplacementGeometry, String> {
+    if base_positions.len() != 4 {
+        return Err(format!(
+            "displacement face {face_index} has {} edges instead of 4",
+            base_positions.len()
+        ));
+    }
+    let dispinfo_index = usize::try_from(face.dispinfo)
+        .map_err(|_| format!("face {face_index} has an invalid DISPINFO index"))?;
+    let info = dispinfos
+        .get(dispinfo_index)
+        .ok_or_else(|| format!("face {face_index} references missing DISPINFO {dispinfo_index}"))?;
+    if info.map_face != face_index {
+        return Err(format!(
+            "face {face_index} references DISPINFO {dispinfo_index}, whose parent face is {}",
+            info.map_face
+        ));
+    }
+
+    let side = (1_usize << info.power) + 1;
+    let vertex_count = side * side;
+    let triangle_count = (side - 1) * (side - 1) * 2;
+    let source_vertices = dispverts
+        .get(info.first_vertex..info.first_vertex + vertex_count)
+        .ok_or_else(|| format!("DISPINFO {dispinfo_index} DISP_VERTS range is out of bounds"))?;
+    let triangle_tags = disptris
+        .get(info.first_triangle..info.first_triangle + triangle_count)
+        .ok_or_else(|| format!("DISPINFO {dispinfo_index} DISP_TRIS range is out of bounds"))?
+        .to_vec();
+
+    let start = base_positions
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            dot(sub(**a, info.start_position), sub(**a, info.start_position)).total_cmp(&dot(
+                sub(**b, info.start_position),
+                sub(**b, info.start_position),
+            ))
+        })
+        .map(|(index, _)| index)
+        .unwrap();
+    let corners = [
+        base_positions[start],
+        base_positions[(start + 1) % 4],
+        base_positions[(start + 2) % 4],
+        base_positions[(start + 3) % 4],
+    ];
+    let denominator = (side - 1) as f32;
+    let mut flat_positions = Vec::with_capacity(vertex_count);
+    for row in 0..side {
+        let row_amount = row as f32 / denominator;
+        let left = lerp(corners[0], corners[1], row_amount);
+        let right = lerp(corners[3], corners[2], row_amount);
+        for column in 0..side {
+            flat_positions.push(lerp(left, right, column as f32 / denominator));
+        }
+    }
+    let positions: Vec<_> = flat_positions
+        .iter()
+        .zip(source_vertices)
+        .map(|(flat, vertex)| add(*flat, scale(vertex.vector, vertex.distance)))
+        .collect();
+    if positions
+        .iter()
+        .flatten()
+        .chain(source_vertices.iter().map(|vertex| &vertex.alpha))
+        .any(|value| !value.is_finite())
+    {
+        return Err(format!(
+            "DISPINFO {dispinfo_index} generated a non-finite vertex value"
+        ));
+    }
+
+    let mut all_triangles = Vec::with_capacity(triangle_count);
+    push_displacement_triangles(
+        [0, 0],
+        [side - 1, side - 1],
+        info.power,
+        side,
+        &mut all_triangles,
+    );
+    if all_triangles.len() != triangle_count {
+        return Err(format!(
+            "DISPINFO {dispinfo_index} generated {} triangles instead of {triangle_count}",
+            all_triangles.len()
+        ));
+    }
+
+    let outward_normal = normalized(outward_normal, [0.0, 0.0, 1.0]);
+    let mut normals = vec![[0.0; 3]; vertex_count];
+    for triangle in &mut all_triangles {
+        let mut normal = cross(
+            sub(positions[triangle[1]], positions[triangle[0]]),
+            sub(positions[triangle[2]], positions[triangle[0]]),
+        );
+        if dot(normal, outward_normal) < 0.0 {
+            triangle.swap(1, 2);
+            normal = scale(normal, -1.0);
+        }
+        normal = normalized(normal, outward_normal);
+        for index in triangle {
+            normals[*index] = add(normals[*index], normal);
+        }
+    }
+    for normal in &mut normals {
+        *normal = normalized(*normal, outward_normal);
+    }
+    let triangles = all_triangles
+        .iter()
+        .copied()
+        .zip(&triangle_tags)
+        .filter_map(|(triangle, tags)| (tags & DISPTRI_TAG_REMOVE == 0).then_some(triangle))
+        .collect();
+    let exported_triangle_tags = triangle_tags
+        .iter()
+        .copied()
+        .filter(|tags| tags & DISPTRI_TAG_REMOVE == 0)
+        .collect();
+
+    Ok(DisplacementGeometry {
+        positions,
+        flat_positions,
+        normals,
+        triangles,
+        alphas: source_vertices.iter().map(|vertex| vertex.alpha).collect(),
+        triangle_tags: exported_triangle_tags,
+        source_triangle_tags: triangle_tags,
+        dispinfo_index,
+        power: info.power,
+        contents: info.contents,
+    })
+}
+
 fn pad4(data: &mut Vec<u8>, byte: u8) {
     while !data.len().is_multiple_of(4) {
         data.push(byte);
@@ -2362,11 +2827,17 @@ impl GlbArrays {
         }));
         let (min, max) = min_max(values, width);
         let accessor = self.accessors.len();
+        let accessor_type = match width {
+            1 => "SCALAR",
+            2 => "VEC2",
+            3 => "VEC3",
+            _ => unreachable!("unsupported accessor width"),
+        };
         self.accessors.push(json!({
             "bufferView": view,
             "componentType": 5126,
             "count": values.len() / width,
-            "type": if width == 3 { "VEC3" } else { "VEC2" },
+            "type": accessor_type,
             "min": min,
             "max": max
         }));
@@ -2494,6 +2965,18 @@ fn export_bsp_internal(
     let primitives = parse_primitives(&bsp.lumps[LUMP_PRIMITIVES])?;
     let primitive_vertices = parse_vec3_lump(&bsp.lumps[LUMP_PRIMVERTS], "primitive vertex")?;
     let primitive_indices = parse_u16_lump(&bsp.lumps[LUMP_PRIMINDICES], "primitive index")?;
+    let dispinfos = parse_dispinfos(&bsp.lumps[LUMP_DISPINFO], bsp.lump_versions[LUMP_DISPINFO])?;
+    let dispverts = parse_dispverts(
+        &bsp.lumps[LUMP_DISP_VERTS],
+        bsp.lump_versions[LUMP_DISP_VERTS],
+    )?;
+    let disptris = parse_disptris(
+        &bsp.lumps[LUMP_DISP_TRIS],
+        bsp.lump_versions[LUMP_DISP_TRIS],
+    )?;
+    if dispinfos.is_empty() && (!dispverts.is_empty() || !disptris.is_empty()) {
+        return Err("BSP has DISP_VERTS or DISP_TRIS without DISPINFO records".to_owned());
+    }
     let faces = parse_faces(&bsp.lumps[selected_lightmaps.faces])?;
     let mut normal_index_cursor = 0;
     let face_normal_starts: Vec<_> = faces
@@ -2520,6 +3003,30 @@ fn export_bsp_internal(
     let external_lightmaps = lightmap_json
         .map(ExternalLightmapLookup::parse)
         .transpose()?;
+    let capabilities = CapabilityReport {
+        displacements: FeatureCapability {
+            present: !dispinfos.is_empty(),
+            count: Some(dispinfos.len()),
+            lump_versions: feature_versions(&[
+                ("DISPINFO", bsp.lump_versions[LUMP_DISPINFO]),
+                ("DISP_VERTS", bsp.lump_versions[LUMP_DISP_VERTS]),
+                ("DISP_TRIS", bsp.lump_versions[LUMP_DISP_TRIS]),
+            ]),
+            status: CapabilityStatus::Exported,
+            detail: None,
+        },
+        overlays: overlay_capability(
+            &bsp.lumps[LUMP_OVERLAYS],
+            bsp.lump_versions[LUMP_OVERLAYS],
+            false,
+        ),
+        water_overlays: overlay_capability(
+            &bsp.lumps[LUMP_WATEROVERLAYS],
+            bsp.lump_versions[LUMP_WATEROVERLAYS],
+            true,
+        ),
+        cubemaps: cubemap_capability(&bsp.lumps[LUMP_CUBEMAPS], bsp.lump_versions[LUMP_CUBEMAPS]),
+    };
 
     if models.is_empty() {
         return Err("BSP contains no brush models".to_owned());
@@ -2553,16 +3060,25 @@ fn export_bsp_internal(
             (face_owner[index].is_some() && face.dispinfo >= 0).then_some(index)
         })
         .collect();
-    if !displacements.is_empty() {
-        let samples = displacements
-            .iter()
-            .take(8)
-            .map(|index| format!("face {index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+    let mut dispinfo_owners = vec![None; dispinfos.len()];
+    for face_index in &displacements {
+        let dispinfo_index = faces[*face_index].dispinfo as usize;
+        let owner = dispinfo_owners.get_mut(dispinfo_index).ok_or_else(|| {
+            format!("face {face_index} references missing DISPINFO {dispinfo_index}")
+        })?;
+        if let Some(other_face) = owner.replace(*face_index) {
+            return Err(format!(
+                "DISPINFO {dispinfo_index} is referenced by faces {other_face} and {face_index}"
+            ));
+        }
+    }
+    if let Some((dispinfo_index, _)) = dispinfo_owners
+        .iter()
+        .enumerate()
+        .find(|(_, owner)| owner.is_none())
+    {
         return Err(format!(
-            "unsupported displacement geometry detected on {} face(s): {samples}; export aborted without dropping geometry",
-            displacements.len()
+            "DISPINFO {dispinfo_index} has no parent face in a brush model"
         ));
     }
     let direct_lightmaps = extract_lightmaps(
@@ -2714,6 +3230,7 @@ fn export_bsp_internal(
             .unwrap_or(0),
         dynamic_props: dynamic_props.len(),
         unresolved_prop_models: model_assets.len(),
+        capabilities,
         ..ExportStats::default()
     };
 
@@ -2743,7 +3260,8 @@ fn export_bsp_internal(
             entity.and_then(|item| entity_property(item, "angles")),
             [0.0; 3],
         );
-        let mut groups: BTreeMap<(usize, bool, bool, bool, i32), PrimitiveData> = BTreeMap::new();
+        let mut groups: BTreeMap<(usize, bool, bool, bool, i32, bool), PrimitiveData> =
+            BTreeMap::new();
         let start = model.first_face as usize;
         let end = start + model.num_faces as usize;
         for (face_index, face) in faces.iter().copied().enumerate().take(end).skip(start) {
@@ -2760,42 +3278,7 @@ fn export_bsp_internal(
             if texture.width <= 0 || texture.height <= 0 {
                 return Err(format!("face {face_index} has invalid texture dimensions"));
             }
-            let source_positions = face_positions(face, &surfedges, &edges, &vertices, face_index)?;
-            let direct_mapping = direct_lightmaps
-                .as_ref()
-                .and_then(|extracted| extracted.by_face.get(&face_index).copied());
-            let compiled_lightmap = face.light_offset >= 0
-                && face.styles[0] != 255
-                && face.lightmap_size[0] >= 0
-                && face.lightmap_size[1] >= 0
-                && texinfo.flags & (SURF_SKY | SURF_NODRAW | SURF_NOLIGHT) == 0;
-            let external_mapping = (direct_mapping.is_none() && compiled_lightmap)
-                .then(|| {
-                    external_lightmaps
-                        .as_ref()
-                        .and_then(|lookup| lookup.find(face_index, &source_positions, texinfo))
-                })
-                .flatten();
-            let has_lightmap = direct_mapping.is_some() || external_mapping.is_some();
-            let surface_rendered = texinfo.flags & NON_RENDERED_SURFACE_FLAGS == 0;
-            let (mut triangles, compiled_triangulation) = face_triangle_indices(
-                face,
-                &primitives,
-                &primitive_vertices,
-                &primitive_indices,
-                source_positions.len(),
-                face_index,
-            )?;
-            let primitive = groups
-                .entry((
-                    material_index,
-                    has_lightmap,
-                    surface_rendered,
-                    compiled_triangulation,
-                    texinfo.flags,
-                ))
-                .or_default();
-            let base_vertex = (primitive.positions.len() / 3) as u32;
+            let base_positions = face_positions(face, &surfedges, &edges, &vertices, face_index)?;
             let plane_normal = planes
                 .get(face.plane)
                 .ok_or_else(|| {
@@ -2807,14 +3290,90 @@ fn export_bsp_internal(
             } else {
                 plane_normal
             };
-            let (source_normals, has_compiled_normals) = face_normals(
-                face,
-                face_normal_starts[face_index],
-                &vertex_normal_indices,
-                &vertex_normals,
-                outward_normal,
-                face_index,
-            )?;
+            let displacement = (face.dispinfo >= 0)
+                .then(|| {
+                    build_displacement_geometry(
+                        face,
+                        face_index,
+                        &base_positions,
+                        outward_normal,
+                        &dispinfos,
+                        &dispverts,
+                        &disptris,
+                    )
+                })
+                .transpose()?;
+            let is_displacement = displacement.is_some();
+            let compiled_lightmap = face.light_offset >= 0
+                && face.styles[0] != 255
+                && face.lightmap_size[0] >= 0
+                && face.lightmap_size[1] >= 0
+                && texinfo.flags & (SURF_SKY | SURF_NODRAW | SURF_NOLIGHT) == 0;
+            let direct_mapping = direct_lightmaps
+                .as_ref()
+                .and_then(|extracted| extracted.by_face.get(&face_index).copied());
+            let external_mapping = (direct_mapping.is_none() && compiled_lightmap)
+                .then(|| {
+                    external_lightmaps
+                        .as_ref()
+                        .and_then(|lookup| lookup.find(face_index, &base_positions, texinfo))
+                })
+                .flatten();
+            let has_lightmap = direct_mapping.is_some() || external_mapping.is_some();
+            let surface_rendered = texinfo.flags & NON_RENDERED_SURFACE_FLAGS == 0;
+            let (
+                source_positions,
+                uv_positions,
+                source_normals,
+                mut triangles,
+                compiled_triangulation,
+                has_compiled_normals,
+            ) = if let Some(geometry) = &displacement {
+                (
+                    geometry.positions.clone(),
+                    geometry.flat_positions.clone(),
+                    geometry.normals.clone(),
+                    geometry.triangles.clone(),
+                    false,
+                    false,
+                )
+            } else {
+                let (triangles, compiled_triangulation) = face_triangle_indices(
+                    face,
+                    &primitives,
+                    &primitive_vertices,
+                    &primitive_indices,
+                    base_positions.len(),
+                    face_index,
+                )?;
+                let (source_normals, has_compiled_normals) = face_normals(
+                    face,
+                    face_normal_starts[face_index],
+                    &vertex_normal_indices,
+                    &vertex_normals,
+                    outward_normal,
+                    face_index,
+                )?;
+                (
+                    base_positions.clone(),
+                    base_positions,
+                    source_normals,
+                    triangles,
+                    compiled_triangulation,
+                    has_compiled_normals,
+                )
+            };
+            let primitive = groups
+                .entry((
+                    material_index,
+                    has_lightmap,
+                    surface_rendered,
+                    compiled_triangulation,
+                    texinfo.flags,
+                    is_displacement,
+                ))
+                .or_default();
+            let base_vertex = (primitive.positions.len() / 3) as u32;
             let summed_normal = source_normals.iter().fold([0.0; 3], |sum, normal| {
                 [sum[0] + normal[0], sum[1] + normal[1], sum[2] + normal[2]]
             });
@@ -2828,8 +3387,9 @@ fn export_bsp_internal(
                 .copied()
                 .map(source_to_gltf)
                 .collect();
-            for ((source, gltf), source_normal) in source_positions
+            for (((_source, uv_source), gltf), source_normal) in source_positions
                 .iter()
+                .zip(&uv_positions)
                 .zip(&gltf_positions)
                 .zip(&source_normals)
             {
@@ -2839,17 +3399,17 @@ fn export_bsp_internal(
                     .extend_from_slice(&source_to_gltf(*source_normal));
                 primitive
                     .uv0
-                    .push(dot4(texinfo.texture_vecs[0], *source) / texture.width as f32);
+                    .push(dot4(texinfo.texture_vecs[0], *uv_source) / texture.width as f32);
                 primitive
                     .uv0
-                    .push(dot4(texinfo.texture_vecs[1], *source) / texture.height as f32);
+                    .push(dot4(texinfo.texture_vecs[1], *uv_source) / texture.height as f32);
                 if let (Some(extracted), Some(placement)) = (&direct_lightmaps, direct_mapping) {
                     primitive.uv1.extend_from_slice(&lightmap_uv(
                         placement,
                         &extracted.artifacts.flat,
                         face,
                         texinfo,
-                        *source,
+                        *uv_source,
                         face_index,
                     )?);
                 } else if let (Some(lookup), Some(mapping_index)) =
@@ -2857,8 +3417,22 @@ fn export_bsp_internal(
                 {
                     primitive
                         .uv1
-                        .extend_from_slice(&lookup.uv(mapping_index, *source));
+                        .extend_from_slice(&lookup.uv(mapping_index, *uv_source));
                 }
+            }
+            if let Some(geometry) = &displacement {
+                primitive
+                    .displacement_alphas
+                    .extend_from_slice(&geometry.alphas);
+                primitive.dispinfo_indices.push(geometry.dispinfo_index);
+                primitive.displacement_powers.push(geometry.power);
+                primitive.displacement_contents.push(geometry.contents);
+                primitive
+                    .displacement_triangle_tags
+                    .push(geometry.triangle_tags.clone());
+                primitive
+                    .displacement_source_triangle_tags
+                    .push(geometry.source_triangle_tags.clone());
             }
             for triangle in &mut triangles {
                 let a = gltf_positions[triangle[0]];
@@ -2889,8 +3463,12 @@ fn export_bsp_internal(
             }
             if compiled_triangulation {
                 stats.compiled_primitive_faces += 1;
-            } else {
+            } else if !is_displacement {
                 stats.fan_faces += 1;
+            }
+            if is_displacement {
+                stats.displacement_vertices += source_positions.len();
+                stats.displacement_triangles += triangles.len();
             }
             if has_compiled_normals {
                 stats.compiled_normal_vertices += source_positions.len();
@@ -2906,7 +3484,14 @@ fn export_bsp_internal(
 
         let mut primitives_json = Vec::new();
         for (
-            (material_index, has_lightmap, surface_rendered, compiled_triangulation, surface_flags),
+            (
+                material_index,
+                has_lightmap,
+                surface_rendered,
+                compiled_triangulation,
+                surface_flags,
+                is_displacement,
+            ),
             primitive,
         ) in groups
         {
@@ -2923,6 +3508,10 @@ fn export_bsp_internal(
             if has_lightmap {
                 let uv1 = arrays.add_f32(&primitive.uv1, 2, 34962);
                 attributes.insert("TEXCOORD_1".to_owned(), json!(uv1));
+            }
+            if is_displacement {
+                let alpha = arrays.add_f32(&primitive.displacement_alphas, 1, 34962);
+                attributes.insert("_DISPLACEMENT_ALPHA".to_owned(), json!(alpha));
             }
             let indices = arrays.add_indices(&primitive.indices);
             let visibility_chunk_index = visibility
@@ -2949,8 +3538,23 @@ fn export_bsp_internal(
                 "surfaceFlags": surface_flags,
                 "surfaceInitiallyRendered": surface_rendered,
                 "initiallyRendered": entity_rendered && surface_rendered,
-                "triangulation": if compiled_triangulation { "compiled" } else { "fan" }
+                "triangulation": if is_displacement {
+                    "displacement"
+                } else if compiled_triangulation {
+                    "compiled"
+                } else {
+                    "fan"
+                }
             });
+            if is_displacement {
+                extras["bspDispInfoIndices"] = json!(primitive.dispinfo_indices);
+                extras["bspDisplacementPowers"] = json!(primitive.displacement_powers);
+                extras["bspDisplacementContents"] = json!(primitive.displacement_contents);
+                extras["bspDisplacementTriangleTags"] = json!(primitive.displacement_triangle_tags);
+                extras["bspDisplacementSourceTriangleTags"] =
+                    json!(primitive.displacement_source_triangle_tags);
+                extras["geometry"] = json!("displacement");
+            }
             if let Some(chunk_index) = visibility_chunk_index {
                 extras["visibilityChunkIndex"] = json!(chunk_index);
             }

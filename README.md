@@ -26,6 +26,8 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - dynamic prop entity references and ordered key/value state metadata
 - compiled face polygons and referenced primitive triangulation
 - compiled vertex normals
+- compiled displacement grids, vector distances, alpha and triangle tags
+- generated displacement normals and Source displacement triangulation
 - texture UVs and material names
 - versioned Source material manifests with PAK-first VMT/VTF provenance
 - VMT shader-family inputs and common render flags
@@ -43,13 +45,14 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 
 Unsupported domains are detected or reported explicitly:
 
-- displacement geometry aborts export instead of being silently dropped
 - multi-style lightmaps abort export instead of being silently flattened
 - static and dynamic prop MDL geometry resolution
 - VTF pixel conversion and full shader execution
 - material proxies and animated materials (identified as metadata only)
 - decoded VPhysics collision meshes
-- overlays and particles
+- overlays and water overlays (presence and lump versions are reported, geometry is not exported)
+- cubemap samples (presence and lump versions are reported, textures are not exported)
+- particles
 
 Do not describe output as full Source parity until those domains are implemented and tested.
 
@@ -193,6 +196,10 @@ entry `n` occupies `indices[offsets[n]..offsets[n + 1]]`. World-face memberships
 from `LEAFFACES`; bounds are not sampled. Chunks for non-world brush models have `staticPvs=false`
 and remain runtime-controlled rather than being culled by the static world PVS.
 
+The CLI statistics include a `capabilities` object. Displacements report `exported`; overlays,
+water overlays and cubemaps report `detectedOnly`. Unknown optional-feature lump versions report
+`unsupportedVersion` rather than implying support.
+
 ## Verification
 
 ```bash
@@ -229,14 +236,14 @@ The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529
 
 - Compiled BSP is the authority for render geometry and model boundaries.
 - Named brush entities are never flattened into worldspawn.
-- Unsupported geometry fails closed.
+- Unsupported geometry and displacement lump versions fail closed.
 - Render, collision and visibility data remain separate domains.
 - Accuracy claims are scoped and machine-verifiable.
 - No game assets or proprietary source excerpts are included.
 
 ## Roadmap
 
-1. Displacements and overlays
+1. Overlay projection and clipping
 2. Direct lightmap atlas generation, including directional bump channels (implemented for
    single-style brush faces)
 3. Static prop game lumps and reusable model references (metadata implemented; MDL resolution pending)
