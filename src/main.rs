@@ -5,13 +5,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> --out <map.glb> [--lightmaps <lightmap_data.json>]"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> --out <map.glb> [--lightmaps <lightmap_data.json>] [--props-out <props.json>]"
 }
 
 fn run() -> Result<(), String> {
     let mut bsp_path: Option<PathBuf> = None;
     let mut output_path: Option<PathBuf> = None;
     let mut lightmap_path: Option<PathBuf> = None;
+    let mut props_output_path: Option<PathBuf> = None;
     let args: Vec<_> = env::args_os().skip(1).collect();
     let mut index = 0;
     while index < args.len() {
@@ -23,6 +24,7 @@ fn run() -> Result<(), String> {
             "--bsp" => bsp_path = Some(value.into()),
             "--out" => output_path = Some(value.into()),
             "--lightmaps" => lightmap_path = Some(value.into()),
+            "--props-out" => props_output_path = Some(value.into()),
             _ => return Err(format!("unknown argument: {flag}\n{}", usage())),
         }
         index += 2;
@@ -44,6 +46,16 @@ fn run() -> Result<(), String> {
     }
     fs::write(&output_path, &result.glb)
         .map_err(|error| format!("failed to write {}: {error}", output_path.display()))?;
+    if let Some(props_output_path) = props_output_path {
+        if let Some(parent) = props_output_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        }
+        let props = serde_json::to_vec_pretty(&result.props)
+            .map_err(|error| format!("failed to serialize prop metadata: {error}"))?;
+        fs::write(&props_output_path, props)
+            .map_err(|error| format!("failed to write {}: {error}", props_output_path.display()))?;
+    }
     println!(
         "{}",
         serde_json::to_string(&result.stats)

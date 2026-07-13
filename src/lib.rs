@@ -14,6 +14,7 @@ const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
 const LUMP_VERTNORMALS: usize = 30;
 const LUMP_VERTNORMALINDICES: usize = 31;
+const LUMP_GAME_LUMP: usize = 35;
 const LUMP_PRIMITIVES: usize = 37;
 const LUMP_PRIMVERTS: usize = 38;
 const LUMP_PRIMINDICES: usize = 39;
@@ -26,6 +27,10 @@ const TEXINFO_SIZE: usize = 72;
 const TEXDATA_SIZE: usize = 32;
 const MODEL_SIZE: usize = 48;
 const PRIMITIVE_SIZE: usize = 10;
+const GAME_LUMP_HEADER_SIZE: usize = 16;
+const STATIC_PROP_NAME_LENGTH: usize = 128;
+const STATIC_PROP_GAME_LUMP_ID: u32 = 0x7370_7270;
+const GAME_LUMP_COMPRESSED: u16 = 0x0001;
 
 const SURF_SKY2D: i32 = 0x0002;
 const SURF_SKY: i32 = 0x0004;
@@ -54,12 +59,18 @@ pub struct ExportStats {
     pub compiled_normal_vertices: usize,
     pub compiled_normal_opposed_vertices: usize,
     pub initially_rendered_faces: usize,
+    pub static_prop_models: usize,
+    pub static_props: usize,
+    pub solid_static_props: usize,
+    pub dynamic_props: usize,
+    pub unresolved_prop_models: usize,
 }
 
 #[derive(Debug)]
 pub struct ExportResult {
     pub glb: Vec<u8>,
     pub stats: ExportStats,
+    pub props: Value,
 }
 
 #[derive(Clone, Copy)]
@@ -71,7 +82,58 @@ struct LumpHeader {
 
 struct Bsp {
     version: i32,
+    headers: Vec<LumpHeader>,
     lumps: Vec<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct EntityProperty {
+    key: String,
+    value: String,
+}
+
+type Entity = Vec<EntityProperty>;
+
+struct GameLumpEntry {
+    id: u32,
+    flags: u16,
+    version: u16,
+    offset: usize,
+    length: usize,
+}
+
+struct StaticPropGameLump {
+    version: u16,
+    layout: &'static str,
+    dictionary: Vec<String>,
+    leaves: Vec<u16>,
+    instances: Vec<StaticPropInstance>,
+}
+
+struct StaticPropInstance {
+    origin: [f32; 3],
+    angles: [f32; 3],
+    dictionary_index: u16,
+    first_leaf: u16,
+    leaf_count: u16,
+    solidity: u8,
+    flags: u32,
+    skin: i32,
+    fade_min_distance: f32,
+    fade_max_distance: f32,
+    lighting_origin: [f32; 3],
+    forced_fade_scale: Option<f32>,
+    min_dx_level: Option<u16>,
+    max_dx_level: Option<u16>,
+    min_cpu_level: Option<u8>,
+    max_cpu_level: Option<u8>,
+    min_gpu_level: Option<u8>,
+    max_gpu_level: Option<u8>,
+    diffuse_modulation: Option<[u8; 4]>,
+    disable_x360: Option<bool>,
+    flags_ex: Option<u32>,
+    lightmap_resolution: Option<[u16; 2]>,
+    uniform_scale: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -207,6 +269,44 @@ fn read_f32(data: &[u8], offset: usize, context: &str) -> Result<f32, String> {
     Ok(f32::from_bits(read_u32(data, offset, context)?))
 }
 
+fn read_vec3(data: &[u8], offset: usize, context: &str) -> Result<[f32; 3], String> {
+    Ok([
+        read_f32(data, offset, context)?,
+        read_f32(data, offset + 4, context)?,
+        read_f32(data, offset + 8, context)?,
+    ])
+}
+
+fn decompress_source_lzma(data: &[u8], expected: usize, context: &str) -> Result<Vec<u8>, String> {
+    if data.get(0..4) != Some(b"LZMA") || data.len() < 17 {
+        return Err(format!("{context} has a truncated or missing LZMA header"));
+    }
+    let header_expected = read_u32(data, 4, "LZMA size")? as usize;
+    let compressed = read_u32(data, 8, "LZMA size")? as usize;
+    if header_expected != expected {
+        return Err(format!(
+            "{context} LZMA size mismatch: header declares {header_expected}, expected {expected}"
+        ));
+    }
+    let compressed_data = data
+        .get(17..17 + compressed)
+        .ok_or_else(|| format!("{context} LZMA payload is truncated"))?;
+    let mut alone = Vec::with_capacity(13 + compressed);
+    alone.extend_from_slice(&data[12..17]);
+    alone.extend_from_slice(&(expected as u64).to_le_bytes());
+    alone.extend_from_slice(compressed_data);
+    let mut output = Vec::with_capacity(expected);
+    lzma_rs::lzma_decompress(&mut Cursor::new(alone), &mut output)
+        .map_err(|error| format!("failed to decompress {context}: {error}"))?;
+    if output.len() != expected {
+        return Err(format!(
+            "{context} size mismatch: decoded {}, expected {expected}",
+            output.len()
+        ));
+    }
+    Ok(output)
+}
+
 fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
     if data.len() < 1036 || data.get(0..4) != Some(b"VBSP") {
         return Err("input is not a complete Valve BSP file".to_owned());
@@ -242,37 +342,27 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
             .get(header.offset..end)
             .ok_or_else(|| format!("lump {index} extends past the BSP file"))?;
         if raw.get(0..4) == Some(b"LZMA") {
-            if raw.len() < 17 {
-                return Err(format!(
-                    "compressed lump {index} has a truncated LZMA header"
-                ));
-            }
             let expected = read_u32(raw, 4, "LZMA size")? as usize;
-            let compressed = read_u32(raw, 8, "LZMA size")? as usize;
-            let compressed_data = raw
-                .get(17..17 + compressed)
-                .ok_or_else(|| format!("compressed lump {index} is truncated"))?;
-            let mut alone = Vec::with_capacity(13 + compressed);
-            alone.extend_from_slice(&raw[12..17]);
-            alone.extend_from_slice(&(expected as u64).to_le_bytes());
-            alone.extend_from_slice(compressed_data);
-            let mut output = Vec::with_capacity(expected);
-            lzma_rs::lzma_decompress(&mut Cursor::new(alone), &mut output)
-                .map_err(|error| format!("failed to decompress lump {index}: {error}"))?;
-            if output.len() != expected
-                || (header.uncompressed_size != 0 && output.len() != header.uncompressed_size)
-            {
+            if header.uncompressed_size != 0 && expected != header.uncompressed_size {
                 return Err(format!(
-                    "compressed lump {index} size mismatch: decoded {}, expected {expected}",
-                    output.len()
+                    "compressed lump {index} size mismatch: LZMA header declares {expected}, lump table declares {}",
+                    header.uncompressed_size
                 ));
             }
-            lumps.push(output);
+            lumps.push(decompress_source_lzma(
+                raw,
+                expected,
+                &format!("lump {index}"),
+            )?);
         } else {
             lumps.push(raw.to_vec());
         }
     }
-    Ok(Bsp { version, lumps })
+    Ok(Bsp {
+        version,
+        headers,
+        lumps,
+    })
 }
 
 fn parse_vec3_lump(data: &[u8], label: &str) -> Result<Vec<[f32; 3]>, String> {
@@ -544,7 +634,7 @@ fn tokenize_entities(text: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
-fn parse_entities(data: &[u8]) -> Result<Vec<HashMap<String, String>>, String> {
+fn parse_entities(data: &[u8]) -> Result<Vec<Entity>, String> {
     let text = String::from_utf8_lossy(data);
     let tokens = tokenize_entities(&text)?;
     let mut entities = Vec::new();
@@ -554,7 +644,7 @@ fn parse_entities(data: &[u8]) -> Result<Vec<HashMap<String, String>>, String> {
             return Err(format!("expected entity opening brace at token {index}"));
         }
         index += 1;
-        let mut entity = HashMap::new();
+        let mut entity = Vec::new();
         while index < tokens.len() && tokens[index] != "}" {
             let key = tokens[index].clone();
             let value = tokens
@@ -564,7 +654,7 @@ fn parse_entities(data: &[u8]) -> Result<Vec<HashMap<String, String>>, String> {
             if value == "{" || value == "}" {
                 return Err("entity key has an invalid value".to_owned());
             }
-            entity.insert(key, value);
+            entity.push(EntityProperty { key, value });
             index += 2;
         }
         if tokens.get(index).map(String::as_str) != Some("}") {
@@ -574,6 +664,336 @@ fn parse_entities(data: &[u8]) -> Result<Vec<HashMap<String, String>>, String> {
         entities.push(entity);
     }
     Ok(entities)
+}
+
+fn parse_game_lump_entries(bsp: &Bsp) -> Result<Vec<GameLumpEntry>, String> {
+    let data = &bsp.lumps[LUMP_GAME_LUMP];
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let count = read_i32(data, 0, "GAME_LUMP count")?;
+    if count < 0 {
+        return Err("GAME_LUMP has a negative child-lump count".to_owned());
+    }
+    let count = count as usize;
+    let table_length = count
+        .checked_mul(GAME_LUMP_HEADER_SIZE)
+        .and_then(|length| length.checked_add(4))
+        .ok_or_else(|| "GAME_LUMP child table size overflows".to_owned())?;
+    if table_length > data.len() {
+        return Err(format!(
+            "GAME_LUMP child table is truncated: {count} entries need {table_length} bytes, lump has {}",
+            data.len()
+        ));
+    }
+    (0..count)
+        .map(|index| {
+            let offset = 4 + index * GAME_LUMP_HEADER_SIZE;
+            let file_offset = read_i32(data, offset + 8, "GAME_LUMP child offset")?;
+            let file_length = read_i32(data, offset + 12, "GAME_LUMP child length")?;
+            if file_offset < 0 || file_length < 0 {
+                return Err(format!(
+                    "GAME_LUMP child {index} has a negative offset or length"
+                ));
+            }
+            Ok(GameLumpEntry {
+                id: read_u32(data, offset, "GAME_LUMP child id")?,
+                flags: read_u16(data, offset + 4, "GAME_LUMP child flags")?,
+                version: read_u16(data, offset + 6, "GAME_LUMP child version")?,
+                offset: file_offset as usize,
+                length: file_length as usize,
+            })
+        })
+        .collect()
+}
+
+fn game_lump_child_data(bsp: &Bsp, file: &[u8], entry: &GameLumpEntry) -> Result<Vec<u8>, String> {
+    let parent = bsp.headers[LUMP_GAME_LUMP];
+    let (source, start, parent_end) = if parent.uncompressed_size == 0 {
+        let end = parent
+            .offset
+            .checked_add(parent.length)
+            .ok_or_else(|| "GAME_LUMP range overflows".to_owned())?;
+        if entry.offset < parent.offset {
+            return Err(format!(
+                "GAME_LUMP child offset {} precedes parent offset {}",
+                entry.offset, parent.offset
+            ));
+        }
+        (file, entry.offset, end)
+    } else {
+        let start = entry.offset.checked_sub(parent.offset).ok_or_else(|| {
+            format!(
+                "GAME_LUMP child offset {} precedes compressed parent offset {}",
+                entry.offset, parent.offset
+            )
+        })?;
+        (
+            &bsp.lumps[LUMP_GAME_LUMP][..],
+            start,
+            bsp.lumps[LUMP_GAME_LUMP].len(),
+        )
+    };
+    if start > parent_end {
+        return Err(format!(
+            "GAME_LUMP child at offset {} lies outside its parent lump",
+            entry.offset
+        ));
+    }
+    let tail = source.get(start..parent_end).ok_or_else(|| {
+        format!(
+            "GAME_LUMP child at offset {} lies outside the BSP file",
+            entry.offset
+        )
+    })?;
+    if entry.flags & GAME_LUMP_COMPRESSED != 0 {
+        decompress_source_lzma(tail, entry.length, "compressed GAME_LUMP child")
+    } else {
+        tail.get(..entry.length).map(<[u8]>::to_vec).ok_or_else(|| {
+            format!(
+                "GAME_LUMP child at offset {} is truncated: needs {} bytes",
+                entry.offset, entry.length
+            )
+        })
+    }
+}
+
+fn static_prop_record_layout(version: u16, size: usize) -> Result<&'static str, String> {
+    match (version, size) {
+        (4, 56) => Ok("source-v4"),
+        (5, 60) => Ok("source-v5"),
+        (6, 64) => Ok("source-v6"),
+        (7, 68) => Ok("source-v7"),
+        (8, 68) => Ok("source-v8"),
+        (9, 72) => Ok("source-v9"),
+        (10, 72) => Ok("tf2-v10"),
+        (10, 76) => Ok("sdk2013-v10"),
+        (11, 76) => Ok("sdk2013-v11"),
+        (11, 80) => Ok("sdk2013-v11-extended"),
+        _ => Err(format!(
+            "unsupported static prop GAME_LUMP version {version} with {size}-byte records"
+        )),
+    }
+}
+
+fn parse_static_prop_record(
+    data: &[u8],
+    version: u16,
+    layout: &str,
+    index: usize,
+) -> Result<StaticPropInstance, String> {
+    let context = format!("static prop {index}");
+    let mut instance = StaticPropInstance {
+        origin: read_vec3(data, 0, &context)?,
+        angles: read_vec3(data, 12, &context)?,
+        dictionary_index: read_u16(data, 24, &context)?,
+        first_leaf: read_u16(data, 26, &context)?,
+        leaf_count: read_u16(data, 28, &context)?,
+        solidity: *data
+            .get(30)
+            .ok_or_else(|| format!("truncated {context} solidity"))?,
+        flags: 0,
+        skin: read_i32(data, 32, &context)?,
+        fade_min_distance: read_f32(data, 36, &context)?,
+        fade_max_distance: read_f32(data, 40, &context)?,
+        lighting_origin: read_vec3(data, 44, &context)?,
+        forced_fade_scale: (version >= 5)
+            .then(|| read_f32(data, 56, &context))
+            .transpose()?,
+        min_dx_level: None,
+        max_dx_level: None,
+        min_cpu_level: None,
+        max_cpu_level: None,
+        min_gpu_level: None,
+        max_gpu_level: None,
+        diffuse_modulation: None,
+        disable_x360: None,
+        flags_ex: None,
+        lightmap_resolution: None,
+        uniform_scale: None,
+    };
+
+    match layout {
+        "tf2-v10" => {
+            instance.min_dx_level = Some(read_u16(data, 60, &context)?);
+            instance.max_dx_level = Some(read_u16(data, 62, &context)?);
+            instance.flags = read_u32(data, 64, &context)?;
+            instance.lightmap_resolution =
+                Some([read_u16(data, 68, &context)?, read_u16(data, 70, &context)?]);
+        }
+        "source-v4" | "source-v5" | "source-v6" | "source-v7" => {
+            instance.flags = u32::from(data[31]);
+            if version >= 6 {
+                instance.min_dx_level = Some(read_u16(data, 60, &context)?);
+                instance.max_dx_level = Some(read_u16(data, 62, &context)?);
+            }
+            if version == 7 {
+                instance.diffuse_modulation = Some(data[64..68].try_into().unwrap());
+            }
+        }
+        "source-v8" | "source-v9" | "sdk2013-v10" | "sdk2013-v11" | "sdk2013-v11-extended" => {
+            instance.flags = u32::from(data[31]);
+            instance.min_cpu_level = Some(data[60]);
+            instance.max_cpu_level = Some(data[61]);
+            instance.min_gpu_level = Some(data[62]);
+            instance.max_gpu_level = Some(data[63]);
+            instance.diffuse_modulation = Some(data[64..68].try_into().unwrap());
+            match layout {
+                "source-v9" => {
+                    instance.disable_x360 = Some(read_u32(data, 68, &context)? != 0);
+                }
+                "sdk2013-v10" => {
+                    instance.disable_x360 = Some(read_u32(data, 68, &context)? != 0);
+                    instance.flags_ex = Some(read_u32(data, 72, &context)?);
+                }
+                "sdk2013-v11" | "sdk2013-v11-extended" => {
+                    instance.flags_ex = Some(read_u32(data, 68, &context)?);
+                    instance.uniform_scale = Some(read_f32(data, 72, &context)?);
+                }
+                _ => {}
+            }
+        }
+        _ => unreachable!("layout was validated before parsing"),
+    }
+    Ok(instance)
+}
+
+fn parse_static_props(data: &[u8], version: u16) -> Result<StaticPropGameLump, String> {
+    let dictionary_count = read_i32(data, 0, "static prop dictionary count")?;
+    if dictionary_count < 0 {
+        return Err("static prop dictionary has a negative entry count".to_owned());
+    }
+    let dictionary_count = dictionary_count as usize;
+    let dictionary_start = 4_usize;
+    let dictionary_end = dictionary_count
+        .checked_mul(STATIC_PROP_NAME_LENGTH)
+        .and_then(|size| dictionary_start.checked_add(size))
+        .ok_or_else(|| "static prop dictionary size overflows".to_owned())?;
+    let dictionary_bytes = data.get(dictionary_start..dictionary_end).ok_or_else(|| {
+        format!("static prop dictionary is truncated: expected {dictionary_count} entries")
+    })?;
+    let dictionary = dictionary_bytes
+        .chunks_exact(STATIC_PROP_NAME_LENGTH)
+        .enumerate()
+        .map(|(index, name)| {
+            let end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name.len());
+            let name = std::str::from_utf8(&name[..end])
+                .map_err(|_| format!("static prop dictionary path {index} is not UTF-8"))?;
+            if name.is_empty() {
+                Err(format!("static prop dictionary path {index} is empty"))
+            } else {
+                Ok(name.to_owned())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let leaf_count = read_i32(data, dictionary_end, "static prop leaf count")?;
+    if leaf_count < 0 {
+        return Err("static prop leaf list has a negative entry count".to_owned());
+    }
+    let leaf_count = leaf_count as usize;
+    let leaf_start = dictionary_end + 4;
+    let leaf_end = leaf_count
+        .checked_mul(2)
+        .and_then(|size| leaf_start.checked_add(size))
+        .ok_or_else(|| "static prop leaf-list size overflows".to_owned())?;
+    let leaf_bytes = data
+        .get(leaf_start..leaf_end)
+        .ok_or_else(|| "static prop leaf list is truncated".to_owned())?;
+    let leaves = parse_u16_lump(leaf_bytes, "static prop leaf")?;
+
+    let instance_count = read_i32(data, leaf_end, "static prop instance count")?;
+    if instance_count < 0 {
+        return Err("static prop list has a negative instance count".to_owned());
+    }
+    let instance_count = instance_count as usize;
+    let instances_start = leaf_end + 4;
+    let records = data
+        .get(instances_start..)
+        .ok_or_else(|| "static prop instance list is truncated".to_owned())?;
+    let record_size = if instance_count == 0 {
+        if !records.is_empty() {
+            return Err(format!(
+                "static prop list declares zero instances but has {} trailing bytes",
+                records.len()
+            ));
+        }
+        match version {
+            4 => 56,
+            5 => 60,
+            6 => 64,
+            7 | 8 => 68,
+            9 | 10 => 72,
+            11 => 76,
+            _ => {
+                return Err(format!(
+                    "unsupported static prop GAME_LUMP version {version}"
+                ));
+            }
+        }
+    } else {
+        if !records.len().is_multiple_of(instance_count) {
+            return Err(format!(
+                "static prop instance bytes {} are not divisible by declared count {instance_count}",
+                records.len()
+            ));
+        }
+        records.len() / instance_count
+    };
+    let layout = static_prop_record_layout(version, record_size)?;
+    let instances = records
+        .chunks_exact(record_size)
+        .enumerate()
+        .map(|(index, record)| parse_static_prop_record(record, version, layout, index))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (index, instance) in instances.iter().enumerate() {
+        if usize::from(instance.dictionary_index) >= dictionary.len() {
+            return Err(format!(
+                "static prop {index} references missing dictionary entry {}",
+                instance.dictionary_index
+            ));
+        }
+        let first = usize::from(instance.first_leaf);
+        let end = first
+            .checked_add(usize::from(instance.leaf_count))
+            .ok_or_else(|| format!("static prop {index} leaf range overflows"))?;
+        if end > leaves.len() {
+            return Err(format!(
+                "static prop {index} leaf range {first}..{end} exceeds {} entries",
+                leaves.len()
+            ));
+        }
+    }
+
+    Ok(StaticPropGameLump {
+        version,
+        layout,
+        dictionary,
+        leaves,
+        instances,
+    })
+}
+
+fn find_static_props(bsp: &Bsp, file: &[u8]) -> Result<Option<StaticPropGameLump>, String> {
+    let entries = parse_game_lump_entries(bsp)?;
+    let matches: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.id == STATIC_PROP_GAME_LUMP_ID)
+        .collect();
+    if matches.len() > 1 {
+        return Err("GAME_LUMP contains multiple static prop ('sprp') children".to_owned());
+    }
+    matches
+        .first()
+        .map(|entry| {
+            game_lump_child_data(bsp, file, entry)
+                .and_then(|data| parse_static_props(&data, entry.version))
+        })
+        .transpose()
 }
 
 fn source_to_gltf(value: [f32; 3]) -> [f32; 3] {
@@ -829,11 +1249,11 @@ fn face_triangle_indices(
     Ok((triangles, true))
 }
 
-fn entity_property<'a>(entity: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+fn entity_property<'a>(entity: &'a Entity, name: &str) -> Option<&'a str> {
     entity
         .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+        .find(|property| property.key.eq_ignore_ascii_case(name))
+        .map(|property| property.value.as_str())
 }
 
 fn parse_source_vector(value: Option<&str>, fallback: [f32; 3]) -> [f32; 3] {
@@ -851,6 +1271,14 @@ fn parse_source_vector(value: Option<&str>, fallback: [f32; 3]) -> [f32; 3] {
 }
 
 fn source_entity_matrix(origin: [f32; 3], angles: [f32; 3]) -> [f32; 16] {
+    source_entity_matrix_scaled(origin, angles, 1.0)
+}
+
+fn source_entity_matrix_scaled(
+    origin: [f32; 3],
+    angles: [f32; 3],
+    uniform_scale: f32,
+) -> [f32; 16] {
     let [pitch, yaw, roll] = angles.map(f32::to_radians);
     let (sp, cp) = pitch.sin_cos();
     let (sy, cy) = yaw.sin_cos();
@@ -882,17 +1310,17 @@ fn source_entity_matrix(origin: [f32; 3], angles: [f32; 3]) -> [f32; 16] {
     }
     let translation = source_to_gltf(origin);
     [
-        gltf_rotation[0][0],
-        gltf_rotation[1][0],
-        gltf_rotation[2][0],
+        gltf_rotation[0][0] * uniform_scale,
+        gltf_rotation[1][0] * uniform_scale,
+        gltf_rotation[2][0] * uniform_scale,
         0.0,
-        gltf_rotation[0][1],
-        gltf_rotation[1][1],
-        gltf_rotation[2][1],
+        gltf_rotation[0][1] * uniform_scale,
+        gltf_rotation[1][1] * uniform_scale,
+        gltf_rotation[2][1] * uniform_scale,
         0.0,
-        gltf_rotation[0][2],
-        gltf_rotation[1][2],
-        gltf_rotation[2][2],
+        gltf_rotation[0][2] * uniform_scale,
+        gltf_rotation[1][2] * uniform_scale,
+        gltf_rotation[2][2] * uniform_scale,
         0.0,
         translation[0],
         translation[1],
@@ -901,7 +1329,7 @@ fn source_entity_matrix(origin: [f32; 3], angles: [f32; 3]) -> [f32; 16] {
     ]
 }
 
-fn entity_initially_rendered(entity: Option<&HashMap<String, String>>, classname: &str) -> bool {
+fn entity_initially_rendered(entity: Option<&Entity>, classname: &str) -> bool {
     let Some(entity) = entity else {
         return true;
     };
@@ -1079,6 +1507,7 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
     )?;
     let models = parse_models(&bsp.lumps[LUMP_MODELS])?;
     let entities = parse_entities(&bsp.lumps[LUMP_ENTITIES])?;
+    let static_props = find_static_props(&bsp, data)?;
     let lightmaps = lightmap_json.map(LightmapLookup::parse).transpose()?;
 
     if models.is_empty() {
@@ -1126,11 +1555,10 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         ));
     }
 
-    let mut entity_by_model: HashMap<usize, (usize, &HashMap<String, String>)> = HashMap::new();
+    let mut entity_by_model: HashMap<usize, (usize, &Entity)> = HashMap::new();
     for (entity_index, entity) in entities.iter().enumerate() {
-        let Some(model_value) = entity
-            .get("model")
-            .and_then(|value| value.strip_prefix('*'))
+        let Some(model_value) =
+            entity_property(entity, "model").and_then(|value| value.strip_prefix('*'))
         else {
             continue;
         };
@@ -1143,10 +1571,57 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
     if let Some((entity_index, worldspawn)) = entities
         .iter()
         .enumerate()
-        .find(|(_, entity)| entity.get("classname").map(String::as_str) == Some("worldspawn"))
+        .find(|(_, entity)| entity_property(entity, "classname") == Some("worldspawn"))
     {
         entity_by_model.insert(0, (entity_index, worldspawn));
     }
+
+    let dynamic_props: Vec<_> = entities
+        .iter()
+        .enumerate()
+        .filter(|(_, entity)| {
+            entity_property(entity, "classname")
+                .map(|classname| classname.to_ascii_lowercase().starts_with("prop_dynamic"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let mut model_asset_paths = Vec::new();
+    let mut model_asset_by_path = HashMap::new();
+    if let Some(static_props) = &static_props {
+        for path in &static_props.dictionary {
+            if !model_asset_by_path.contains_key(path) {
+                let index = model_asset_paths.len();
+                model_asset_paths.push(path.clone());
+                model_asset_by_path.insert(path.clone(), index);
+            }
+        }
+    }
+    for (_, entity) in &dynamic_props {
+        let Some(path) = entity_property(entity, "model") else {
+            continue;
+        };
+        if path.starts_with('*') || model_asset_by_path.contains_key(path) {
+            continue;
+        }
+        let index = model_asset_paths.len();
+        model_asset_paths.push(path.to_owned());
+        model_asset_by_path.insert(path.to_owned(), index);
+    }
+    let model_assets: Vec<_> = model_asset_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            json!({
+                "modelAssetIndex": index,
+                "sourcePath": path,
+                "sourceFormat": "Source MDL",
+                "reusable": true,
+                "geometryEmbedded": false,
+                "resolutionStatus": "unsupported",
+                "unsupportedReason": "MDL model resolution is not configured; source path retained without fabricated geometry"
+            })
+        })
+        .collect();
 
     let materials: Vec<_> = material_names
         .iter()
@@ -1174,6 +1649,26 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         models: models.len(),
         materials: material_names.len(),
         displacement_faces: displacements.len(),
+        static_prop_models: static_props
+            .as_ref()
+            .map(|props| props.dictionary.len())
+            .unwrap_or(0),
+        static_props: static_props
+            .as_ref()
+            .map(|props| props.instances.len())
+            .unwrap_or(0),
+        solid_static_props: static_props
+            .as_ref()
+            .map(|props| {
+                props
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.solidity != 0)
+                    .count()
+            })
+            .unwrap_or(0),
+        dynamic_props: dynamic_props.len(),
+        unresolved_prop_models: model_assets.len(),
         ..ExportStats::default()
     };
 
@@ -1433,6 +1928,165 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         stats.meshes += 1;
     }
 
+    let mut static_prop_metadata = Vec::new();
+    if let Some(static_props) = &static_props {
+        for (index, instance) in static_props.instances.iter().enumerate() {
+            let dictionary_index = usize::from(instance.dictionary_index);
+            let model_path = &static_props.dictionary[dictionary_index];
+            let model_asset_index = model_asset_by_path[model_path];
+            let first_leaf = usize::from(instance.first_leaf);
+            let leaf_end = first_leaf + usize::from(instance.leaf_count);
+            let leaves = &static_props.leaves[first_leaf..leaf_end];
+            let mut extras = json!({
+                "sourceType": "staticProp",
+                "staticPropIndex": index,
+                "gameLumpId": "sprp",
+                "gameLumpVersion": static_props.version,
+                "gameLumpLayout": static_props.layout,
+                "dictionaryIndex": dictionary_index,
+                "modelPath": model_path,
+                "modelAssetIndex": model_asset_index,
+                "modelResolutionStatus": "unsupported",
+                "sourceOrigin": instance.origin,
+                "sourceAngles": instance.angles,
+                "firstLeaf": instance.first_leaf,
+                "leafCount": instance.leaf_count,
+                "leaves": leaves,
+                "skin": instance.skin,
+                "solidity": instance.solidity,
+                "solid": instance.solidity != 0,
+                "flags": instance.flags,
+                "fadeMinDistance": instance.fade_min_distance,
+                "fadeMaxDistance": instance.fade_max_distance,
+                "lightingOrigin": instance.lighting_origin
+            });
+            if let Some(value) = instance.forced_fade_scale {
+                extras["forcedFadeScale"] = json!(value);
+            }
+            if let Some(value) = instance.min_dx_level {
+                extras["minDxLevel"] = json!(value);
+            }
+            if let Some(value) = instance.max_dx_level {
+                extras["maxDxLevel"] = json!(value);
+            }
+            if let Some(value) = instance.min_cpu_level {
+                extras["minCpuLevel"] = json!(value);
+            }
+            if let Some(value) = instance.max_cpu_level {
+                extras["maxCpuLevel"] = json!(value);
+            }
+            if let Some(value) = instance.min_gpu_level {
+                extras["minGpuLevel"] = json!(value);
+            }
+            if let Some(value) = instance.max_gpu_level {
+                extras["maxGpuLevel"] = json!(value);
+            }
+            if let Some(value) = instance.diffuse_modulation {
+                extras["diffuseModulation"] = json!(value);
+            }
+            if let Some(value) = instance.disable_x360 {
+                extras["disableX360"] = json!(value);
+            }
+            if let Some(value) = instance.flags_ex {
+                extras["flagsEx"] = json!(value);
+            }
+            if let Some(value) = instance.lightmap_resolution {
+                extras["lightmapResolution"] = json!(value);
+            }
+            if let Some(value) = instance.uniform_scale {
+                extras["uniformScale"] = json!(value);
+            }
+            nodes_json.push(json!({
+                "name": format!("static_prop_{index}"),
+                "matrix": source_entity_matrix_scaled(
+                    instance.origin,
+                    instance.angles,
+                    instance.uniform_scale.unwrap_or(1.0),
+                ),
+                "extras": extras
+            }));
+            static_prop_metadata.push(nodes_json.last().unwrap()["extras"].clone());
+        }
+    }
+
+    let mut dynamic_prop_metadata = Vec::new();
+    for (entity_index, entity) in dynamic_props {
+        let classname = entity_property(entity, "classname").unwrap_or("prop_dynamic");
+        let targetname = entity_property(entity, "targetname");
+        let model_path = entity_property(entity, "model");
+        let model_asset_index = model_path.and_then(|path| model_asset_by_path.get(path).copied());
+        let origin = parse_source_vector(entity_property(entity, "origin"), [0.0; 3]);
+        let angles = parse_source_vector(entity_property(entity, "angles"), [0.0; 3]);
+        let key_values: Vec<_> = entity
+            .iter()
+            .map(|property| json!({ "key": property.key, "value": property.value }))
+            .collect();
+        let extras = json!({
+            "sourceType": "dynamicPropEntity",
+            "entityIndex": entity_index,
+            "classname": classname,
+            "targetname": targetname,
+            "modelPath": model_path,
+            "modelAssetIndex": model_asset_index,
+            "modelResolutionStatus": model_path.map(|_| "unsupported"),
+            "sourceOrigin": origin,
+            "sourceAngles": angles,
+            "initialState": {
+                "startDisabled": entity_property(entity, "StartDisabled"),
+                "defaultAnim": entity_property(entity, "DefaultAnim"),
+                "playbackRate": entity_property(entity, "playbackrate"),
+                "skin": entity_property(entity, "skin"),
+                "solid": entity_property(entity, "solid"),
+                "spawnflags": entity_property(entity, "spawnflags"),
+                "renderMode": entity_property(entity, "rendermode"),
+                "renderAmount": entity_property(entity, "renderamt"),
+                "renderColor": entity_property(entity, "rendercolor")
+            },
+            "keyValues": key_values
+        });
+        let name = targetname
+            .map(|target| format!("dynamic_prop_{entity_index}_{target}"))
+            .unwrap_or_else(|| format!("dynamic_prop_{entity_index}"));
+        nodes_json.push(json!({
+            "name": name,
+            "matrix": source_entity_matrix(origin, angles),
+            "extras": extras
+        }));
+        dynamic_prop_metadata.push(nodes_json.last().unwrap()["extras"].clone());
+    }
+
+    let static_prop_lump_metadata = static_props.as_ref().map(|props| {
+        json!({
+            "id": "sprp",
+            "version": props.version,
+            "layout": props.layout,
+            "dictionaryCount": props.dictionary.len(),
+            "dictionaryPaths": props.dictionary,
+            "leafEntryCount": props.leaves.len(),
+            "instanceCount": props.instances.len(),
+            "solidInstanceCount": props
+                .instances
+                .iter()
+                .filter(|instance| instance.solidity != 0)
+                .count()
+        })
+    });
+    let props_metadata = json!({
+        "schema": "bsp-to-glb.props",
+        "schemaVersion": 1,
+        "sourceBspVersion": bsp.version,
+        "coordinateTransform": "Source XYZ to glTF X,Z,-Y",
+        "modelResolution": {
+            "status": "unsupported",
+            "geometryEmbedded": false,
+            "reason": "MDL model resolution is not configured; source paths are references only"
+        },
+        "modelAssets": model_assets,
+        "staticPropLump": static_prop_lump_metadata,
+        "staticProps": static_prop_metadata,
+        "dynamicProps": dynamic_prop_metadata
+    });
+
     let document = json!({
         "asset": {
             "version": "2.0",
@@ -1440,7 +2094,8 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
             "extras": {
                 "source": "compiled Valve BSP",
                 "bspVersion": bsp.version,
-                "coordinateTransform": "Source XYZ to glTF X,Z,-Y"
+                "coordinateTransform": "Source XYZ to glTF X,Z,-Y",
+                "props": props_metadata.clone()
             }
         },
         "scene": 0,
@@ -1452,5 +2107,9 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         "accessors": arrays.accessors
     });
     let glb = encode_glb(document, arrays.binary)?;
-    Ok(ExportResult { glb, stats })
+    Ok(ExportResult {
+        glb,
+        stats,
+        props: props_metadata,
+    })
 }
