@@ -25,6 +25,76 @@ pub use vtf::{
     decode_vtf, inspect_vtf,
 };
 
+pub const BUILD_METADATA_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuildCapabilityStatus {
+    Supported,
+    DetectedOnly,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildCapabilities {
+    pub brush_geometry: BuildCapabilityStatus,
+    pub bsp_models: BuildCapabilityStatus,
+    pub displacements: BuildCapabilityStatus,
+    pub direct_lightmaps: BuildCapabilityStatus,
+    pub material_metadata: BuildCapabilityStatus,
+    pub vtf_pixel_conversion: BuildCapabilityStatus,
+    pub prop_metadata: BuildCapabilityStatus,
+    pub prop_geometry: BuildCapabilityStatus,
+    pub brush_collision: BuildCapabilityStatus,
+    pub decoded_physics_collision: BuildCapabilityStatus,
+    pub visibility: BuildCapabilityStatus,
+    pub overlays: BuildCapabilityStatus,
+    pub water_overlays: BuildCapabilityStatus,
+    pub cubemaps: BuildCapabilityStatus,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildMetadata {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub name: &'static str,
+    pub version: &'static str,
+    pub target: &'static str,
+    pub profile: &'static str,
+    pub source_commit: Option<&'static str>,
+    pub capabilities: BuildCapabilities,
+}
+
+pub fn build_metadata() -> BuildMetadata {
+    BuildMetadata {
+        schema: "bsp-to-glb.build-metadata",
+        schema_version: BUILD_METADATA_SCHEMA_VERSION,
+        name: env!("CARGO_PKG_NAME"),
+        version: env!("CARGO_PKG_VERSION"),
+        target: env!("BSP_TO_GLB_BUILD_TARGET"),
+        profile: env!("BSP_TO_GLB_BUILD_PROFILE"),
+        source_commit: option_env!("BSP_TO_GLB_SOURCE_COMMIT"),
+        capabilities: BuildCapabilities {
+            brush_geometry: BuildCapabilityStatus::Supported,
+            bsp_models: BuildCapabilityStatus::Supported,
+            displacements: BuildCapabilityStatus::Supported,
+            direct_lightmaps: BuildCapabilityStatus::Supported,
+            material_metadata: BuildCapabilityStatus::Supported,
+            vtf_pixel_conversion: BuildCapabilityStatus::Supported,
+            prop_metadata: BuildCapabilityStatus::Supported,
+            prop_geometry: BuildCapabilityStatus::Unsupported,
+            brush_collision: BuildCapabilityStatus::Supported,
+            decoded_physics_collision: BuildCapabilityStatus::Unsupported,
+            visibility: BuildCapabilityStatus::Supported,
+            overlays: BuildCapabilityStatus::DetectedOnly,
+            water_overlays: BuildCapabilityStatus::DetectedOnly,
+            cubemaps: BuildCapabilityStatus::DetectedOnly,
+        },
+    }
+}
+
 const LUMP_ENTITIES: usize = 0;
 const LUMP_PLANES: usize = 1;
 const LUMP_TEXDATA: usize = 2;

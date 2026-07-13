@@ -107,6 +107,18 @@ Strict supported-domain checks for that map:
 The Blender output contains props and reconstructed VMF geometry outside this strict comparison.
 Exact-triangle comparisons therefore measure compiled-BSP identity, not subjective visual quality.
 
+## Releases
+
+Tags named `vMAJOR.MINOR.PATCH` publish tested Windows x64 and Linux x64 archives. The tag must match
+the Cargo package version. Every release includes deterministic archive names, `SHA256SUMS`, a
+human-readable [`CAPABILITIES.md`](CAPABILITIES.md), target-specific build metadata, and generated
+release notes. Archives also contain the README, license, capability snapshot, and
+`build-metadata.json`.
+
+Verify an archive against a digest pinned by the consuming repository before extraction. See
+[`docs/DRIBBLE_RELEASES.md`](docs/DRIBBLE_RELEASES.md) for the dribble.tf pin, download, checksum,
+and metadata-validation contract.
+
 ## Build
 
 ```bash
@@ -114,6 +126,16 @@ cargo build --release
 ```
 
 ## Usage
+
+Inspect the package version or machine-readable build metadata without a BSP input:
+
+```bash
+bsp-to-glb --version
+bsp-to-glb --version-json
+```
+
+The JSON includes schema version, package version, build target/profile, release source commit, and
+the release's supported, detected-only, and unsupported capability states.
 
 ```bash
 bsp-to-glb \
