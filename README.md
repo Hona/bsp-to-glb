@@ -7,14 +7,14 @@ decompiling to VMF or routing world geometry through Blender.
 
 ## Benchmark TL;DR
 
-Direct compiled-BSP export is approximately **136x faster** than the measured Blender/Plumber path
+Direct compiled-BSP export is approximately **177x faster** than the measured Blender/Plumber path
 while preserving the supported compiled brush-geometry domain more faithfully than a
 BSP-to-VMF-to-mesh reconstruction.
 
 | Export path | Warm median | Output size |
 |---|---:|---:|
-| Direct Rust BSP export | 155.8 ms | 3.82 MB |
-| Blender/Plumber export | 21.21 s | 23.06 MB |
+| Direct Rust BSP export | 129.8 ms | 3.82 MB |
+| Blender/Plumber export | 23.00 s | 23.06 MB |
 
 ## Accuracy TL;DR
 
@@ -105,10 +105,10 @@ Reference map: `jump_hydrogen_rc1_bmv` (BSP v20, no displacements).
 
 | Export path | Warm median | Output size |
 |---|---:|---:|
-| Direct Rust BSP export | 155.8 ms | 3.82 MB |
-| Blender/Plumber export | 21.21 s | 23.06 MB |
+| Direct Rust BSP export | 129.8 ms | 3.82 MB |
+| Blender/Plumber export | 23.00 s | 23.06 MB |
 
-Measured speedup: `136x`.
+Measured speedup: `177.23x`.
 
 Strict supported-domain checks for that map:
 
