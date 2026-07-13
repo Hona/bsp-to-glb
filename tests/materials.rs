@@ -41,7 +41,7 @@ fn parses_supported_vmt_shader_inputs_and_limitations() {
         LightmappedGeneric
         {
             // Values and keys are case-insensitive in Source material files.
-            "$BaseTexture" "Brick\\Wall_A"
+            "$BaseTexture" "Brick\Wall_A"
             "$translucent" 1
             "$additive" "1"
             "$alphatest" 1
@@ -95,6 +95,138 @@ fn parses_supported_vmt_shader_inputs_and_limitations() {
     assert_eq!(material.unsupported.proxies, ["AnimatedTexture"]);
     assert!(material.unsupported.animated);
     assert_eq!(material.shader.inputs["$basetexture"], "Brick\\Wall_A");
+}
+
+#[test]
+fn preserves_literal_backslashes_in_vmt_paths() {
+    let material = parse_vmt(
+        br#"LightmappedGeneric {
+            "$basetexture" "tiles\trim\test"
+            "$detail" "RealWorldTextures2\detail\noise_detail_01"
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(material.shader.inputs["$basetexture"], r"tiles\trim\test");
+    assert_eq!(
+        material.shader.inputs["$detail"],
+        r"RealWorldTextures2\detail\noise_detail_01"
+    );
+    assert_eq!(
+        material.textures.base_texture.as_deref(),
+        Some("tiles/trim/test")
+    );
+    assert_eq!(
+        material.textures.detail.as_deref(),
+        Some("RealWorldTextures2/detail/noise_detail_01")
+    );
+}
+
+#[test]
+fn applies_pc_conditionals_and_keeps_the_first_duplicate() {
+    let material = parse_vmt(
+        br#"lightmappedgeneric {
+            "$BaseTexture" "custom/first"
+            "$basetexture" "custom/duplicate"
+            "$detail" "custom/console" [$X360]
+            "$detail" "custom/windows" [$WIN32]
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(material.shader.family, "lightmappedGeneric");
+    assert_eq!(
+        material.textures.base_texture.as_deref(),
+        Some("custom/first")
+    );
+    assert_eq!(material.textures.detail.as_deref(), Some("custom/windows"));
+}
+
+#[test]
+fn resolves_patch_include_insert_and_replace_case_insensitively() {
+    let resources = vec![
+        bsp_to_glb::PakResource {
+            path: "materials/custom/child.vmt".to_owned(),
+            kind: PakResourceKind::Vmt,
+            data: br#"pAtCh {
+                "InClUdE" "materials\custom\base.vmt"
+                "INSERT" { "$detail" "detail\added" }
+                "replace" {
+                    "$BaseTexture" "custom\replacement"
+                    "$notInBase" "ignored"
+                }
+            }"#
+            .to_vec(),
+        },
+        bsp_to_glb::PakResource {
+            path: "materials/custom/base.vmt".to_owned(),
+            kind: PakResourceKind::Vmt,
+            data: br#"LIGHTMAPPEDGENERIC {
+                "$basetexture" "custom\first"
+                "$BaseTexture" "custom\duplicate"
+                "$surfaceprop" "Concrete"
+            }"#
+            .to_vec(),
+        },
+    ];
+
+    let manifest =
+        build_source_material_manifest(&["custom/child".to_owned()], &resources, None).unwrap();
+    let material = manifest.materials[0].metadata.as_ref().unwrap();
+
+    assert_eq!(material.shader.name, "LIGHTMAPPEDGENERIC");
+    assert_eq!(material.shader.family, "lightmappedGeneric");
+    assert_eq!(
+        material.textures.base_texture.as_deref(),
+        Some("custom/replacement")
+    );
+    assert_eq!(material.textures.detail.as_deref(), Some("detail/added"));
+    assert_eq!(material.surface_prop.as_deref(), Some("Concrete"));
+    assert!(!material.shader.inputs.contains_key("$notinbase"));
+}
+
+#[test]
+fn rejects_excessive_vmt_nesting() {
+    let mut vmt = String::from("LightmappedGeneric {");
+    for depth in 0..65 {
+        vmt.push_str(&format!(" section{depth} {{"));
+    }
+    for _ in 0..65 {
+        vmt.push('}');
+    }
+    vmt.push('}');
+
+    let error = parse_vmt(vmt.as_bytes()).unwrap_err();
+    assert!(error.contains("nesting"), "unexpected error: {error}");
+}
+
+#[test]
+fn rejects_patch_chains_beyond_the_dependency_limit() {
+    let mut resources = Vec::new();
+    for index in 0..=10 {
+        resources.push(bsp_to_glb::PakResource {
+            path: format!("materials/custom/patch{index}.vmt"),
+            kind: PakResourceKind::Vmt,
+            data: format!(
+                "Patch {{ include materials/custom/{}.vmt }}",
+                if index == 10 {
+                    "base".to_owned()
+                } else {
+                    format!("patch{}", index + 1)
+                }
+            )
+            .into_bytes(),
+        });
+    }
+    resources.push(bsp_to_glb::PakResource {
+        path: "materials/custom/base.vmt".to_owned(),
+        kind: PakResourceKind::Vmt,
+        data: br#"LightmappedGeneric { "$basetexture" "custom/base" }"#.to_vec(),
+    });
+
+    let error = build_source_material_manifest(&["custom/patch0".to_owned()], &resources, None)
+        .unwrap_err();
+    assert!(error.contains("depth"), "unexpected error: {error}");
 }
 
 #[test]

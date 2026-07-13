@@ -2,11 +2,14 @@ use crate::vtf::{VtfErrorKind, VtfImageSelection, VtfMetadata, decode_vtf, inspe
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Read};
 
 const MAX_PAK_ENTRIES: usize = 65_535;
 const MAX_VMT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_VMT_TOKENS: usize = 262_144;
+const MAX_VMT_NESTING: usize = 64;
+const MAX_VMT_PATCH_DEPTH: usize = 10;
 const MAX_VTF_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_MATERIAL_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -227,7 +230,7 @@ pub struct SourceMaterialPackage {
     pub artifacts: Vec<MaterialTextureArtifact>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum KvValue {
     String(String),
     Object(Vec<(String, KvValue)>),
@@ -236,8 +239,31 @@ enum KvValue {
 #[derive(Debug)]
 enum Token {
     Text(String),
+    Conditional(String),
     Open,
     Close,
+}
+
+#[derive(Debug)]
+struct ParsedVmt {
+    shader: String,
+    values: Vec<(String, KvValue)>,
+}
+
+#[derive(Default)]
+struct PatchChanges {
+    insert: Vec<(String, KvValue)>,
+    replace: Vec<(String, KvValue)>,
+}
+
+fn push_token(tokens: &mut Vec<Token>, token: Token) -> Result<(), String> {
+    if tokens.len() >= MAX_VMT_TOKENS {
+        return Err(format!(
+            "VMT exceeds the {MAX_VMT_TOKENS}-token safety limit"
+        ));
+    }
+    tokens.push(token);
+    Ok(())
 }
 
 fn tokenize_keyvalues(data: &[u8]) -> Result<Vec<Token>, String> {
@@ -256,51 +282,24 @@ fn tokenize_keyvalues(data: &[u8]) -> Result<Vec<Token>, String> {
                 }
             }
             b'{' => {
-                tokens.push(Token::Open);
+                push_token(&mut tokens, Token::Open)?;
                 index += 1;
             }
             b'}' => {
-                tokens.push(Token::Close);
+                push_token(&mut tokens, Token::Close)?;
                 index += 1;
             }
             b'"' => {
                 index += 1;
-                let mut value = Vec::new();
-                let mut closed = false;
-                while index < bytes.len() {
-                    match bytes[index] {
-                        b'"' => {
-                            closed = true;
-                            index += 1;
-                            break;
-                        }
-                        b'\\' => {
-                            let escaped = *bytes
-                                .get(index + 1)
-                                .ok_or_else(|| "VMT has a trailing escape".to_owned())?;
-                            match escaped {
-                                b'\\' | b'"' => value.push(escaped),
-                                b'n' => value.push(b'\n'),
-                                b't' => value.push(b'\t'),
-                                _ => {
-                                    value.push(b'\\');
-                                    value.push(escaped);
-                                }
-                            }
-                            index += 2;
-                        }
-                        byte => {
-                            value.push(byte);
-                            index += 1;
-                        }
-                    }
+                let start = index;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += 1;
                 }
-                if !closed {
+                if index == bytes.len() {
                     return Err("VMT has an unterminated quoted string".to_owned());
                 }
-                tokens.push(Token::Text(String::from_utf8(value).map_err(|error| {
-                    format!("VMT quoted value is not UTF-8: {error}")
-                })?));
+                push_token(&mut tokens, Token::Text(text[start..index].to_owned()))?;
+                index += 1;
             }
             _ => {
                 let start = index;
@@ -316,14 +315,52 @@ fn tokenize_keyvalues(data: &[u8]) -> Result<Vec<Token>, String> {
                 if start == index {
                     return Err(format!("unexpected VMT byte at offset {index}"));
                 }
-                tokens.push(Token::Text(text[start..index].to_owned()));
+                let value = text[start..index].to_owned();
+                let token = if value.starts_with('[') && value.ends_with(']') {
+                    Token::Conditional(value)
+                } else {
+                    Token::Text(value)
+                };
+                push_token(&mut tokens, token)?;
             }
         }
     }
     Ok(tokens)
 }
 
-fn parse_object(tokens: &[Token], index: &mut usize) -> Result<Vec<(String, KvValue)>, String> {
+fn pc_condition(condition: &str) -> Result<bool, String> {
+    let condition = condition
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| format!("invalid VMT conditional {condition:?}"))?;
+    let (negated, symbol) = condition
+        .strip_prefix('!')
+        .map_or((false, condition), |symbol| (true, symbol));
+    let active = if symbol.eq_ignore_ascii_case("$WIN32") || symbol.eq_ignore_ascii_case("$WINDOWS")
+    {
+        true
+    } else if symbol.eq_ignore_ascii_case("$X360")
+        || symbol.eq_ignore_ascii_case("$OSX")
+        || symbol.eq_ignore_ascii_case("$LINUX")
+        || symbol.eq_ignore_ascii_case("$POSIX")
+    {
+        false
+    } else {
+        return Err(format!("unsupported VMT conditional {condition:?}"));
+    };
+    Ok(active ^ negated)
+}
+
+fn parse_object(
+    tokens: &[Token],
+    index: &mut usize,
+    depth: usize,
+) -> Result<Vec<(String, KvValue)>, String> {
+    if depth > MAX_VMT_NESTING {
+        return Err(format!(
+            "VMT nesting exceeds the {MAX_VMT_NESTING}-level safety limit"
+        ));
+    }
     if !matches!(tokens.get(*index), Some(Token::Open)) {
         return Err("expected VMT opening brace".to_owned());
     }
@@ -336,6 +373,9 @@ fn parse_object(tokens: &[Token], index: &mut usize) -> Result<Vec<(String, KvVa
                 return Ok(values);
             }
             Some(Token::Text(_)) => {}
+            Some(Token::Conditional(_)) => {
+                return Err("VMT object has a conditional without a key".to_owned());
+            }
             Some(Token::Open) => return Err("VMT object has a block without a key".to_owned()),
             None => return Err("VMT object is missing its closing brace".to_owned()),
         }
@@ -344,22 +384,38 @@ fn parse_object(tokens: &[Token], index: &mut usize) -> Result<Vec<(String, KvVa
         };
         let key = key.clone();
         *index += 1;
+        let mut accepted = true;
+        if let Some(Token::Conditional(condition)) = tokens.get(*index) {
+            accepted = pc_condition(condition)?;
+            *index += 1;
+        }
         let value = match tokens.get(*index) {
             Some(Token::Text(value)) => {
                 *index += 1;
                 KvValue::String(value.clone())
             }
-            Some(Token::Open) => KvValue::Object(parse_object(tokens, index)?),
-            Some(Token::Close) | None => {
+            Some(Token::Open) => KvValue::Object(parse_object(tokens, index, depth + 1)?),
+            Some(Token::Conditional(_)) | Some(Token::Close) | None => {
                 return Err(format!("VMT key {key:?} has no value"));
             }
         };
-        values.push((key, value));
+        if let Some(Token::Conditional(condition)) = tokens.get(*index) {
+            if matches!(value, KvValue::Object(_)) {
+                return Err(format!(
+                    "VMT block {key:?} has an unsupported trailing conditional"
+                ));
+            }
+            accepted &= pc_condition(condition)?;
+            *index += 1;
+        }
+        if accepted {
+            values.push((key, value));
+        }
     }
 }
 
 fn string_input<'a>(values: &'a [(String, KvValue)], key: &str) -> Option<&'a str> {
-    values.iter().rev().find_map(|(name, value)| {
+    values.iter().find_map(|(name, value)| {
         if name.eq_ignore_ascii_case(key)
             && let KvValue::String(value) = value
         {
@@ -403,7 +459,7 @@ fn shader_family(shader: &str) -> &'static str {
     }
 }
 
-pub fn parse_vmt(data: &[u8]) -> Result<VmtMaterial, String> {
+fn parse_vmt_document(data: &[u8]) -> Result<ParsedVmt, String> {
     if data.len() as u64 > MAX_VMT_BYTES {
         return Err(format!("VMT exceeds the {MAX_VMT_BYTES}-byte safety limit"));
     }
@@ -412,18 +468,87 @@ pub fn parse_vmt(data: &[u8]) -> Result<VmtMaterial, String> {
         return Err("VMT is missing its shader name".to_owned());
     };
     let mut index = 1;
-    let values = parse_object(&tokens, &mut index)?;
+    let root_active = if let Some(Token::Conditional(condition)) = tokens.get(index) {
+        index += 1;
+        pc_condition(condition)?
+    } else {
+        true
+    };
+    let values = parse_object(&tokens, &mut index, 1)?;
     if index != tokens.len() {
         return Err("VMT has trailing content after its root block".to_owned());
     }
+    if !root_active {
+        return Err("VMT root is inactive for the PC export target".to_owned());
+    }
+    Ok(ParsedVmt {
+        shader: shader.clone(),
+        values,
+    })
+}
 
-    let inputs = values
-        .iter()
-        .filter_map(|(key, value)| match value {
-            KvValue::String(value) => Some((key.to_ascii_lowercase(), value.clone())),
-            KvValue::Object(_) => None,
-        })
-        .collect();
+fn material_key(key: &str) -> Result<Option<(String, bool)>, String> {
+    let Some((condition, key)) = key.split_once('?') else {
+        return Ok(Some((key.to_owned(), false)));
+    };
+    if condition.is_empty() || key.is_empty() {
+        return Err(format!("invalid conditional material key {key:?}"));
+    }
+    let (negated, condition) = condition
+        .strip_prefix('!')
+        .map_or((false, condition), |condition| (true, condition));
+    let active = if condition.eq_ignore_ascii_case("ldr") || condition.eq_ignore_ascii_case("srgb")
+    {
+        true
+    } else if condition.eq_ignore_ascii_case("hdr")
+        || condition.eq_ignore_ascii_case("lowfill")
+        || condition.eq_ignore_ascii_case("360")
+    {
+        false
+    } else {
+        return Err(format!(
+            "unsupported material-key conditional {condition:?}"
+        ));
+    };
+    Ok((active ^ negated).then(|| (key.to_owned(), true)))
+}
+
+fn effective_material_values(
+    values: Vec<(String, KvValue)>,
+) -> Result<Vec<(String, KvValue)>, String> {
+    let mut effective = Vec::with_capacity(values.len());
+    let mut by_name = HashMap::with_capacity(values.len());
+    for (key, value) in values {
+        let Some((key, conditional)) = material_key(&key)? else {
+            continue;
+        };
+        let lookup = key.to_ascii_lowercase();
+        if let Some(index) = by_name.get(&lookup).copied() {
+            if conditional {
+                effective[index] = (key, value);
+            }
+        } else {
+            by_name.insert(lookup, effective.len());
+            effective.push((key, value));
+        }
+    }
+    Ok(effective)
+}
+
+fn material_from_document(document: ParsedVmt) -> Result<VmtMaterial, String> {
+    if document.shader.eq_ignore_ascii_case("Patch") {
+        return Err("Patch VMT requires material dependency resolution".to_owned());
+    }
+    let values = effective_material_values(document.values)?;
+
+    let mut inputs = BTreeMap::new();
+    for (key, value) in &values {
+        if let KvValue::String(value) = value {
+            inputs
+                .entry(key.to_ascii_lowercase())
+                .or_insert_with(|| value.clone());
+        }
+    }
     let proxies = values
         .iter()
         .filter(|(key, _)| key.eq_ignore_ascii_case("Proxies"))
@@ -443,7 +568,7 @@ pub fn parse_vmt(data: &[u8]) -> Result<VmtMaterial, String> {
         detail: texture_input(&values, "$detail"),
         env_map: texture_input(&values, "$envmap"),
     };
-    let family = shader_family(shader).to_owned();
+    let family = shader_family(&document.shader).to_owned();
     let features = VmtFeatures {
         unlit: family == "unlitGeneric",
         translucent: bool_input(&values, "$translucent"),
@@ -460,7 +585,7 @@ pub fn parse_vmt(data: &[u8]) -> Result<VmtMaterial, String> {
 
     Ok(VmtMaterial {
         shader: VmtShaderMetadata {
-            name: shader.clone(),
+            name: document.shader,
             family,
             inputs,
         },
@@ -469,6 +594,10 @@ pub fn parse_vmt(data: &[u8]) -> Result<VmtMaterial, String> {
         surface_prop: string_input(&values, "$surfaceprop").map(str::to_owned),
         unsupported: UnsupportedMaterialFeatures { proxies, animated },
     })
+}
+
+pub fn parse_vmt(data: &[u8]) -> Result<VmtMaterial, String> {
+    material_from_document(parse_vmt_document(data)?)
 }
 
 fn normalize_archive_path(path: &str) -> Result<String, String> {
@@ -649,6 +778,131 @@ fn resolve_external(
         })
         .transpose()
         .map(Option::flatten)
+}
+
+fn apply_patch_entries(
+    destination: &mut Vec<(String, KvValue)>,
+    source: &[(String, KvValue)],
+    replace_only: bool,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_VMT_NESTING {
+        return Err(format!(
+            "VMT patch nesting exceeds the {MAX_VMT_NESTING}-level safety limit"
+        ));
+    }
+    let mut by_name = HashMap::with_capacity(destination.len() + source.len());
+    for (index, (key, _)) in destination.iter().enumerate() {
+        by_name.entry(key.to_ascii_lowercase()).or_insert(index);
+    }
+    for (key, value) in source {
+        let lookup = key.to_ascii_lowercase();
+        if let Some(index) = by_name.get(&lookup).copied() {
+            if let KvValue::Object(source_values) = value {
+                if !matches!(destination[index].1, KvValue::Object(_)) {
+                    destination[index].1 = KvValue::Object(Vec::new());
+                }
+                let KvValue::Object(destination_values) = &mut destination[index].1 else {
+                    unreachable!();
+                };
+                apply_patch_entries(destination_values, source_values, replace_only, depth + 1)?;
+            } else {
+                destination[index].1 = value.clone();
+            }
+        } else if !replace_only {
+            by_name.insert(lookup, destination.len());
+            destination.push((key.clone(), value.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn patch_section<'a>(
+    values: &'a [(String, KvValue)],
+    key: &str,
+) -> Result<Option<&'a [(String, KvValue)]>, String> {
+    let Some((_, value)) = values
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+    else {
+        return Ok(None);
+    };
+    match value {
+        KvValue::Object(values) => Ok(Some(values)),
+        KvValue::String(_) => Err(format!("Patch {key:?} must be an object")),
+    }
+}
+
+fn accumulate_patch(document: &ParsedVmt, changes: &mut PatchChanges) -> Result<String, String> {
+    for (key, _) in &document.values {
+        if !key.eq_ignore_ascii_case("include")
+            && !key.eq_ignore_ascii_case("insert")
+            && !key.eq_ignore_ascii_case("replace")
+        {
+            return Err(format!("unsupported Patch command {key:?}"));
+        }
+    }
+    let include = string_input(&document.values, "include")
+        .filter(|include| !include.trim().is_empty())
+        .ok_or_else(|| "Patch VMT is missing a non-empty include".to_owned())?;
+    if let Some(insert) = patch_section(&document.values, "insert")? {
+        apply_patch_entries(&mut changes.insert, insert, false, 1)?;
+    }
+    if let Some(replace) = patch_section(&document.values, "replace")? {
+        apply_patch_entries(&mut changes.replace, replace, false, 1)?;
+    }
+    Ok(include.to_owned())
+}
+
+fn resolve_effective_vmt(
+    root_data: &[u8],
+    root_path: &str,
+    embedded_resources: &[PakResource],
+    by_path: &HashMap<String, usize>,
+    resolver: Option<&dyn MaterialResolver>,
+) -> Result<VmtMaterial, String> {
+    let mut document = parse_vmt_document(root_data)
+        .map_err(|error| format!("failed to parse {root_path}: {error}"))?;
+    let mut current_path = root_path.to_owned();
+    let mut visited = HashSet::from([root_path.to_ascii_lowercase()]);
+    let mut changes = PatchChanges::default();
+    let mut patch_depth = 0;
+
+    while document.shader.eq_ignore_ascii_case("Patch") {
+        if patch_depth >= MAX_VMT_PATCH_DEPTH {
+            return Err(format!(
+                "Patch include depth and dependency count exceed the {MAX_VMT_PATCH_DEPTH}-file safety limit at {current_path}"
+            ));
+        }
+        let include = accumulate_patch(&document, &mut changes)
+            .map_err(|error| format!("invalid Patch VMT {current_path}: {error}"))?;
+        let include_path = source_lookup_path(&include, ".vmt")?;
+        if !visited.insert(include_path.to_ascii_lowercase()) {
+            return Err(format!(
+                "Patch include cycle from {current_path} to {include_path}"
+            ));
+        }
+
+        let data = if let Some(resource) = lookup_pak(embedded_resources, by_path, &include_path) {
+            Cow::Borrowed(resource.data.as_slice())
+        } else if let Some(resource) =
+            resolve_external(resolver, &include_path, PakResourceKind::Vmt)?
+        {
+            Cow::Owned(resource.data)
+        } else {
+            return Err(format!(
+                "Patch VMT {current_path} includes unavailable dependency {include_path}"
+            ));
+        };
+        document = parse_vmt_document(&data)
+            .map_err(|error| format!("failed to parse Patch dependency {include_path}: {error}"))?;
+        current_path = include_path;
+        patch_depth += 1;
+    }
+
+    apply_patch_entries(&mut document.values, &changes.insert, false, 1)?;
+    apply_patch_entries(&mut document.values, &changes.replace, true, 1)?;
+    material_from_document(document)
 }
 
 struct TexturePackageBuilder {
@@ -859,7 +1113,12 @@ fn build_materials(
             });
             (None, ResourceProvenance::Unresolved)
         };
-        let metadata = vmt_data.as_deref().map(parse_vmt).transpose()?;
+        let metadata = vmt_data
+            .as_deref()
+            .map(|data| {
+                resolve_effective_vmt(data, &vmt_path, embedded_resources, &by_path, resolver)
+            })
+            .transpose()?;
         let mut textures = Vec::new();
         if let Some(material) = &metadata {
             let references = [

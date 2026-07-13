@@ -1,6 +1,6 @@
 use bsp_to_glb::{
-    ExportOptions, TextureDecodeStatus, VtfImageSelection, export_bsp_with_options,
-    read_bsp_pak_resources,
+    ExportOptions, TextureDecodeStatus, VtfImageSelection, build_source_material_manifest,
+    export_bsp_with_options, read_bsp_pak_resources,
 };
 use std::env;
 use std::fs;
@@ -26,6 +26,16 @@ fn hydrogen_pak_material_coverage_and_benchmark() {
     let started = Instant::now();
     let result = export_bsp_with_options(&bsp, &options).unwrap();
     let elapsed = started.elapsed();
+    let material_names = result
+        .material_manifest
+        .materials
+        .iter()
+        .map(|material| material.name.clone())
+        .collect::<Vec<_>>();
+    let parse_started = Instant::now();
+    let parsed_manifest =
+        build_source_material_manifest(&material_names, &pak_resources, None).unwrap();
+    let parse_elapsed = parse_started.elapsed();
     let package = result
         .material_textures
         .as_ref()
@@ -63,11 +73,13 @@ fn hydrogen_pak_material_coverage_and_benchmark() {
         package.manifest.sources.len()
     );
     assert!(package.artifacts.len() <= decoded);
+    assert_eq!(parsed_manifest.materials.len(), material_names.len());
     assert_eq!(resources.len(), pak_resources.len());
     assert_eq!(resources.len(), pak_vmts + pak_vtfs);
     eprintln!(
-        "Hydrogen PAK scan: {:.3} ms; material package export: {:.3} ms, materials={}, pak_vmt={}, pak_vtf={}, references={}, decoded={}, unsupported={}, invalid={}, unique_png={}",
+        "Hydrogen PAK scan: {:.3} ms; effective material parse: {:.3} ms; material package export: {:.3} ms, materials={}, pak_vmt={}, pak_vtf={}, references={}, decoded={}, unsupported={}, invalid={}, unique_png={}",
         pak_elapsed.as_secs_f64() * 1_000.0,
+        parse_elapsed.as_secs_f64() * 1_000.0,
         elapsed.as_secs_f64() * 1_000.0,
         result.material_manifest.materials.len(),
         pak_vmts,
