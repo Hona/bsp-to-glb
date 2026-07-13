@@ -30,6 +30,8 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - bounded BSP PAK parsing for embedded VMT/VTF resources
 - lightmap UVs supplied by existing atlas metadata
 - hidden-but-preserved sky, trigger and disabled brush models
+- versioned direct-BSP collision sidecars with brush-model ownership
+- raw per-model PHYSCOLLIDE blocks and metadata (opaque, explicitly not decoded)
 - LZMA-compressed BSP lumps
 
 Unsupported domains are detected or reported explicitly:
@@ -38,7 +40,7 @@ Unsupported domains are detected or reported explicitly:
 - static and dynamic prop model assets
 - VTF pixel conversion and full shader execution
 - material proxies and animated materials (identified as metadata only)
-- collision brushes and physics meshes
+- decoded VPhysics collision meshes
 - PVS/leaf visibility data
 - overlays and particles
 
@@ -103,7 +105,8 @@ bsp-to-glb \
   --bsp path/to/compiled.bsp \
   --out path/to/map.glb \
   --lightmaps path/to/lightmap_data.json \
-  --material-manifest path/to/map.materials.json
+  --material-manifest path/to/map.materials.json \
+  --collision-out path/to/map.collision.json \
 ```
 
 `--lightmaps` is optional. The current input format is produced by the tf2jump map pipeline and
@@ -129,6 +132,26 @@ PAK parsing only exposes `materials/**/*.vmt` and `materials/**/*.vtf`. It rejec
 case-insensitive duplicate paths, oversized entries and malformed ZIP data, and applies bounded
 entry and decompression limits.
 
+`--out` and `--collision-out` are independently optional, but at least one is required. A
+collision-only export does not parse or triangulate render faces.
+
+## Collision Sidecar
+
+Collision output is JSON with schema `bsp-to-glb/collision`, version `1`. It preserves Source-space
+planes, brush sides, brushes, leaf-brush references, leaf and brush contents, and model ownership
+derived from each BSP model's head node. `CONTENTS_PLAYERCLIP` remains present in the numeric
+contents mask and is also exposed as `playerClip` for consumers.
+
+The sidecar declares `geometrySource: "bspBrushes"` and
+`renderTriangleSubstitution: false`; render triangles are never used as collision fallback.
+PHYSCOLLIDE model headers and raw blocks are retained as base64, while `decodeStatus` is
+`"unsupported"` until a compatible VPhysics decoder is implemented.
+
+Static-prop collision metadata is modular library input through `CollisionExportInput`. `None`
+means GAME_LUMP data was unavailable; `Some` preserves supplied prop indices, model names and
+solid modes. The CLI currently reports static-prop input as unavailable because this branch has no
+shared GAME_LUMP parser.
+
 ## Verification
 
 ```bash
@@ -138,6 +161,16 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Tests use synthetic BSP fixtures and do not include game assets.
+
+The external Hydrogen acceptance test can be run without committing the map:
+
+```bash
+HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --test hydrogen_collision -- --ignored
+```
+
+It verifies 3,511 brushes, 31,092 brush sides, 2,575 world-model brushes, 259 playerclip brushes,
+151 model entries, and collision ownership for zero-render model 147.
 
 ## Design Principles
 
@@ -154,7 +187,7 @@ Tests use synthetic BSP fixtures and do not include game assets.
 2. Direct lightmap atlas generation, including directional bump channels
 3. Static prop game lumps and reusable model references
 4. VMT/VTF material package integration
-5. Collision brush and physics sidecars
+5. Collision brush and opaque physics sidecars (implemented)
 6. Leaf/cluster/PVS sidecars
 7. Versioned output manifests and runtime integration
 
