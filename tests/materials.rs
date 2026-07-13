@@ -1,8 +1,9 @@
 use bsp_to_glb::{
-    MaterialResolver, PakResourceKind, ResolvedMaterialResource, build_source_material_manifest,
-    parse_vmt, read_bsp_pak_resources,
+    MaterialResolver, MaterialResourceProvenance, PakResourceKind, ResolvedMaterialResource,
+    build_source_material_manifest, parse_vmt, read_bsp_pak_resources,
 };
 use serde_json::to_value;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::io::{Cursor, Write};
 use zip::CompressionMethod;
@@ -289,9 +290,15 @@ impl MaterialResolver for FixtureResolver {
     fn resolve(&self, lookup_path: &str) -> Result<Option<ResolvedMaterialResource>, String> {
         self.requests.borrow_mut().push(lookup_path.to_owned());
         if lookup_path.eq_ignore_ascii_case("materials/brick/test_normal.vtf") {
+            let data = b"external-synthetic-vtf".to_vec();
             Ok(Some(ResolvedMaterialResource {
-                data: b"external-synthetic-vtf".to_vec(),
-                provenance: "fixture-resolver".to_owned(),
+                provenance: MaterialResourceProvenance {
+                    mount_id: "fixture-resolver".to_owned(),
+                    path: lookup_path.to_owned(),
+                    crc32: format!("{:08x}", crc32fast::hash(&data)),
+                    content_hash: format!("sha256:{:x}", Sha256::digest(&data)),
+                },
+                data,
             }))
         } else {
             Ok(None)
@@ -321,7 +328,7 @@ fn manifest_uses_pak_first_then_reports_external_and_unresolved_assets() {
             .unwrap();
     let json = to_value(&manifest).unwrap();
 
-    assert_eq!(json["schemaVersion"], 2);
+    assert_eq!(json["schemaVersion"], 3);
     assert_eq!(json["lookupPolicy"], "pakFirst");
     assert_eq!(
         json["materials"][0]["vmt"]["lookupPath"],

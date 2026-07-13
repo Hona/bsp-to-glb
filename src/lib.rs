@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 
 mod collision;
+mod material_resolver;
 mod materials;
 mod vtf;
 
@@ -11,13 +12,17 @@ pub use collision::{
     CollisionExportInput, CollisionExportResult, CollisionStats, StaticPropCollisionInput,
     export_collision_sidecar,
 };
+pub use material_resolver::{
+    MATERIAL_MOUNT_PLAN_VERSION, MaterialResolverLimits, MountedMaterialResolver,
+};
 pub use materials::{
-    EmbeddedResourceMetadata, ManifestResource, ManifestTexture, MaterialLimitations,
-    MaterialResolver, MaterialTextureArtifact, MaterialTextureManifest, MaterialTextureOutput,
-    MaterialTextureSource, PakResource, PakResourceKind, ResolvedMaterialResource,
-    ResourceProvenance, SourceMaterialEntry, SourceMaterialManifest, SourceMaterialPackage,
-    TextureDecodeStatus, UnresolvedAsset, UnsupportedMaterialFeatures, VmtFeatures, VmtMaterial,
-    VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
+    EmbeddedResourceMetadata, MATERIAL_MANIFEST_VERSION, MATERIAL_TEXTURE_MANIFEST_VERSION,
+    ManifestResource, ManifestTexture, MaterialLimitations, MaterialResolver,
+    MaterialResourceProvenance, MaterialTextureArtifact, MaterialTextureManifest,
+    MaterialTextureOutput, MaterialTextureSource, PakResource, PakResourceKind,
+    ResolvedMaterialResource, ResourceProvenance, SourceMaterialEntry, SourceMaterialManifest,
+    SourceMaterialPackage, TextureDecodeStatus, UnresolvedAsset, UnsupportedMaterialFeatures,
+    VmtFeatures, VmtMaterial, VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
     build_source_material_package, parse_vmt, read_bsp_pak_resources,
 };
 pub use vtf::{
@@ -25,7 +30,7 @@ pub use vtf::{
     decode_vtf, inspect_vtf,
 };
 
-pub const BUILD_METADATA_SCHEMA_VERSION: u32 = 1;
+pub const BUILD_METADATA_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +48,7 @@ pub struct BuildCapabilities {
     pub displacements: BuildCapabilityStatus,
     pub direct_lightmaps: BuildCapabilityStatus,
     pub material_metadata: BuildCapabilityStatus,
+    pub material_resolution: BuildCapabilityStatus,
     pub vtf_pixel_conversion: BuildCapabilityStatus,
     pub prop_metadata: BuildCapabilityStatus,
     pub prop_geometry: BuildCapabilityStatus,
@@ -56,6 +62,15 @@ pub struct BuildCapabilities {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildComponentVersions {
+    pub material_manifest: u32,
+    pub material_mount_plan: u32,
+    pub material_textures: u32,
+    pub visibility_sidecar: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildMetadata {
     pub schema: &'static str,
     pub schema_version: u32,
@@ -65,6 +80,7 @@ pub struct BuildMetadata {
     pub profile: &'static str,
     pub source_commit: Option<&'static str>,
     pub capabilities: BuildCapabilities,
+    pub components: BuildComponentVersions,
 }
 
 pub fn build_metadata() -> BuildMetadata {
@@ -82,6 +98,7 @@ pub fn build_metadata() -> BuildMetadata {
             displacements: BuildCapabilityStatus::Supported,
             direct_lightmaps: BuildCapabilityStatus::Supported,
             material_metadata: BuildCapabilityStatus::Supported,
+            material_resolution: BuildCapabilityStatus::Supported,
             vtf_pixel_conversion: BuildCapabilityStatus::Supported,
             prop_metadata: BuildCapabilityStatus::Supported,
             prop_geometry: BuildCapabilityStatus::Unsupported,
@@ -92,6 +109,12 @@ pub fn build_metadata() -> BuildMetadata {
             water_overlays: BuildCapabilityStatus::DetectedOnly,
             cubemaps: BuildCapabilityStatus::DetectedOnly,
         },
+        components: BuildComponentVersions {
+            material_manifest: MATERIAL_MANIFEST_VERSION,
+            material_mount_plan: MATERIAL_MOUNT_PLAN_VERSION,
+            material_textures: MATERIAL_TEXTURE_MANIFEST_VERSION,
+            visibility_sidecar: VISIBILITY_SIDECAR_VERSION,
+        },
     }
 }
 
@@ -100,6 +123,7 @@ const LUMP_PLANES: usize = 1;
 const LUMP_TEXDATA: usize = 2;
 const LUMP_VERTEXES: usize = 3;
 const LUMP_VISIBILITY: usize = 4;
+const LUMP_NODES: usize = 5;
 const LUMP_TEXINFO: usize = 6;
 const LUMP_FACES: usize = 7;
 const LUMP_LIGHTING: usize = 8;
@@ -130,6 +154,7 @@ const FACE_SIZE: usize = 56;
 const TEXINFO_SIZE: usize = 72;
 const TEXDATA_SIZE: usize = 32;
 const MODEL_SIZE: usize = 48;
+const NODE_SIZE: usize = 32;
 const PRIMITIVE_SIZE: usize = 10;
 const GAME_LUMP_HEADER_SIZE: usize = 16;
 const STATIC_PROP_NAME_LENGTH: usize = 128;
@@ -138,7 +163,10 @@ const GAME_LUMP_COMPRESSED: u16 = 0x0001;
 const LEAF_VERSION_0_SIZE: usize = 56;
 const LEAF_VERSION_1_SIZE: usize = 32;
 
-pub const VISIBILITY_SIDECAR_VERSION: u32 = 1;
+pub const VISIBILITY_SIDECAR_VERSION: u32 = 2;
+pub const MAX_VISIBILITY_PLANES: usize = 65_536;
+pub const MAX_VISIBILITY_NODES: usize = 65_536;
+pub const MAX_VISIBILITY_TREE_DEPTH: usize = 4_096;
 const DISPINFO_SIZE: usize = 176;
 const DISP_VERT_SIZE: usize = 20;
 const OVERLAY_SIZE: usize = 352;
@@ -391,6 +419,20 @@ pub struct VisibilityLeaf {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VisibilityPlane {
+    pub normal: [f32; 3],
+    pub distance: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisibilityNode {
+    pub plane_index: u32,
+    pub children: [i32; 2],
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VisibilityChunk {
     pub index: usize,
     pub mesh_index: usize,
@@ -408,6 +450,9 @@ pub struct VisibilitySidecar {
     pub cluster_count: usize,
     pub cluster_word_count: usize,
     pub pvs_words: Vec<u32>,
+    pub planes: Vec<VisibilityPlane>,
+    pub nodes: Vec<VisibilityNode>,
+    pub world_head_node: i32,
     pub leaves: Vec<VisibilityLeaf>,
     pub face_model_indices: Vec<i32>,
     pub world_face_indices: Vec<u32>,
@@ -429,6 +474,64 @@ impl VisibilitySidecar {
     pub fn to_json(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(self)
             .map_err(|error| format!("failed to serialize visibility sidecar: {error}"))
+    }
+
+    pub fn locate_world_leaf(&self, point: [f32; 3]) -> Result<usize, String> {
+        if point.iter().any(|value| !value.is_finite()) {
+            return Err("visibility query point contains a non-finite value".to_owned());
+        }
+        if self.planes.len() > MAX_VISIBILITY_PLANES {
+            return Err(format!(
+                "visibility plane count {} exceeds {MAX_VISIBILITY_PLANES}",
+                self.planes.len()
+            ));
+        }
+        if self.nodes.len() > MAX_VISIBILITY_NODES {
+            return Err(format!(
+                "visibility node count {} exceeds {MAX_VISIBILITY_NODES}",
+                self.nodes.len()
+            ));
+        }
+
+        let mut child = self.world_head_node;
+        let mut depth = 0;
+        while child >= 0 {
+            if depth == MAX_VISIBILITY_TREE_DEPTH {
+                return Err(format!(
+                    "visibility tree depth exceeds {MAX_VISIBILITY_TREE_DEPTH}"
+                ));
+            }
+            depth += 1;
+            let node_index = child as usize;
+            let node = self
+                .nodes
+                .get(node_index)
+                .ok_or_else(|| format!("visibility tree references missing node {node_index}"))?;
+            let plane = self.planes.get(node.plane_index as usize).ok_or_else(|| {
+                format!(
+                    "visibility node {node_index} references missing plane {}",
+                    node.plane_index
+                )
+            })?;
+            if !plane.distance.is_finite() || plane.normal.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "visibility plane {} contains a non-finite value",
+                    node.plane_index
+                ));
+            }
+            let distance = plane.normal[0] * point[0]
+                + plane.normal[1] * point[1]
+                + plane.normal[2] * point[2]
+                - plane.distance;
+            child = node.children[usize::from(distance < 0.0)];
+        }
+
+        let leaf_index = usize::try_from(-1_i64 - i64::from(child))
+            .map_err(|_| "visibility tree has an invalid leaf encoding".to_owned())?;
+        self.leaves
+            .get(leaf_index)
+            .ok_or_else(|| format!("visibility tree references missing leaf {leaf_index}"))?;
+        Ok(leaf_index)
     }
 }
 
@@ -816,7 +919,13 @@ fn parse_planes(data: &[u8]) -> Result<Vec<Plane>, String> {
     if !data.len().is_multiple_of(20) {
         return Err("plane lump length is not divisible by 20".to_owned());
     }
-    (0..data.len() / 20)
+    let count = data.len() / 20;
+    if count > MAX_VISIBILITY_PLANES {
+        return Err(format!(
+            "plane count {count} exceeds {MAX_VISIBILITY_PLANES}"
+        ));
+    }
+    (0..count)
         .map(|index| {
             let offset = index * 20;
             Ok(Plane {
@@ -1127,6 +1236,34 @@ fn parse_models(data: &[u8]) -> Result<Vec<Model>, String> {
         .collect()
 }
 
+fn parse_visibility_nodes(data: &[u8], version: i32) -> Result<Vec<VisibilityNode>, String> {
+    require_lump_version(version, "NODES", !data.is_empty())?;
+    if !data.len().is_multiple_of(NODE_SIZE) {
+        return Err(format!(
+            "NODES lump length {} is not divisible by {NODE_SIZE}",
+            data.len()
+        ));
+    }
+    let count = data.len() / NODE_SIZE;
+    if count > MAX_VISIBILITY_NODES {
+        return Err(format!("node count {count} exceeds {MAX_VISIBILITY_NODES}"));
+    }
+    (0..count)
+        .map(|index| {
+            let offset = index * NODE_SIZE;
+            let plane_index = read_i32(data, offset, "node plane index")?;
+            Ok(VisibilityNode {
+                plane_index: u32::try_from(plane_index)
+                    .map_err(|_| format!("node {index} has negative plane index {plane_index}"))?,
+                children: [
+                    read_i32(data, offset + 4, "node child")?,
+                    read_i32(data, offset + 8, "node child")?,
+                ],
+            })
+        })
+        .collect()
+}
+
 fn parse_i32_lump(data: &[u8], label: &str) -> Result<Vec<i32>, String> {
     if !data.len().is_multiple_of(4) {
         return Err(format!("{label} lump length is not divisible by 4"));
@@ -1233,7 +1370,11 @@ fn parse_visibility_leaves(data: &[u8], version: i32) -> Result<Vec<VisibilityLe
             data.len()
         ));
     }
-    (0..data.len() / size)
+    let count = data.len() / size;
+    if count > 65_536 {
+        return Err(format!("leaf count {count} exceeds 65536"));
+    }
+    (0..count)
         .map(|index| {
             let offset = index * size;
             Ok(VisibilityLeaf {
@@ -1255,6 +1396,89 @@ fn parse_visibility_leaves(data: &[u8], version: i32) -> Result<Vec<VisibilityLe
         .collect()
 }
 
+fn validate_visibility_reference(
+    child: i32,
+    node_count: usize,
+    leaf_count: usize,
+    context: &str,
+) -> Result<(), String> {
+    if child >= 0 {
+        let node_index = child as usize;
+        if node_index >= node_count {
+            return Err(format!("{context} references missing node {node_index}"));
+        }
+    } else {
+        let leaf_index = usize::try_from(-1_i64 - i64::from(child))
+            .map_err(|_| format!("{context} has an invalid leaf encoding {child}"))?;
+        if leaf_index >= leaf_count {
+            return Err(format!("{context} references missing leaf {leaf_index}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_visibility_node_graph(nodes: &[VisibilityNode]) -> Result<(), String> {
+    struct Frame {
+        index: usize,
+        next_child: usize,
+        max_child_depth: usize,
+    }
+
+    let mut states = vec![0_u8; nodes.len()];
+    let mut depths = vec![0_usize; nodes.len()];
+    let mut stack = Vec::new();
+    for root in 0..nodes.len() {
+        if states[root] != 0 {
+            continue;
+        }
+        states[root] = 1;
+        stack.push(Frame {
+            index: root,
+            next_child: 0,
+            max_child_depth: 0,
+        });
+        while let Some(frame) = stack.last_mut() {
+            if frame.next_child < 2 {
+                let child = nodes[frame.index].children[frame.next_child];
+                frame.next_child += 1;
+                if child < 0 {
+                    continue;
+                }
+                let child_index = child as usize;
+                match states[child_index] {
+                    0 => {
+                        states[child_index] = 1;
+                        stack.push(Frame {
+                            index: child_index,
+                            next_child: 0,
+                            max_child_depth: 0,
+                        });
+                    }
+                    1 => return Err("visibility node graph contains a cycle".to_owned()),
+                    2 => frame.max_child_depth = frame.max_child_depth.max(depths[child_index]),
+                    _ => unreachable!(),
+                }
+                continue;
+            }
+
+            let depth = frame.max_child_depth + 1;
+            if depth > MAX_VISIBILITY_TREE_DEPTH {
+                return Err(format!(
+                    "visibility tree depth {depth} exceeds {MAX_VISIBILITY_TREE_DEPTH}"
+                ));
+            }
+            let completed = frame.index;
+            states[completed] = 2;
+            depths[completed] = depth;
+            stack.pop();
+            if let Some(parent) = stack.last_mut() {
+                parent.max_child_depth = parent.max_child_depth.max(depth);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn set_cluster_bit(words: &mut [u32], cluster: usize) {
     words[cluster / 32] |= 1 << (cluster % 32);
 }
@@ -1269,6 +1493,7 @@ fn checked_u32(value: usize, label: &str) -> Result<u32, String> {
 
 fn build_visibility(
     bsp: &Bsp,
+    planes: &[Plane],
     faces: &[Face],
     models: &[Model],
     face_owner: &[Option<usize>],
@@ -1282,6 +1507,76 @@ fn build_visibility(
     let (cluster_count, pvs_words) = parse_pvs(&bsp.lumps[LUMP_VISIBILITY])?;
     let cluster_word_count = cluster_count.div_ceil(32);
     let leaves = parse_visibility_leaves(&bsp.lumps[LUMP_LEAFS], bsp.lump_versions[LUMP_LEAFS])?;
+    require_lump_version(bsp.lump_versions[LUMP_PLANES], "PLANES", !planes.is_empty())?;
+    require_lump_version(bsp.lump_versions[LUMP_MODELS], "MODELS", !models.is_empty())?;
+    if planes.is_empty() {
+        return Err("BSP has no PLANES data".to_owned());
+    }
+    for (index, plane) in planes.iter().enumerate() {
+        if !plane.distance.is_finite() || plane.normal.iter().any(|value| !value.is_finite()) {
+            return Err(format!("plane {index} contains a non-finite value"));
+        }
+    }
+    let nodes = parse_visibility_nodes(&bsp.lumps[LUMP_NODES], bsp.lump_versions[LUMP_NODES])?;
+    if nodes.is_empty() {
+        return Err("BSP has no NODES data".to_owned());
+    }
+    for (index, node) in nodes.iter().enumerate() {
+        if node.plane_index as usize >= planes.len() {
+            return Err(format!(
+                "node {index} references missing plane {}",
+                node.plane_index
+            ));
+        }
+        let plane = planes[node.plane_index as usize];
+        if !(0..=5).contains(&plane.plane_type) {
+            return Err(format!(
+                "node {index} references plane {} with invalid type {}",
+                node.plane_index, plane.plane_type
+            ));
+        }
+        if plane.plane_type < 3 {
+            let axis = plane.plane_type as usize;
+            if plane
+                .normal
+                .iter()
+                .enumerate()
+                .any(|(index, value)| *value != f32::from(index == axis))
+            {
+                return Err(format!(
+                    "node {index} references non-canonical axial plane {}",
+                    node.plane_index
+                ));
+            }
+        }
+        for child in node.children {
+            validate_visibility_reference(
+                child,
+                nodes.len(),
+                leaves.len(),
+                &format!("node {index}"),
+            )?;
+        }
+    }
+    for (index, model) in models.iter().enumerate() {
+        if model.head_node >= 0 {
+            let node_index = model.head_node as usize;
+            if node_index >= nodes.len() {
+                return Err(format!(
+                    "model {index} references missing head node {node_index}"
+                ));
+            }
+        } else {
+            let leaf_index = usize::try_from(-1_i64 - i64::from(model.head_node))
+                .map_err(|_| format!("model {index} has an invalid head leaf encoding"))?;
+            if leaf_index >= leaves.len() {
+                return Err(format!(
+                    "model {index} references missing head leaf {leaf_index}"
+                ));
+            }
+        }
+    }
+    validate_visibility_node_graph(&nodes)?;
     let leaf_faces = parse_u16_lump(&bsp.lumps[LUMP_LEAFFACES], "leaf face")?;
     let world = models
         .first()
@@ -1299,6 +1594,14 @@ fn build_visibility(
 
     let mut face_leaf_indices = vec![Vec::new(); faces.len()];
     for (leaf_index, leaf) in leaves.iter().enumerate() {
+        if leaf
+            .mins
+            .iter()
+            .zip(leaf.maxs)
+            .any(|(minimum, maximum)| *minimum > maximum)
+        {
+            return Err(format!("leaf {leaf_index} has inverted bounds"));
+        }
         if leaf.cluster < -1 || (leaf.cluster >= 0 && leaf.cluster as usize >= cluster_count) {
             return Err(format!(
                 "leaf {leaf_index} references invalid cluster {}",
@@ -1367,6 +1670,15 @@ fn build_visibility(
             cluster_count,
             cluster_word_count,
             pvs_words,
+            planes: planes
+                .iter()
+                .map(|plane| VisibilityPlane {
+                    normal: plane.normal,
+                    distance: plane.distance,
+                })
+                .collect(),
+            nodes,
+            world_head_node: world.head_node,
             leaves,
             face_model_indices,
             world_face_indices,
@@ -3030,10 +3342,18 @@ pub fn export_bsp_with_visibility(
     data: &[u8],
     lightmap_json: Option<&[u8]>,
 ) -> Result<ExportResult, String> {
+    export_bsp_with_material_resolver_and_visibility(data, lightmap_json, None)
+}
+
+pub fn export_bsp_with_material_resolver_and_visibility(
+    data: &[u8],
+    lightmap_json: Option<&[u8]>,
+    material_resolver: Option<&dyn MaterialResolver>,
+) -> Result<ExportResult, String> {
     export_bsp_internal(
         data,
         lightmap_json,
-        None,
+        material_resolver,
         &ExportOptions {
             lightmap_set: LightmapSet::None,
             ..ExportOptions::default()
@@ -3046,7 +3366,15 @@ pub fn export_bsp_with_options_and_visibility(
     data: &[u8],
     options: &ExportOptions,
 ) -> Result<ExportResult, String> {
-    export_bsp_internal(data, None, None, options, true)
+    export_bsp_with_options_and_material_resolver_and_visibility(data, options, None)
+}
+
+pub fn export_bsp_with_options_and_material_resolver_and_visibility(
+    data: &[u8],
+    options: &ExportOptions,
+    material_resolver: Option<&dyn MaterialResolver>,
+) -> Result<ExportResult, String> {
+    export_bsp_internal(data, None, material_resolver, options, true)
 }
 
 fn export_bsp_internal(
@@ -3207,7 +3535,7 @@ fn export_bsp_internal(
         options.atlas_width,
     )?;
     let mut visibility = include_visibility
-        .then(|| build_visibility(&bsp, &faces, &models, &face_owner))
+        .then(|| build_visibility(&bsp, &planes, &faces, &models, &face_owner))
         .transpose()?;
 
     let mut entity_by_model: HashMap<usize, (usize, &Entity)> = HashMap::new();
@@ -3930,7 +4258,7 @@ fn export_bsp_internal(
     let document = json!({
         "asset": {
             "version": "2.0",
-            "generator": "bsp-to-glb 0.1.0",
+            "generator": concat!("bsp-to-glb ", env!("CARGO_PKG_VERSION")),
             "extras": {
                 "source": "compiled Valve BSP",
                 "bspVersion": bsp.version,

@@ -51,8 +51,13 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
 "#
     .to_vec();
 
-    let mut planes = vec![0; 20];
+    let mut planes = vec![0; 3 * 20];
     put_f32(&mut planes, 8, 1.0);
+    put_i32(&mut planes, 16, 2);
+    put_f32(&mut planes, 20, 1.0);
+    put_i32(&mut planes, 20 + 16, 0);
+    put_f32(&mut planes, 40 + 4, 1.0);
+    put_i32(&mut planes, 40 + 16, 1);
     lumps[1] = planes;
 
     let mut texdata = vec![0; 32];
@@ -88,6 +93,15 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         visibility.push(row);
     }
     lumps[4] = visibility;
+
+    let mut nodes = vec![0; 2 * 32];
+    put_i32(&mut nodes, 0, 1);
+    put_i32(&mut nodes, 4, 1);
+    put_i32(&mut nodes, 8, -4);
+    put_i32(&mut nodes, 32, 2);
+    put_i32(&mut nodes, 36, -2);
+    put_i32(&mut nodes, 40, -3);
+    lumps[5] = nodes;
 
     let mut texinfo = vec![0; 72];
     put_f32(&mut texinfo, 0, 1.0);
@@ -131,12 +145,12 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
     {
         let offset = leaf * 32;
         put_i16(&mut leaves, offset + 4, cluster);
-        put_i16(&mut leaves, offset + 8, leaf as i16);
-        put_i16(&mut leaves, offset + 10, leaf as i16);
-        put_i16(&mut leaves, offset + 12, leaf as i16);
-        put_i16(&mut leaves, offset + 14, leaf as i16 + 1);
-        put_i16(&mut leaves, offset + 16, leaf as i16 + 1);
-        put_i16(&mut leaves, offset + 18, leaf as i16 + 1);
+        put_i16(&mut leaves, offset + 8, -16);
+        put_i16(&mut leaves, offset + 10, -16);
+        put_i16(&mut leaves, offset + 12, -16);
+        put_i16(&mut leaves, offset + 14, 16);
+        put_i16(&mut leaves, offset + 16, 16);
+        put_i16(&mut leaves, offset + 18, 16);
         put_u16(&mut leaves, offset + 20, first_face);
         put_u16(&mut leaves, offset + 22, face_count);
     }
@@ -478,7 +492,20 @@ fn exports_exact_versioned_visibility_memberships() {
     let sidecar = result.visibility.as_ref().unwrap();
 
     assert_eq!(sidecar.format, "bsp-to-glb.visibility");
-    assert_eq!(sidecar.version, 1);
+    assert_eq!(sidecar.version, 2);
+    assert_eq!(sidecar.world_head_node, 0);
+    assert_eq!(sidecar.planes.len(), 3);
+    assert_eq!(sidecar.planes[1].normal, [1.0, 0.0, 0.0]);
+    assert_eq!(sidecar.planes[1].distance, 0.0);
+    assert_eq!(sidecar.nodes.len(), 2);
+    assert_eq!(sidecar.nodes[0].plane_index, 1);
+    assert_eq!(sidecar.nodes[0].children, [1, -4]);
+    assert_eq!(sidecar.nodes[1].plane_index, 2);
+    assert_eq!(sidecar.nodes[1].children, [-2, -3]);
+    assert_eq!(sidecar.locate_world_leaf([1.0, -1.0, 0.0]).unwrap(), 2);
+    assert_eq!(sidecar.locate_world_leaf([1.0, 0.0, 0.0]).unwrap(), 1);
+    assert_eq!(sidecar.locate_world_leaf([-1.0, 1.0, 0.0]).unwrap(), 3);
+    assert!(sidecar.locate_world_leaf([f32::NAN, 0.0, 0.0]).is_err());
     assert_eq!(sidecar.cluster_count, 3);
     assert_eq!(sidecar.leaves.len(), 4);
     assert_eq!(sidecar.pvs_words, [0b101, 0b010, 0b111]);
@@ -518,6 +545,91 @@ fn exports_exact_versioned_visibility_memberships() {
 }
 
 #[test]
+fn rejects_malformed_visibility_tree_references_and_cycles() {
+    let cases = [
+        (5, 0, 3, "node 0 references missing plane 3"),
+        (5, 4, 2, "node 0 references missing node 2"),
+        (5, 4, -5, "node 0 references missing leaf 4"),
+        (14, 36, 2, "model 0 references missing head node 2"),
+        (5, 36, 0, "visibility node graph contains a cycle"),
+    ];
+
+    for (lump, relative_offset, value, expected) in cases {
+        let mut bsp = synthetic_bsp(false);
+        let offset = lump_offset(&bsp, lump) + relative_offset;
+        put_i32(&mut bsp, offset, value);
+        let error = export_bsp_with_visibility(&bsp, None).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "expected {expected:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_non_finite_visibility_planes() {
+    let mut bsp = synthetic_bsp(false);
+    let distance = lump_offset(&bsp, 1) + 12;
+    put_f32(&mut bsp, distance, f32::NAN);
+
+    let error = export_bsp_with_visibility(&bsp, None).unwrap_err();
+    assert!(
+        error.contains("plane 0 contains a non-finite value"),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_inverted_visibility_leaf_bounds() {
+    let mut bsp = synthetic_bsp(false);
+    let leaf_minimum = lump_offset(&bsp, 10) + 8;
+    put_i16(&mut bsp, leaf_minimum, 17);
+
+    let error = export_bsp_with_visibility(&bsp, None).unwrap_err();
+    assert!(error.contains("leaf 0 has inverted bounds"), "{error}");
+}
+
+#[test]
+fn rejects_visibility_lumps_above_public_record_bounds() {
+    let bsp = synthetic_bsp(false);
+    let too_many_planes = replace_lump(&bsp, 1, &vec![0; 65_537 * 20]);
+    let error = export_bsp_with_visibility(&too_many_planes, None).unwrap_err();
+    assert!(error.contains("plane count 65537 exceeds 65536"), "{error}");
+
+    let too_many_nodes = replace_lump(&bsp, 5, &vec![0; 65_537 * 32]);
+    let error = export_bsp_with_visibility(&too_many_nodes, None).unwrap_err();
+    assert!(error.contains("node count 65537 exceeds 65536"), "{error}");
+}
+
+#[test]
+fn rejects_visibility_trees_above_the_depth_bound() {
+    const EXCESSIVE_DEPTH: usize = 4_097;
+    let bsp = synthetic_bsp(false);
+    let mut nodes = vec![0; EXCESSIVE_DEPTH * 32];
+    for index in 0..EXCESSIVE_DEPTH {
+        let offset = index * 32;
+        put_i32(&mut nodes, offset, 0);
+        put_i32(
+            &mut nodes,
+            offset + 4,
+            if index + 1 == EXCESSIVE_DEPTH {
+                -1
+            } else {
+                (index + 1) as i32
+            },
+        );
+        put_i32(&mut nodes, offset + 8, -1);
+    }
+    let bsp = replace_lump(&bsp, 5, &nodes);
+
+    let error = export_bsp_with_visibility(&bsp, None).unwrap_err();
+    assert!(
+        error.contains("visibility tree depth 4097 exceeds 4096"),
+        "{error}"
+    );
+}
+
+#[test]
 fn composes_displacements_direct_lightmaps_materials_props_and_visibility() {
     let result =
         export_bsp_with_options_and_visibility(&synthetic_bsp(true), &ExportOptions::default())
@@ -549,7 +661,27 @@ fn cli_writes_visibility_sidecar() {
     let bsp_path = directory.join("synthetic.bsp");
     let glb_path = directory.join("synthetic.glb");
     let visibility_path = directory.join("synthetic.visibility.json");
+    let material_manifest_path = directory.join("synthetic.materials.json");
+    let mount_plan_path = directory.join("material-mounts.json");
+    let content_path = directory.join("content");
+    fs::create_dir_all(content_path.join("materials/brick")).unwrap();
     fs::write(&bsp_path, synthetic_bsp(false)).unwrap();
+    fs::write(
+        content_path.join("materials/brick/test.vmt"),
+        br#"LightmappedGeneric {}"#,
+    )
+    .unwrap();
+    fs::write(
+        &mount_plan_path,
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "mounts": [
+                { "id": "fixture", "kind": "directory", "path": content_path }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
         .args([
@@ -559,6 +691,10 @@ fn cli_writes_visibility_sidecar() {
             glb_path.to_str().unwrap(),
             "--visibility-out",
             visibility_path.to_str().unwrap(),
+            "--material-mount-plan",
+            mount_plan_path.to_str().unwrap(),
+            "--material-manifest",
+            material_manifest_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -570,7 +706,57 @@ fn cli_writes_visibility_sidecar() {
     let sidecar: bsp_to_glb::VisibilitySidecar =
         serde_json::from_slice(&fs::read(&visibility_path).unwrap()).unwrap();
     assert_eq!(sidecar.cluster_count, 3);
+    let material_bytes = fs::read(&material_manifest_path).unwrap();
+    assert!(!String::from_utf8_lossy(&material_bytes).contains(directory.to_str().unwrap()));
+    let materials: Value = serde_json::from_slice(&material_bytes).unwrap();
+    let provenance = &materials["materials"][0]["vmt"]["provenance"];
+    assert_eq!(provenance["kind"], "external");
+    assert_eq!(provenance["mountId"], "fixture");
+    assert_eq!(provenance["path"], "materials/brick/test.vmt");
+    assert_eq!(provenance.as_object().unwrap().len(), 5);
+    assert!(materials["unresolvedAssets"].as_array().unwrap().is_empty());
     assert!(glb_path.is_file());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cli_rejects_a_material_mount_plan_without_render_output() {
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "resolver-collision-only-test-{}",
+            std::process::id()
+        ));
+    fs::create_dir_all(&directory).unwrap();
+    let bsp_path = directory.join("synthetic.bsp");
+    let collision_path = directory.join("synthetic.collision.json");
+    let mount_plan_path = directory.join("material-mounts.json");
+    fs::write(&bsp_path, synthetic_bsp(false)).unwrap();
+    fs::write(
+        &mount_plan_path,
+        serde_json::to_vec(&json!({ "schemaVersion": 1, "mounts": [] })).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
+        .args([
+            "--bsp",
+            bsp_path.to_str().unwrap(),
+            "--collision-out",
+            collision_path.to_str().unwrap(),
+            "--material-mount-plan",
+            mount_plan_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--material-mount-plan requires --out")
+    );
+    assert!(!collision_path.exists());
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -627,6 +813,31 @@ fn lump_offset(bsp: &[u8], lump: usize) -> usize {
 
 fn set_lump_version(bsp: &mut [u8], lump: usize, version: i32) {
     put_i32(bsp, 8 + lump * 16 + 8, version);
+}
+
+fn replace_lump(bsp: &[u8], target_lump: usize, replacement: &[u8]) -> Vec<u8> {
+    let mut rebuilt = bsp[..HEADER_SIZE].to_vec();
+    for lump in 0..64 {
+        let header = 8 + lump * 16;
+        let old_offset = i32::from_le_bytes(bsp[header..header + 4].try_into().unwrap()) as usize;
+        let old_length =
+            i32::from_le_bytes(bsp[header + 4..header + 8].try_into().unwrap()) as usize;
+        let data = if lump == target_lump {
+            replacement
+        } else {
+            &bsp[old_offset..old_offset + old_length]
+        };
+        if data.is_empty() {
+            put_i32(&mut rebuilt, header, 0);
+            put_i32(&mut rebuilt, header + 4, 0);
+            continue;
+        }
+        let offset = rebuilt.len();
+        rebuilt.extend_from_slice(data);
+        put_i32(&mut rebuilt, header, offset as i32);
+        put_i32(&mut rebuilt, header + 4, data.len() as i32);
+    }
+    rebuilt
 }
 
 fn fnv1a64(data: &[u8]) -> u64 {
@@ -1158,7 +1369,7 @@ fn exports_a_local_displacement_map() {
 fn no_displacement_export_remains_byte_and_metric_stable() {
     let result = export_bsp(&synthetic_bsp(false), None).unwrap();
 
-    assert_eq!(fnv1a64(&result.glb), 2_725_951_261_419_704_846);
+    assert_eq!(fnv1a64(&result.glb), 9_571_780_838_537_332_067);
     assert_eq!(result.stats.faces, 2);
     assert_eq!(result.stats.vertices, 8);
     assert_eq!(result.stats.triangles, 4);
@@ -1216,7 +1427,7 @@ fn exports_pak_backed_source_material_manifest_and_safe_gltf_flags() {
     let manifest = serde_json::to_value(&result.material_manifest).unwrap();
     let gltf = glb_json(&result.glb);
 
-    assert_eq!(manifest["schemaVersion"], 2);
+    assert_eq!(manifest["schemaVersion"], 3);
     assert_eq!(manifest["materials"][0]["name"], "brick/test");
     assert_eq!(
         manifest["materials"][0]["metadata"]["shader"]["family"],
@@ -1270,7 +1481,7 @@ fn cli_writes_requested_versioned_material_sidecar() {
         String::from_utf8_lossy(&output.stderr)
     );
     let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    assert_eq!(manifest["schemaVersion"], 2);
+    assert_eq!(manifest["schemaVersion"], 3);
     assert_eq!(manifest["lookupPolicy"], "pakFirst");
     assert_eq!(
         manifest["unresolvedAssets"][0]["lookupPath"],

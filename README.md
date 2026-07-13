@@ -32,6 +32,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - versioned Source material manifests with PAK-first VMT/VTF provenance
 - VMT shader-family inputs and common render flags
 - bounded BSP PAK parsing for embedded VMT/VTF resources
+- ordered directory/VPK material mounts with native VPK v1/v2 ranged reads and CRC validation
 - bounded VTF 7.0-7.5 parsing and selected mip/frame/face decoding to lossless RGBA PNG
 - content-addressed material texture packages with decoded-pixel deduplication
 - lightmap UVs supplied by existing atlas metadata
@@ -44,7 +45,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - static-prop collision identity and solid-mode metadata when `sprp` is present
 - raw per-model PHYSCOLLIDE blocks and metadata (opaque, explicitly not decoded)
 - LZMA-compressed BSP lumps
-- exact leaf/cluster/PVS visibility sidecars with GLB chunk ownership
+- exact BSP-tree leaf/cluster/PVS visibility sidecars with GLB chunk ownership
 
 Unsupported domains are detected or reported explicitly:
 
@@ -134,8 +135,10 @@ bsp-to-glb --version
 bsp-to-glb --version-json
 ```
 
-The JSON includes schema version, package version, build target/profile, release source commit, and
-the release's supported, detected-only, and unsupported capability states.
+Build-metadata schema version 2 includes package version, build target/profile, release source
+commit, supported/detected-only/unsupported capability states, and serialized component versions.
+The current component versions are material manifest 3, material mount plan 1, material textures 1,
+and visibility sidecar 2.
 
 ```bash
 bsp-to-glb \
@@ -144,6 +147,7 @@ bsp-to-glb \
   --lightmap-set auto \
   --lightmap-atlas path/to/lightmap.png \
   --lightmap-manifest path/to/lightmaps.json \
+  --material-mount-plan path/to/material-mounts.json \
   --material-manifest path/to/map.materials.json \
   --texture-output path/to/textures \
   --texture-manifest path/to/textures/manifest.json \
@@ -168,17 +172,44 @@ The default maximum atlas row width is 4096 pixels and can be changed with `--at
 The legacy `--lightmaps path/to/lightmap_data.json` input remains available for pipeline-produced
 atlas metadata. It is mutually exclusive with direct atlas output options.
 
-`--material-manifest` is optional. It writes schema version 2 with the original BSP material name,
+`--material-manifest` is optional. It writes schema version 3 with the original BSP material name,
 canonical Source lookup paths, shader-family metadata, embedded resource inventory, per-resource
 provenance, optional texture-package source indices and unresolved assets. Embedded PAK resources
 always win over an external resolver.
 
 ## Material Resolution
 
-The library exposes `MaterialResolver` and `export_bsp_with_material_resolver` for callers that can
-provide resources from an installation or another asset store. A resolver receives canonical paths
-such as `materials/brick/wall.vtf` and must return real bytes plus a stable provenance label. The
-exporter does not include a game-asset resolver and does not emit placeholder textures.
+The library exposes `MaterialResolver` and resolver-aware export functions for callers that provide
+resources from an installation or another asset store. `--material-mount-plan` supplies the CLI's
+built-in `MountedMaterialResolver` with an immutable ordered list of game-content directories and
+VPK directory files:
+
+```json
+{
+  "schemaVersion": 1,
+  "mounts": [
+    { "id": "tfLoose", "kind": "directory", "path": "path/to/tf" },
+    { "id": "tfMisc", "kind": "vpk", "path": "path/to/tf/tf2_misc_dir.vpk" },
+    { "id": "tfTextures", "kind": "vpk", "path": "path/to/tf/tf2_textures_dir.vpk" }
+  ]
+}
+```
+
+Relative source paths are resolved from the plan file. The BSP PAK is always searched first, then
+mounts are searched in listed order; the first indexed entry wins. If that entry is unreadable,
+truncated, or fails its VPK CRC, resolution fails instead of falling through. Exporter references
+are normalized to canonical `materials/**/*.vmt` or `materials/**/*.vtf` lookups. Resolver lookup
+is case-insensitive after slash and dot-segment normalization and rejects traversal or other
+resource domains. VPK v1 and v2 preload bytes, embedded data, and external chunks are read directly
+by range without extraction or per-resource subprocesses.
+
+Published provenance contains only logical mount ID, normalized lookup path, CRC32, and SHA-256
+content hash. Local source paths are never written to material manifests. One resolver mutex covers
+budget accounting and the complete asset read, so each resolver performs at most one source read at
+a time and retains no open handles. Hard limits are 64 mounts, 250,000 indexed entries, 64 MiB of
+indexed paths, 32 MiB combined across the mount plan and VPK trees, 1,024-byte lookup paths, 16,384
+requests, 512 MiB of returned data, and one open source file. Declared asset length is charged
+against the remaining returned-data budget before content bytes are read.
 
 VMT parsing records shader inputs for unlit, translucency, additive blending, alpha test, no-cull,
 base texture, bump/SSBump, detail, self-illumination, envmap and surface properties. Proxies and
@@ -234,12 +265,20 @@ later layouts preserve uniform scale. Dynamic prop entities remain separate node
 original entity index and ordered key/value state. MDL paths are reusable asset references only;
 the exporter reports model resolution as unsupported and never fabricates missing geometry.
 
-`--visibility-out` is optional. It writes `bsp-to-glb.visibility` version 1 JSON. PVS rows and
+`--visibility-out` is optional. It writes `bsp-to-glb.visibility` version 2 JSON. PVS rows and
 face/chunk cluster memberships are flattened little-endian `u32` bitsets, with
 `clusterWordCount = ceil(clusterCount / 32)`. Leaf memberships use compact offset/index arrays:
 entry `n` occupies `indices[offsets[n]..offsets[n + 1]]`. World-face memberships come directly
 from `LEAFFACES`; bounds are not sampled. Chunks for non-world brush models have `staticPvs=false`
 and remain runtime-controlled rather than being culled by the static world PVS.
+
+Version 2 also preserves compiled plane records as `{normal, distance}`, node records as
+`{planeIndex, children}`, and `worldHeadNode`. Plane and node order is unchanged from the BSP;
+children retain the public BSP encoding where nonnegative values are node indices and a negative
+value identifies leaf `-value - 1`. Point traversal selects child 1 only for a negative signed
+plane distance and otherwise selects child 0. Export is bounded to 65,536 planes, 65,536 nodes,
+and 4,096 tree levels, and rejects non-finite planes, inverted leaf bounds, invalid references,
+cycles, and unsupported relevant lump versions.
 
 The CLI statistics include a `capabilities` object. Displacements report `exported`; overlays,
 water overlays and cubemaps report `detectedOnly`. Unknown optional-feature lump versions report
@@ -263,6 +302,9 @@ HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
 HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_materials -- --ignored --nocapture
+HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+TF2_GAME_DIR=/path/to/Team\ Fortress\ 2/tf \
+  cargo test --release --test hydrogen_materials hydrogen_stock_material_resolution_and_benchmark -- --ignored --nocapture
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_props -- --nocapture
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
@@ -275,8 +317,8 @@ a local map that is not distributed with this repository.
 It verifies 3,511 brushes, 31,092 brush sides, 2,575 world-model brushes, 259 playerclip brushes,
 151 model entries, collision ownership for zero-render model 147, and TF2 `sprp` v10 prop identity
 and solidity. The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529
-bumped lit faces. Visibility preserves all 450 PVS rows and 6,248 leaves; all 435 clusters owning
-world render faces are represented by static GLB chunks.
+bumped lit faces. Visibility preserves all 450 PVS rows, 16,244 planes, 6,096 nodes, and 6,248
+leaves; all 435 clusters owning world render faces are represented by static GLB chunks.
 
 ## Design Principles
 

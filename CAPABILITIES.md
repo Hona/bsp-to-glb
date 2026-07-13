@@ -11,11 +11,22 @@ as `build-metadata.json` in every archive.
 | Direct LDR/HDR lightmap data and manifests | Supported |
 | Material and prop metadata | Supported |
 | Brush collision sidecars | Supported |
-| Leaf, cluster, and PVS visibility sidecars | Supported |
+| BSP plane/node traversal, leaf, cluster, and PVS visibility sidecars | Supported |
 | Overlay, water-overlay, and cubemap detection | Detected only |
 | Static and dynamic prop model geometry | Unsupported |
 | VTF pixel conversion and content-addressed PNG packages | Supported |
+| Ordered directory and native VPK v1/v2 material resolution | Supported |
 | Decoded physics collision meshes | Unsupported |
+
+## Component Versions
+
+| Component | Version |
+|---|---:|
+| Build metadata | 2 |
+| Source material manifest | 3 |
+| Material mount plan | 1 |
+| Material texture manifest | 1 |
+| Visibility sidecar | 2 |
 
 `detectedOnly` means the input is reported but no corresponding render geometry or texture output
 is produced. `unsupported` means callers must provide another implementation for that domain.

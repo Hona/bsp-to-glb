@@ -1,7 +1,10 @@
 use bsp_to_glb::{
-    ExportOptions, TextureDecodeStatus, VtfImageSelection, build_source_material_manifest,
-    export_bsp_with_options, read_bsp_pak_resources,
+    ExportOptions, MaterialResolver, MountedMaterialResolver, ResourceProvenance,
+    TextureDecodeStatus, VtfImageSelection, build_source_material_manifest,
+    export_bsp_with_options, export_bsp_with_options_and_material_resolver, read_bsp_pak_resources,
 };
+use serde_json::json;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -89,5 +92,82 @@ fn hydrogen_pak_material_coverage_and_benchmark() {
         unsupported,
         invalid,
         package.artifacts.len(),
+    );
+}
+
+#[test]
+#[ignore = "requires HYDROGEN_BSP and TF2_GAME_DIR"]
+fn hydrogen_stock_material_resolution_and_benchmark() {
+    let bsp_path = env::var_os("HYDROGEN_BSP").expect("set HYDROGEN_BSP");
+    let game_dir = PathBuf::from(env::var_os("TF2_GAME_DIR").expect("set TF2_GAME_DIR"));
+    let bsp = fs::read(bsp_path).unwrap();
+    let plan = serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "mounts": [
+            { "id": "tfLoose", "kind": "directory", "path": game_dir },
+            { "id": "tfMisc", "kind": "vpk", "path": game_dir.join("tf2_misc_dir.vpk") },
+            { "id": "tfTextures", "kind": "vpk", "path": game_dir.join("tf2_textures_dir.vpk") }
+        ]
+    }))
+    .unwrap();
+
+    let index_started = Instant::now();
+    let resolver = MountedMaterialResolver::from_json(&plan).unwrap();
+    let index_elapsed = index_started.elapsed();
+    let six = [
+        "materials/LIGHTS/WHITE001.vmt",
+        "materials/Lights/White001.vtf",
+        "materials/TEST/COLOR008.vmt",
+        "materials/TOOLS/TOOLSBLACK.vmt",
+        "materials/TOOLS/TOOLSNODRAW.vmt",
+        "materials/TOOLS/TOOLSTRIGGER.vmt",
+    ];
+    let read_started = Instant::now();
+    for path in six {
+        assert!(resolver.resolve(path).unwrap().is_some(), "missing {path}");
+    }
+    let read_elapsed = read_started.elapsed();
+    assert!(
+        index_elapsed + read_elapsed < std::time::Duration::from_millis(250),
+        "cold resolver overhead was {:.3} ms",
+        (index_elapsed + read_elapsed).as_secs_f64() * 1_000.0
+    );
+
+    let result = export_bsp_with_options_and_material_resolver(
+        &bsp,
+        &ExportOptions::default(),
+        Some(&resolver),
+    )
+    .unwrap();
+    let mut stock_resources = BTreeSet::new();
+    for material in &result.material_manifest.materials {
+        if matches!(material.vmt.provenance, ResourceProvenance::External { .. }) {
+            stock_resources.insert(material.vmt.lookup_path.clone());
+        }
+        for texture in &material.textures {
+            if matches!(texture.provenance, ResourceProvenance::External { .. }) {
+                stock_resources.insert(texture.lookup_path.clone().unwrap());
+            }
+        }
+    }
+    assert!(
+        six.iter().all(|path| stock_resources.contains(*path)),
+        "Hydrogen no longer references all benchmark resources: {stock_resources:?}"
+    );
+    let unresolved = result
+        .material_manifest
+        .unresolved_assets
+        .iter()
+        .map(|asset| asset.lookup_path.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        unresolved,
+        BTreeSet::from(["materials/TOOLS/TOOLSSKYBOX2D.vmt".to_owned()])
+    );
+
+    eprintln!(
+        "Hydrogen stock resolver: index={:.3} ms, six reads={:.3} ms, resources={six:?}, unresolved={unresolved:?}",
+        index_elapsed.as_secs_f64() * 1_000.0,
+        read_elapsed.as_secs_f64() * 1_000.0,
     );
 }

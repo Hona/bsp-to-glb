@@ -1,10 +1,11 @@
 [package]
 name = "bsp-to-glb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 base64 = "0.22"
+crc32fast = "1"
 lzma-rs = "0.3"
 pathdiff = "0.2"
 png = "0.18"

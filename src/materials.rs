@@ -13,6 +13,9 @@ const MAX_VMT_PATCH_DEPTH: usize = 10;
 const MAX_VTF_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_MATERIAL_BYTES: u64 = 1024 * 1024 * 1024;
 
+pub const MATERIAL_MANIFEST_VERSION: u32 = 3;
+pub const MATERIAL_TEXTURE_MANIFEST_VERSION: u32 = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PakResourceKind {
@@ -30,14 +33,24 @@ pub struct PakResource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedMaterialResource {
     pub data: Vec<u8>,
-    pub provenance: String,
+    pub provenance: MaterialResourceProvenance,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialResourceProvenance {
+    pub mount_id: String,
+    pub path: String,
+    pub crc32: String,
+    pub content_hash: String,
 }
 
 /// Resolves a canonical Source lookup path such as `materials/brick/wall.vmt`.
 ///
 /// The exporter always checks the BSP PAK before invoking this resolver. A
-/// resolver must return the requested bytes and a stable provenance label; it
-/// must not return placeholder pixels or claim a resource it cannot provide.
+/// resolver must return the requested bytes with logical mount/path, CRC32,
+/// and SHA-256 provenance; it must not return placeholder pixels or claim a
+/// resource it cannot provide.
 pub trait MaterialResolver {
     fn resolve(&self, lookup_path: &str) -> Result<Option<ResolvedMaterialResource>, String>;
 }
@@ -98,10 +111,24 @@ pub struct VmtMaterial {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ResourceProvenance {
-    Pak { path: String },
-    External { resolver: String },
+    Pak {
+        mount_id: String,
+        path: String,
+        crc32: String,
+        content_hash: String,
+    },
+    External {
+        mount_id: String,
+        path: String,
+        crc32: String,
+        content_hash: String,
+    },
     BuiltIn,
     Unresolved,
 }
@@ -139,9 +166,12 @@ pub struct SourceMaterialEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddedResourceMetadata {
+    pub mount_id: String,
     pub path: String,
     pub kind: PakResourceKind,
     pub byte_length: usize,
+    pub crc32: String,
+    pub content_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -745,9 +775,16 @@ fn validate_external(
     lookup_path: &str,
     kind: PakResourceKind,
 ) -> Result<ResolvedMaterialResource, String> {
-    if resource.provenance.trim().is_empty() {
+    if resource.provenance.mount_id.is_empty()
+        || resource.provenance.mount_id.len() > 128
+        || !resource
+            .provenance
+            .mount_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
         return Err(format!(
-            "external resolver returned empty provenance for {lookup_path}"
+            "external resolver returned invalid logical mount ID for {lookup_path}"
         ));
     }
     let limit = match kind {
@@ -760,7 +797,43 @@ fn validate_external(
             resource.data.len()
         ));
     }
+    if !resource.provenance.path.eq_ignore_ascii_case(lookup_path) {
+        return Err(format!(
+            "external resolver returned provenance path {:?} for {lookup_path}",
+            resource.provenance.path
+        ));
+    }
+    let crc32 = format!("{:08x}", crc32fast::hash(&resource.data));
+    if resource.provenance.crc32 != crc32 {
+        return Err(format!(
+            "external resolver returned incorrect CRC provenance for {lookup_path}"
+        ));
+    }
+    let content_hash = sha256_content_id(&resource.data);
+    if resource.provenance.content_hash != content_hash {
+        return Err(format!(
+            "external resolver returned incorrect content hash provenance for {lookup_path}"
+        ));
+    }
     Ok(resource)
+}
+
+fn pak_provenance(path: &str, data: &[u8]) -> ResourceProvenance {
+    ResourceProvenance::Pak {
+        mount_id: "bspPak".to_owned(),
+        path: path.to_ascii_lowercase(),
+        crc32: format!("{:08x}", crc32fast::hash(data)),
+        content_hash: sha256_content_id(data),
+    }
+}
+
+fn external_provenance(provenance: MaterialResourceProvenance) -> ResourceProvenance {
+    ResourceProvenance::External {
+        mount_id: provenance.mount_id,
+        path: provenance.path,
+        crc32: provenance.crc32,
+        content_hash: provenance.content_hash,
+    }
 }
 
 fn resolve_external(
@@ -1003,7 +1076,7 @@ impl TexturePackageBuilder {
         (
             MaterialTextureManifest {
                 schema: "bsp-to-glb/material-textures".to_owned(),
-                version: 1,
+                version: MATERIAL_TEXTURE_MANIFEST_VERSION,
                 selection: self.selection,
                 sources: self.sources,
                 outputs: self.outputs,
@@ -1094,15 +1167,11 @@ fn build_materials(
         {
             (
                 Some(resource.data.clone()),
-                ResourceProvenance::Pak {
-                    path: resource.path.clone(),
-                },
+                pak_provenance(&vmt_path, &resource.data),
             )
         } else if let Some(resource) = resolve_external(resolver, &vmt_path, PakResourceKind::Vmt)?
         {
-            let provenance = ResourceProvenance::External {
-                resolver: resource.provenance,
-            };
+            let provenance = external_provenance(resource.provenance);
             (Some(resource.data), provenance)
         } else {
             unresolved_assets.push(UnresolvedAsset {
@@ -1158,18 +1227,14 @@ fn build_materials(
                     {
                         (
                             Some(Cow::Borrowed(resource.data.as_slice())),
-                            ResourceProvenance::Pak {
-                                path: resource.path.clone(),
-                            },
+                            pak_provenance(&lookup_path, &resource.data),
                         )
                     } else if let Some(resource) =
                         resolve_external(resolver, &lookup_path, PakResourceKind::Vtf)?
                     {
                         (
                             Some(Cow::Owned(resource.data)),
-                            ResourceProvenance::External {
-                                resolver: resource.provenance,
-                            },
+                            external_provenance(resource.provenance),
                         )
                     } else {
                         unresolved_assets.push(UnresolvedAsset {
@@ -1211,15 +1276,18 @@ fn build_materials(
     }
 
     let manifest = SourceMaterialManifest {
-        schema_version: 2,
+        schema_version: MATERIAL_MANIFEST_VERSION,
         lookup_policy: "pakFirst".to_owned(),
         materials,
         embedded_resources: embedded_resources
             .iter()
             .map(|resource| EmbeddedResourceMetadata {
+                mount_id: "bspPak".to_owned(),
                 path: resource.path.clone(),
                 kind: resource.kind,
                 byte_length: resource.data.len(),
+                crc32: format!("{:08x}", crc32fast::hash(&resource.data)),
+                content_hash: sha256_content_id(&resource.data),
             })
             .collect(),
         unresolved_assets,

@@ -1,6 +1,7 @@
 use bsp_to_glb::{
-    MaterialResolver, PakResource, PakResourceKind, ResolvedMaterialResource, TextureDecodeStatus,
-    VtfErrorKind, VtfImageSelection, build_source_material_package, decode_vtf, inspect_vtf,
+    MaterialResolver, MaterialResourceProvenance, PakResource, PakResourceKind,
+    ResolvedMaterialResource, TextureDecodeStatus, VtfErrorKind, VtfImageSelection,
+    build_source_material_package, decode_vtf, inspect_vtf,
 };
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -272,8 +273,13 @@ impl MaterialResolver for Resolver {
             _ => return Ok(None),
         };
         Ok(Some(ResolvedMaterialResource {
+            provenance: MaterialResourceProvenance {
+                mount_id: "fixture".to_owned(),
+                path: lookup_path.to_owned(),
+                crc32: format!("{:08x}", crc32fast::hash(&data)),
+                content_hash: format!("sha256:{:x}", Sha256::digest(&data)),
+            },
             data,
-            provenance: "fixture".to_owned(),
         }))
     }
 }
@@ -357,7 +363,7 @@ fn material_package_is_pak_first_content_addressed_and_preserves_failures() {
             .unwrap()
             .contains("RGBA16161616F")
     );
-    assert_eq!(package.material_manifest.schema_version, 2);
+    assert_eq!(package.material_manifest.schema_version, 3);
     assert_eq!(
         package.material_manifest.materials[0]
             .metadata

@@ -1,7 +1,9 @@
 use bsp_to_glb::{
-    CollisionExportInput, ExportOptions, LightmapSet, VtfImageSelection, build_metadata,
-    encode_lightmap_png, export_bsp, export_bsp_with_options,
-    export_bsp_with_options_and_visibility, export_bsp_with_visibility, export_collision_sidecar,
+    CollisionExportInput, ExportOptions, LightmapSet, MaterialResolver, MountedMaterialResolver,
+    VtfImageSelection, build_metadata, encode_lightmap_png, export_bsp_with_material_resolver,
+    export_bsp_with_material_resolver_and_visibility,
+    export_bsp_with_options_and_material_resolver,
+    export_bsp_with_options_and_material_resolver_and_visibility, export_collision_sidecar,
     static_prop_collision_inputs,
 };
 use std::env;
@@ -10,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -57,6 +59,7 @@ fn run() -> Result<(), String> {
     let mut collision_output_path: Option<PathBuf> = None;
     let mut lightmap_path: Option<PathBuf> = None;
     let mut material_manifest_path: Option<PathBuf> = None;
+    let mut material_mount_plan_path: Option<PathBuf> = None;
     let mut texture_output_path: Option<PathBuf> = None;
     let mut texture_manifest_path: Option<PathBuf> = None;
     let mut texture_selection = VtfImageSelection::default();
@@ -91,6 +94,7 @@ fn run() -> Result<(), String> {
             "--collision-out" => collision_output_path = Some(value.into()),
             "--lightmaps" => lightmap_path = Some(value.into()),
             "--material-manifest" => material_manifest_path = Some(value.into()),
+            "--material-mount-plan" => material_mount_plan_path = Some(value.into()),
             "--texture-output" => texture_output_path = Some(value.into()),
             "--texture-manifest" => texture_manifest_path = Some(value.into()),
             "--texture-mip" => {
@@ -155,6 +159,9 @@ fn run() -> Result<(), String> {
     if output_path.is_none() && texture_output_path.is_some() {
         return Err("--texture-output requires --out".to_owned());
     }
+    if output_path.is_none() && material_mount_plan_path.is_some() {
+        return Err("--material-mount-plan requires --out".to_owned());
+    }
     if texture_output_path.is_some() {
         options.material_texture_selection = Some(texture_selection);
     }
@@ -166,6 +173,13 @@ fn run() -> Result<(), String> {
             fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))
         })
         .transpose()?;
+    let mounted_resolver = material_mount_plan_path
+        .as_deref()
+        .map(MountedMaterialResolver::from_json_file)
+        .transpose()?;
+    let material_resolver = mounted_resolver
+        .as_ref()
+        .map(|resolver| resolver as &dyn MaterialResolver);
     let mut render_stats = None;
     let mut collision_stats = None;
     if let Some(output_path) = output_path {
@@ -176,14 +190,22 @@ fn run() -> Result<(), String> {
                 );
             }
             if visibility_path.is_some() {
-                export_bsp_with_visibility(&bsp, lightmaps.as_deref())?
+                export_bsp_with_material_resolver_and_visibility(
+                    &bsp,
+                    lightmaps.as_deref(),
+                    material_resolver,
+                )?
             } else {
-                export_bsp(&bsp, lightmaps.as_deref())?
+                export_bsp_with_material_resolver(&bsp, lightmaps.as_deref(), material_resolver)?
             }
         } else if visibility_path.is_some() {
-            export_bsp_with_options_and_visibility(&bsp, &options)?
+            export_bsp_with_options_and_material_resolver_and_visibility(
+                &bsp,
+                &options,
+                material_resolver,
+            )?
         } else {
-            export_bsp_with_options(&bsp, &options)?
+            export_bsp_with_options_and_material_resolver(&bsp, &options, material_resolver)?
         };
         let material_manifest = material_manifest_path
             .as_ref()
