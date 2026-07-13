@@ -3,6 +3,13 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 
+mod collision;
+
+pub use collision::{
+    CollisionExportInput, CollisionExportResult, CollisionStats, StaticPropCollisionInput,
+    export_collision_sidecar,
+};
+
 const LUMP_ENTITIES: usize = 0;
 const LUMP_PLANES: usize = 1;
 const LUMP_TEXDATA: usize = 2;
@@ -71,12 +78,15 @@ struct LumpHeader {
 
 struct Bsp {
     version: i32,
+    lump_versions: Vec<i32>,
     lumps: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
 struct Plane {
     normal: [f32; 3],
+    distance: f32,
+    plane_type: i32,
 }
 
 #[derive(Clone)]
@@ -124,6 +134,7 @@ struct Model {
     mins: [f32; 3],
     maxs: [f32; 3],
     origin: [f32; 3],
+    head_node: i32,
     first_face: i32,
     num_faces: i32,
 }
@@ -213,10 +224,12 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
     }
     let version = read_i32(data, 4, "BSP version")?;
     let mut headers = Vec::with_capacity(64);
+    let mut lump_versions = Vec::with_capacity(64);
     for index in 0..64 {
         let offset = 8 + index * 16;
         let file_offset = read_i32(data, offset, "lump table")?;
         let file_length = read_i32(data, offset + 4, "lump table")?;
+        let lump_version = read_i32(data, offset + 8, "lump table")?;
         let uncompressed_size = read_i32(data, offset + 12, "lump table")?;
         if file_offset < 0 || file_length < 0 || uncompressed_size < 0 {
             return Err(format!("lump {index} has a negative offset or length"));
@@ -226,6 +239,7 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
             length: file_length as usize,
             uncompressed_size: uncompressed_size as usize,
         });
+        lump_versions.push(lump_version);
     }
 
     let mut lumps = Vec::with_capacity(64);
@@ -272,7 +286,11 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
             lumps.push(raw.to_vec());
         }
     }
-    Ok(Bsp { version, lumps })
+    Ok(Bsp {
+        version,
+        lump_versions,
+        lumps,
+    })
 }
 
 fn parse_vec3_lump(data: &[u8], label: &str) -> Result<Vec<[f32; 3]>, String> {
@@ -307,6 +325,8 @@ fn parse_planes(data: &[u8]) -> Result<Vec<Plane>, String> {
                     read_f32(data, offset + 4, "plane")?,
                     read_f32(data, offset + 8, "plane")?,
                 ],
+                distance: read_f32(data, offset + 12, "plane")?,
+                plane_type: read_i32(data, offset + 16, "plane")?,
             })
         })
         .collect()
@@ -418,6 +438,7 @@ fn parse_models(data: &[u8]) -> Result<Vec<Model>, String> {
                 mins: vector(0)?,
                 maxs: vector(12)?,
                 origin: vector(24)?,
+                head_node: read_i32(data, offset + 36, "model")?,
                 first_face: read_i32(data, offset + 40, "model")?,
                 num_faces: read_i32(data, offset + 44, "model")?,
             })
