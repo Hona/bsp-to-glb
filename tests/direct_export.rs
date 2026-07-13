@@ -1,5 +1,5 @@
 use bsp_to_glb::export_bsp;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 const HEADER_SIZE: usize = 4 + 4 + 64 * 16 + 4;
 
@@ -87,15 +87,18 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
             offset + 12,
             if displacement && face == 1 { 0 } else { -1 },
         );
-        faces[offset + 16] = 0;
-        faces[offset + 17..offset + 20].fill(255);
-        put_i32(&mut faces, offset + 20, 0);
+        faces[offset + 16..offset + 20].fill(255);
+        if face == 0 {
+            faces[offset + 16] = 0;
+        }
+        put_i32(&mut faces, offset + 20, if face == 0 { 0 } else { -1 });
         put_i32(&mut faces, offset + 36, 4);
         put_i32(&mut faces, offset + 40, 4);
     }
     put_u16(&mut faces, 48, 1);
     put_u16(&mut faces, 50, 0);
     lumps[7] = faces;
+    lumps[8] = vec![0; 5 * 5 * 4];
 
     let mut edges = vec![0; 8 * 4];
     for face in 0..2 {
@@ -172,6 +175,9 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         let header = 8 + index * 16;
         put_i32(&mut bsp, header, offset as i32);
         put_i32(&mut bsp, header + 4, lump.len() as i32);
+        if matches!(index, 7 | 8) {
+            put_i32(&mut bsp, header + 8, 1);
+        }
     }
     bsp
 }
@@ -228,23 +234,7 @@ fn lump_offset(bsp: &[u8], lump: usize) -> usize {
 #[test]
 fn exports_compiled_faces_with_model_boundaries_and_uvs() {
     let bsp = synthetic_bsp(false);
-    let lightmaps = json!({
-        "atlasWidth": 128,
-        "atlasHeight": 64,
-        "faces": [{
-            "faceIndex": 0,
-            "w": 5,
-            "h": 5,
-            "atlasX": 8,
-            "atlasY": 4,
-            "lmVecs": [[0.0625, 0.0, 0.0, 0.0], [0.0, 0.0625, 0.0, 0.0]],
-            "lmMinsS": 0,
-            "lmMinsT": 0,
-            "verts": [[0, 0, 0], [64, 0, 0], [64, 64, 0], [0, 64, 0]]
-        }]
-    });
-
-    let result = export_bsp(&bsp, Some(lightmaps.to_string().as_bytes())).unwrap();
+    let result = export_bsp(&bsp).unwrap();
     let gltf = glb_json(&result.glb);
 
     assert_eq!(result.stats.models, 2);
@@ -277,7 +267,7 @@ fn exports_compiled_faces_with_model_boundaries_and_uvs() {
         &gltf,
         world_attributes["TEXCOORD_1"].as_u64().unwrap() as usize,
     );
-    assert_eq!(&uv1[0..2], &[8.5 / 128.0, 4.5 / 64.0]);
+    assert_eq!(&uv1[0..2], &[0.1, 0.1]);
     let normals = read_f32_accessor(
         &result.glb,
         &gltf,
@@ -315,28 +305,13 @@ fn exports_compiled_faces_with_model_boundaries_and_uvs() {
 }
 
 #[test]
-fn rejects_lightmap_metadata_when_compiled_face_has_no_lightmap() {
+fn compiled_face_without_light_data_has_no_lightmap() {
     let mut bsp = synthetic_bsp(false);
     let faces = lump_offset(&bsp, 7);
-    bsp[faces + 56 + 16] = 255;
-    put_i32(&mut bsp, faces + 56 + 20, -1);
-    let lightmaps = json!({
-        "atlasWidth": 128,
-        "atlasHeight": 64,
-        "faces": [{
-            "faceIndex": 1,
-            "w": 5,
-            "h": 5,
-            "atlasX": 8,
-            "atlasY": 4,
-            "lmVecs": [[0.0625, 0.0, 0.0, 0.0], [0.0, 0.0625, 0.0, 0.0]],
-            "lmMinsS": 0,
-            "lmMinsT": 0,
-            "verts": [[128, 0, 0], [192, 0, 0], [192, 64, 0], [128, 64, 0]]
-        }]
-    });
+    bsp[faces + 16] = 255;
+    put_i32(&mut bsp, faces + 20, -1);
 
-    let result = export_bsp(&bsp, Some(lightmaps.to_string().as_bytes())).unwrap();
+    let result = export_bsp(&bsp).unwrap();
     assert_eq!(result.stats.lightmapped_faces, 0);
 }
 
@@ -352,7 +327,7 @@ fn preserves_trigger_model_but_marks_it_initially_hidden() {
         + entities;
     bsp[offset..offset + b"func_brush".len()].copy_from_slice(b"trigger_hu");
 
-    let result = export_bsp(&bsp, None).unwrap();
+    let result = export_bsp(&bsp).unwrap();
     let gltf = glb_json(&result.glb);
     assert_eq!(gltf["nodes"][1]["extras"]["classname"], "trigger_hu");
     assert_eq!(gltf["nodes"][1]["extras"]["initiallyRendered"], false);
@@ -365,7 +340,7 @@ fn marks_sky_surfaces_hidden_without_removing_them() {
     let texinfo = lump_offset(&bsp, 6);
     put_i32(&mut bsp, texinfo + 64, 0x0004);
 
-    let result = export_bsp(&bsp, None).unwrap();
+    let result = export_bsp(&bsp).unwrap();
     let gltf = glb_json(&result.glb);
     assert_eq!(result.stats.initially_rendered_faces, 0);
     assert_eq!(gltf["meshes"].as_array().unwrap().len(), 2);
@@ -380,56 +355,20 @@ fn texinfo_nolight_flag_prevents_lightmap_false_positive() {
     let mut bsp = synthetic_bsp(false);
     let texinfo = lump_offset(&bsp, 6);
     put_i32(&mut bsp, texinfo + 64, 0x0400);
-    let lightmaps = json!({
-        "atlasWidth": 128,
-        "atlasHeight": 64,
-        "faces": [{
-            "faceIndex": 0,
-            "w": 5,
-            "h": 5,
-            "atlasX": 8,
-            "atlasY": 4,
-            "lmVecs": [[0.0625, 0.0, 0.0, 0.0], [0.0, 0.0625, 0.0, 0.0]],
-            "lmMinsS": 0,
-            "lmMinsT": 0,
-            "verts": [[0, 0, 0], [64, 0, 0], [64, 64, 0], [0, 64, 0]]
-        }]
-    });
 
-    let result = export_bsp(&bsp, Some(lightmaps.to_string().as_bytes())).unwrap();
+    let result = export_bsp(&bsp).unwrap();
     assert_eq!(result.stats.lightmapped_faces, 0);
 }
 
 #[test]
 fn rejects_displacements_instead_of_dropping_them() {
-    let error = export_bsp(&synthetic_bsp(true), None).unwrap_err();
+    let error = export_bsp(&synthetic_bsp(true)).unwrap_err();
     assert!(error.contains("displacement"), "unexpected error: {error}");
     assert!(error.contains("face 1"), "unexpected error: {error}");
 }
 
 #[test]
-fn matches_three_decimal_lightmap_vertices_without_f32_quantization_loss() {
-    let mut bsp = synthetic_bsp(false);
-    let vertex_header = 8 + 3 * 16;
-    let vertex_lump =
-        i32::from_le_bytes(bsp[vertex_header..vertex_header + 4].try_into().unwrap()) as usize;
-    put_f32(&mut bsp, vertex_lump, -335.1875);
-    let lightmaps = json!({
-        "atlasWidth": 128,
-        "atlasHeight": 64,
-        "faces": [{
-            "faceIndex": 0,
-            "w": 5,
-            "h": 5,
-            "atlasX": 8,
-            "atlasY": 4,
-            "lmVecs": [[0.0625, 0.0, 0.0, 0.0], [0.0, 0.0625, 0.0, 0.0]],
-            "lmMinsS": 0,
-            "lmMinsT": 0,
-            "verts": [[-335.187, 0, 0], [64, 0, 0], [64, 64, 0], [0, 64, 0]]
-        }]
-    });
-
-    let result = export_bsp(&bsp, Some(lightmaps.to_string().as_bytes())).unwrap();
+fn uses_compiled_face_identity_for_lightmap_ownership() {
+    let result = export_bsp(&synthetic_bsp(false)).unwrap();
     assert_eq!(result.stats.lightmapped_faces, 1);
 }
