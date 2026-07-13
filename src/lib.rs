@@ -24,6 +24,7 @@ const LUMP_TEXDATA: usize = 2;
 const LUMP_VERTEXES: usize = 3;
 const LUMP_TEXINFO: usize = 6;
 const LUMP_FACES: usize = 7;
+const LUMP_LIGHTING: usize = 8;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
@@ -34,9 +35,10 @@ const LUMP_GAME_LUMP: usize = 35;
 const LUMP_PRIMITIVES: usize = 37;
 const LUMP_PRIMVERTS: usize = 38;
 const LUMP_PRIMINDICES: usize = 39;
-const LUMP_FACES_HDR: usize = 58;
 const LUMP_TEXDATA_STRING_DATA: usize = 43;
 const LUMP_TEXDATA_STRING_TABLE: usize = 44;
+const LUMP_LIGHTING_HDR: usize = 53;
+const LUMP_FACES_HDR: usize = 58;
 
 const FACE_SIZE: usize = 56;
 const TEXINFO_SIZE: usize = 72;
@@ -55,8 +57,36 @@ const SURF_NODRAW: i32 = 0x0080;
 const SURF_HINT: i32 = 0x0100;
 const SURF_SKIP: i32 = 0x0200;
 const SURF_NOLIGHT: i32 = 0x0400;
+const SURF_BUMPLIGHT: i32 = 0x0800;
 const NON_RENDERED_SURFACE_FLAGS: i32 =
     SURF_SKY2D | SURF_SKY | SURF_TRIGGER | SURF_NODRAW | SURF_HINT | SURF_SKIP;
+
+const DEFAULT_ATLAS_WIDTH: u32 = 4096;
+const LIGHTMAP_LUMP_VERSION: i32 = 1;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LightmapSet {
+    #[default]
+    Auto,
+    Ldr,
+    Hdr,
+    None,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExportOptions {
+    pub lightmap_set: LightmapSet,
+    pub atlas_width: u32,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            lightmap_set: LightmapSet::Auto,
+            atlas_width: DEFAULT_ATLAS_WIDTH,
+        }
+    }
+}
 
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +99,7 @@ pub struct ExportStats {
     pub vertices: usize,
     pub materials: usize,
     pub lightmapped_faces: usize,
+    pub bumped_lightmapped_faces: usize,
     pub displacement_faces: usize,
     pub compiled_primitive_faces: usize,
     pub fan_faces: usize,
@@ -90,6 +121,121 @@ pub struct ExportResult {
     pub stats: ExportStats,
     pub material_manifest: SourceMaterialManifest,
     pub props: Value,
+    pub lightmaps: Option<LightmapArtifacts>,
+}
+
+#[derive(Debug)]
+pub struct LightmapImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct LightmapArtifacts {
+    pub flat: LightmapImage,
+    pub directional: [LightmapImage; 3],
+    pub manifest: LightmapManifest,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LightmapManifest {
+    schema: &'static str,
+    version: u32,
+    source: LightmapManifestSource,
+    atlas: LightmapManifestAtlas,
+    styles: LightmapManifestStyles,
+    faces: Vec<LightmapManifestFace>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LightmapManifestSource {
+    bsp_version: i32,
+    lighting_set: &'static str,
+    faces_lump: usize,
+    lighting_lump: usize,
+    lump_version: i32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LightmapManifestAtlas {
+    width: u32,
+    height: u32,
+    pixel_format: &'static str,
+    encoding: &'static str,
+    color_space: &'static str,
+    component_order: &'static str,
+    exponent: &'static str,
+    decode: &'static str,
+    origin: &'static str,
+    channels: Vec<LightmapManifestChannel>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LightmapManifestChannel {
+    semantic: &'static str,
+    layer: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LightmapManifestStyles {
+    supported_per_face: u8,
+    unused_value: u8,
+    composition: &'static str,
+    storage_order: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LightmapManifestFace {
+    face_index: usize,
+    atlas_x: u32,
+    atlas_y: u32,
+    width: u32,
+    height: u32,
+    light_offset: i32,
+    lightmap_mins: [i32; 2],
+    lightmap_size: [i32; 2],
+    styles: Vec<u8>,
+    bump_light: bool,
+}
+
+impl LightmapManifest {
+    pub fn set_channel_uris(&mut self, uris: [String; 4]) {
+        for (channel, uri) in self.atlas.channels.iter_mut().zip(uris) {
+            channel.uri = Some(uri);
+        }
+    }
+}
+
+pub fn encode_lightmap_png(image: &LightmapImage) -> Result<Vec<u8>, String> {
+    let expected = (image.width as usize)
+        .checked_mul(image.height as usize)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| "lightmap image dimensions overflow".to_owned())?;
+    if image.width == 0 || image.height == 0 || image.pixels.len() != expected {
+        return Err("lightmap image dimensions do not match its RGBA pixels".to_owned());
+    }
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, image.width, image.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| format!("failed to encode lightmap PNG header: {error}"))?;
+        writer
+            .write_image_data(&image.pixels)
+            .map_err(|error| format!("failed to encode lightmap PNG pixels: {error}"))?;
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Copy)]
@@ -213,18 +359,38 @@ struct Model {
     num_faces: i32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LightmapMetadata {
-    atlas_width: f32,
-    atlas_height: f32,
-    #[serde(default)]
-    faces: Vec<LightmapFace>,
+#[derive(Clone, Copy)]
+struct SelectedLightmapLumps {
+    faces: usize,
+    lighting: Option<usize>,
+    name: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct LightmapPlacement {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+struct ExtractedLightmaps {
+    artifacts: LightmapArtifacts,
+    by_face: HashMap<usize, LightmapPlacement>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LightmapFace {
+struct ExternalLightmapMetadata {
+    atlas_width: f32,
+    atlas_height: f32,
+    #[serde(default)]
+    faces: Vec<ExternalLightmapFace>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalLightmapFace {
     face_index: usize,
     w: f32,
     h: f32,
@@ -237,8 +403,8 @@ struct LightmapFace {
     verts: Vec<[f64; 3]>,
 }
 
-struct LightmapLookup {
-    metadata: LightmapMetadata,
+struct ExternalLightmapLookup {
+    metadata: ExternalLightmapMetadata,
     vertex_sets: Vec<HashSet<[i32; 3]>>,
     by_vertex: HashMap<[i32; 3], Vec<usize>>,
     by_face: HashMap<usize, usize>,
@@ -341,7 +507,7 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
         let offset = 8 + index * 16;
         let file_offset = read_i32(data, offset, "lump table")?;
         let file_length = read_i32(data, offset + 4, "lump table")?;
-        let lump_version = read_i32(data, offset + 8, "lump table")?;
+        let version = read_i32(data, offset + 8, "lump table")?;
         let uncompressed_size = read_i32(data, offset + 12, "lump table")?;
         if file_offset < 0 || file_length < 0 || uncompressed_size < 0 {
             return Err(format!("lump {index} has a negative offset or length"));
@@ -351,7 +517,7 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
             length: file_length as usize,
             uncompressed_size: uncompressed_size as usize,
         });
-        lump_versions.push(lump_version);
+        lump_versions.push(version);
     }
 
     let mut lumps = Vec::with_capacity(64);
@@ -1039,8 +1205,7 @@ fn quantize_vertex(value: [f32; 3]) -> [i32; 3] {
 }
 
 fn quantize_metadata_vertex(value: [f64; 3]) -> [i32; 3] {
-    // lightmap_data.json is produced with JavaScript Math.round, which rounds
-    // negative half values toward +infinity rather than away from zero.
+    // The existing JavaScript metadata producer uses Math.round semantics.
     let round_like_javascript = |number: f64| (number + 0.5).floor() as i32;
     [
         round_like_javascript(value[0] * 1000.0),
@@ -1049,9 +1214,9 @@ fn quantize_metadata_vertex(value: [f64; 3]) -> [i32; 3] {
     ]
 }
 
-impl LightmapLookup {
+impl ExternalLightmapLookup {
     fn parse(data: &[u8]) -> Result<Self, String> {
-        let metadata: LightmapMetadata = serde_json::from_slice(data)
+        let metadata: ExternalLightmapMetadata = serde_json::from_slice(data)
             .map_err(|error| format!("invalid lightmap metadata: {error}"))?;
         if metadata.atlas_width <= 0.0 || metadata.atlas_height <= 0.0 {
             return Err("lightmap atlas dimensions must be positive".to_owned());
@@ -1086,7 +1251,7 @@ impl LightmapLookup {
         })
     }
 
-    fn vectors_match(mapping: &LightmapFace, texinfo: &TexInfo) -> bool {
+    fn vectors_match(mapping: &ExternalLightmapFace, texinfo: &TexInfo) -> bool {
         let mut error = 0.0;
         for row in 0..2 {
             for axis in 0..4 {
@@ -1122,6 +1287,372 @@ impl LightmapLookup {
             (face.atlas_y + luxel_t - face.lm_mins_t + 0.5) / self.metadata.atlas_height,
         ]
     }
+}
+
+fn validate_lightmap_pair(
+    bsp: &Bsp,
+    faces: usize,
+    lighting: usize,
+    name: &str,
+) -> Result<(), String> {
+    if bsp.lumps[faces].is_empty() || bsp.lumps[lighting].is_empty() {
+        return Err(format!(
+            "requested {name} lightmaps require a complete {name} face/lighting pair"
+        ));
+    }
+    let face_version = bsp.lump_versions[faces];
+    let lighting_version = bsp.lump_versions[lighting];
+    if face_version != LIGHTMAP_LUMP_VERSION || lighting_version != LIGHTMAP_LUMP_VERSION {
+        return Err(format!(
+            "unsupported {name} lightmap pair versions: faces={face_version}, lighting={lighting_version}; expected version {LIGHTMAP_LUMP_VERSION}"
+        ));
+    }
+    Ok(())
+}
+
+fn select_lightmap_lumps(
+    bsp: &Bsp,
+    selection: LightmapSet,
+) -> Result<SelectedLightmapLumps, String> {
+    let complete_ldr = !bsp.lumps[LUMP_FACES].is_empty() && !bsp.lumps[LUMP_LIGHTING].is_empty();
+    let complete_hdr =
+        !bsp.lumps[LUMP_FACES_HDR].is_empty() && !bsp.lumps[LUMP_LIGHTING_HDR].is_empty();
+    let unlit_faces = if !bsp.lumps[LUMP_FACES].is_empty() {
+        LUMP_FACES
+    } else {
+        LUMP_FACES_HDR
+    };
+    let selected = match selection {
+        LightmapSet::Ldr => {
+            validate_lightmap_pair(bsp, LUMP_FACES, LUMP_LIGHTING, "LDR")?;
+            SelectedLightmapLumps {
+                faces: LUMP_FACES,
+                lighting: Some(LUMP_LIGHTING),
+                name: Some("ldr"),
+            }
+        }
+        LightmapSet::Hdr => {
+            validate_lightmap_pair(bsp, LUMP_FACES_HDR, LUMP_LIGHTING_HDR, "HDR")?;
+            SelectedLightmapLumps {
+                faces: LUMP_FACES_HDR,
+                lighting: Some(LUMP_LIGHTING_HDR),
+                name: Some("hdr"),
+            }
+        }
+        LightmapSet::Auto if complete_hdr => {
+            validate_lightmap_pair(bsp, LUMP_FACES_HDR, LUMP_LIGHTING_HDR, "HDR")?;
+            SelectedLightmapLumps {
+                faces: LUMP_FACES_HDR,
+                lighting: Some(LUMP_LIGHTING_HDR),
+                name: Some("hdr"),
+            }
+        }
+        LightmapSet::Auto if complete_ldr => {
+            validate_lightmap_pair(bsp, LUMP_FACES, LUMP_LIGHTING, "LDR")?;
+            SelectedLightmapLumps {
+                faces: LUMP_FACES,
+                lighting: Some(LUMP_LIGHTING),
+                name: Some("ldr"),
+            }
+        }
+        LightmapSet::Auto => {
+            if !bsp.lumps[LUMP_LIGHTING].is_empty() || !bsp.lumps[LUMP_LIGHTING_HDR].is_empty() {
+                return Err(
+                    "BSP contains lighting without a complete matching LDR or HDR face pair"
+                        .to_owned(),
+                );
+            }
+            SelectedLightmapLumps {
+                faces: unlit_faces,
+                lighting: None,
+                name: None,
+            }
+        }
+        LightmapSet::None => SelectedLightmapLumps {
+            faces: unlit_faces,
+            lighting: None,
+            name: None,
+        },
+    };
+    Ok(selected)
+}
+
+fn face_styles(face: Face, face_index: usize) -> Result<Vec<u8>, String> {
+    let first_unused = face
+        .styles
+        .iter()
+        .position(|style| *style == 255)
+        .unwrap_or(face.styles.len());
+    if face.styles[first_unused..]
+        .iter()
+        .any(|style| *style != 255)
+    {
+        return Err(format!(
+            "face {face_index} has non-contiguous light styles; export aborted"
+        ));
+    }
+    let styles = face.styles[..first_unused].to_vec();
+    if styles.len() > 1 {
+        return Err(format!(
+            "face {face_index} uses multiple light styles {:?}; style composition is unsupported",
+            styles
+        ));
+    }
+    Ok(styles)
+}
+
+fn extract_lightmaps(
+    bsp: &Bsp,
+    selected: SelectedLightmapLumps,
+    faces: &[Face],
+    texinfos: &[TexInfo],
+    face_owner: &[Option<usize>],
+    atlas_max_width: u32,
+) -> Result<Option<ExtractedLightmaps>, String> {
+    let Some(lighting_lump) = selected.lighting else {
+        return Ok(None);
+    };
+    if atlas_max_width == 0 {
+        return Err("lightmap atlas width must be positive".to_owned());
+    }
+    let light_data = &bsp.lumps[lighting_lump];
+    struct Candidate {
+        face_index: usize,
+        face: Face,
+        styles: Vec<u8>,
+        bump_light: bool,
+        source_start: usize,
+        sample_bytes: usize,
+        placement: LightmapPlacement,
+    }
+
+    let mut candidates = Vec::new();
+    let mut x = 0_u32;
+    let mut y = 0_u32;
+    let mut row_height = 0_u32;
+    let mut used_width = 0_u32;
+    for (face_index, face) in faces.iter().copied().enumerate() {
+        if face_owner[face_index].is_none() || face.light_offset < 0 || face.styles[0] == 255 {
+            continue;
+        }
+        let texinfo_index = usize::try_from(face.texinfo)
+            .map_err(|_| format!("face {face_index} has no texinfo"))?;
+        let texinfo = texinfos.get(texinfo_index).ok_or_else(|| {
+            format!("face {face_index} references missing texinfo {texinfo_index}")
+        })?;
+        if texinfo.flags & (SURF_SKY2D | SURF_SKY | SURF_NODRAW | SURF_NOLIGHT) != 0 {
+            continue;
+        }
+        if face.lightmap_size[0] < 0 || face.lightmap_size[1] < 0 {
+            return Err(format!(
+                "face {face_index} has invalid lightmap extents {:?}",
+                face.lightmap_size
+            ));
+        }
+        let styles = face_styles(face, face_index)?;
+        if styles.is_empty() {
+            continue;
+        }
+        let width = u32::try_from(face.lightmap_size[0])
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| format!("face {face_index} lightmap width overflows"))?;
+        let height = u32::try_from(face.lightmap_size[1])
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| format!("face {face_index} lightmap height overflows"))?;
+        if width > atlas_max_width {
+            return Err(format!(
+                "face {face_index} lightmap width {width} exceeds atlas width {atlas_max_width}"
+            ));
+        }
+        let sample_bytes = width
+            .checked_mul(height)
+            .and_then(|value| value.checked_mul(4))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("face {face_index} lightmap byte size overflows"))?;
+        let bump_light = texinfo.flags & SURF_BUMPLIGHT != 0;
+        let source_start = face.light_offset as usize;
+        let source_length = sample_bytes
+            .checked_mul(if bump_light { 4 } else { 1 })
+            .and_then(|value| value.checked_mul(styles.len()))
+            .ok_or_else(|| format!("face {face_index} lighting range overflows"))?;
+        let source_end = source_start
+            .checked_add(source_length)
+            .ok_or_else(|| format!("face {face_index} lighting range overflows"))?;
+        if source_end > light_data.len() {
+            return Err(format!(
+                "face {face_index} lighting range {source_start}..{source_end} exceeds lighting lump size {}",
+                light_data.len()
+            ));
+        }
+
+        let fits_current_row = x
+            .checked_add(width)
+            .is_some_and(|end| end <= atlas_max_width);
+        if x != 0 && !fits_current_row {
+            y = y
+                .checked_add(row_height)
+                .ok_or_else(|| "lightmap atlas height overflows".to_owned())?;
+            x = 0;
+            row_height = 0;
+        }
+        let placement = LightmapPlacement {
+            x,
+            y,
+            width,
+            height,
+        };
+        x = x
+            .checked_add(width)
+            .ok_or_else(|| "lightmap atlas width overflows".to_owned())?;
+        row_height = row_height.max(height);
+        used_width = used_width.max(x);
+        candidates.push(Candidate {
+            face_index,
+            face,
+            styles,
+            bump_light,
+            source_start,
+            sample_bytes,
+            placement,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let atlas_height = y
+        .checked_add(row_height)
+        .ok_or_else(|| "lightmap atlas height overflows".to_owned())?;
+    let atlas_bytes = used_width
+        .checked_mul(atlas_height)
+        .and_then(|value| value.checked_mul(4))
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "lightmap atlas byte size overflows".to_owned())?;
+    let mut flat_pixels = vec![0; atlas_bytes];
+    let mut directional_pixels: [Vec<u8>; 3] = std::array::from_fn(|_| vec![0; atlas_bytes]);
+    let mut by_face = HashMap::with_capacity(candidates.len());
+    let mut manifest_faces = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        let copy_channel = |source_offset: usize, destination: &mut [u8]| {
+            for row in 0..candidate.placement.height as usize {
+                let row_bytes = candidate.placement.width as usize * 4;
+                let source_start = source_offset + row * row_bytes;
+                let destination_start = ((candidate.placement.y as usize + row)
+                    * used_width as usize
+                    + candidate.placement.x as usize)
+                    * 4;
+                destination[destination_start..destination_start + row_bytes]
+                    .copy_from_slice(&light_data[source_start..source_start + row_bytes]);
+            }
+        };
+        copy_channel(candidate.source_start, &mut flat_pixels);
+        if candidate.bump_light {
+            for (channel, destination) in directional_pixels.iter_mut().enumerate() {
+                copy_channel(
+                    candidate.source_start + candidate.sample_bytes * (channel + 1),
+                    destination,
+                );
+            }
+        }
+        by_face.insert(candidate.face_index, candidate.placement);
+        manifest_faces.push(LightmapManifestFace {
+            face_index: candidate.face_index,
+            atlas_x: candidate.placement.x,
+            atlas_y: candidate.placement.y,
+            width: candidate.placement.width,
+            height: candidate.placement.height,
+            light_offset: candidate.face.light_offset,
+            lightmap_mins: candidate.face.lightmap_mins,
+            lightmap_size: candidate.face.lightmap_size,
+            styles: candidate.styles,
+            bump_light: candidate.bump_light,
+        });
+    }
+
+    let image = |pixels| LightmapImage {
+        width: used_width,
+        height: atlas_height,
+        pixels,
+    };
+    let artifacts = LightmapArtifacts {
+        flat: image(flat_pixels),
+        directional: directional_pixels.map(image),
+        manifest: LightmapManifest {
+            schema: "https://tf2jump.xyz/schemas/bsp-lightmaps/v1",
+            version: 1,
+            source: LightmapManifestSource {
+                bsp_version: bsp.version,
+                lighting_set: selected.name.unwrap(),
+                faces_lump: selected.faces,
+                lighting_lump,
+                lump_version: bsp.lump_versions[lighting_lump],
+            },
+            atlas: LightmapManifestAtlas {
+                width: used_width,
+                height: atlas_height,
+                pixel_format: "rgba8",
+                encoding: "color-rgb-exp-32",
+                color_space: "linear",
+                component_order: "RGBE",
+                exponent: "alpha-as-signed-int8-twos-complement",
+                decode: "linearRgb = rgb8 * 2^signedExponent / 255",
+                origin: "top-left",
+                channels: ["flat", "bump-0", "bump-1", "bump-2"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(layer, semantic)| LightmapManifestChannel {
+                        semantic,
+                        layer: layer as u8,
+                        uri: None,
+                    })
+                    .collect(),
+            },
+            styles: LightmapManifestStyles {
+                supported_per_face: 1,
+                unused_value: 255,
+                composition: "single-style",
+                storage_order: "style-major-then-flat-and-directional",
+            },
+            faces: manifest_faces,
+        },
+    };
+    Ok(Some(ExtractedLightmaps { artifacts, by_face }))
+}
+
+fn lightmap_uv(
+    placement: LightmapPlacement,
+    atlas: &LightmapImage,
+    face: Face,
+    texinfo: &TexInfo,
+    position: [f32; 3],
+    face_index: usize,
+) -> Result<[f32; 2], String> {
+    let local = [
+        dot4(texinfo.lightmap_vecs[0], position) - face.lightmap_mins[0] as f32,
+        dot4(texinfo.lightmap_vecs[1], position) - face.lightmap_mins[1] as f32,
+    ];
+    let limit = [face.lightmap_size[0] as f32, face.lightmap_size[1] as f32];
+    for axis in 0..2 {
+        if !local[axis].is_finite() || local[axis] < -0.01 || local[axis] > limit[axis] + 0.01 {
+            return Err(format!(
+                "face {face_index} vertex projects outside its compiled lightmap extents"
+            ));
+        }
+    }
+    let uv = [
+        (placement.x as f32 + local[0] + 0.5) / atlas.width as f32,
+        (placement.y as f32 + local[1] + 0.5) / atlas.height as f32,
+    ];
+    if uv
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(format!("face {face_index} produced an invalid UV1 range"));
+    }
+    Ok(uv)
 }
 
 fn face_positions(
@@ -1510,7 +2041,40 @@ pub fn export_bsp_with_material_resolver(
     lightmap_json: Option<&[u8]>,
     material_resolver: Option<&dyn MaterialResolver>,
 ) -> Result<ExportResult, String> {
+    export_bsp_internal(
+        data,
+        lightmap_json,
+        material_resolver,
+        &ExportOptions {
+            lightmap_set: LightmapSet::None,
+            ..ExportOptions::default()
+        },
+    )
+}
+
+pub fn export_bsp_with_options(
+    data: &[u8],
+    options: &ExportOptions,
+) -> Result<ExportResult, String> {
+    export_bsp_with_options_and_material_resolver(data, options, None)
+}
+
+pub fn export_bsp_with_options_and_material_resolver(
+    data: &[u8],
+    options: &ExportOptions,
+    material_resolver: Option<&dyn MaterialResolver>,
+) -> Result<ExportResult, String> {
+    export_bsp_internal(data, None, material_resolver, options)
+}
+
+fn export_bsp_internal(
+    data: &[u8],
+    lightmap_json: Option<&[u8]>,
+    material_resolver: Option<&dyn MaterialResolver>,
+    options: &ExportOptions,
+) -> Result<ExportResult, String> {
     let bsp = parse_bsp(data)?;
+    let selected_lightmaps = select_lightmap_lumps(&bsp, options.lightmap_set)?;
     let planes = parse_planes(&bsp.lumps[LUMP_PLANES])?;
     let vertices = parse_vec3_lump(&bsp.lumps[LUMP_VERTEXES], "vertex")?;
     let edges = parse_edges(&bsp.lumps[LUMP_EDGES])?;
@@ -1521,12 +2085,7 @@ pub fn export_bsp_with_material_resolver(
     let primitives = parse_primitives(&bsp.lumps[LUMP_PRIMITIVES])?;
     let primitive_vertices = parse_vec3_lump(&bsp.lumps[LUMP_PRIMVERTS], "primitive vertex")?;
     let primitive_indices = parse_u16_lump(&bsp.lumps[LUMP_PRIMINDICES], "primitive index")?;
-    let face_lump = if bsp.lumps[LUMP_FACES].is_empty() {
-        &bsp.lumps[LUMP_FACES_HDR]
-    } else {
-        &bsp.lumps[LUMP_FACES]
-    };
-    let faces = parse_faces(face_lump)?;
+    let faces = parse_faces(&bsp.lumps[selected_lightmaps.faces])?;
     let mut normal_index_cursor = 0;
     let face_normal_starts: Vec<_> = faces
         .iter()
@@ -1549,7 +2108,9 @@ pub fn export_bsp_with_material_resolver(
     let models = parse_models(&bsp.lumps[LUMP_MODELS])?;
     let entities = parse_entities(&bsp.lumps[LUMP_ENTITIES])?;
     let static_props = find_static_props(&bsp, data)?;
-    let lightmaps = lightmap_json.map(LightmapLookup::parse).transpose()?;
+    let external_lightmaps = lightmap_json
+        .map(ExternalLightmapLookup::parse)
+        .transpose()?;
 
     if models.is_empty() {
         return Err("BSP contains no brush models".to_owned());
@@ -1595,6 +2156,14 @@ pub fn export_bsp_with_material_resolver(
             displacements.len()
         ));
     }
+    let direct_lightmaps = extract_lightmaps(
+        &bsp,
+        selected_lightmaps,
+        &faces,
+        &texinfos,
+        &face_owner,
+        options.atlas_width,
+    )?;
 
     let mut entity_by_model: HashMap<usize, (usize, &Entity)> = HashMap::new();
     for (entity_index, entity) in entities.iter().enumerate() {
@@ -1780,19 +2349,22 @@ pub fn export_bsp_with_material_resolver(
                 return Err(format!("face {face_index} has invalid texture dimensions"));
             }
             let source_positions = face_positions(face, &surfedges, &edges, &vertices, face_index)?;
+            let direct_mapping = direct_lightmaps
+                .as_ref()
+                .and_then(|extracted| extracted.by_face.get(&face_index).copied());
             let compiled_lightmap = face.light_offset >= 0
                 && face.styles[0] != 255
                 && face.lightmap_size[0] >= 0
                 && face.lightmap_size[1] >= 0
                 && texinfo.flags & (SURF_SKY | SURF_NODRAW | SURF_NOLIGHT) == 0;
-            let mapping = compiled_lightmap
+            let external_mapping = (direct_mapping.is_none() && compiled_lightmap)
                 .then(|| {
-                    lightmaps
+                    external_lightmaps
                         .as_ref()
                         .and_then(|lookup| lookup.find(face_index, &source_positions, texinfo))
                 })
                 .flatten();
-            let has_lightmap = mapping.is_some();
+            let has_lightmap = direct_mapping.is_some() || external_mapping.is_some();
             let surface_rendered = texinfo.flags & NON_RENDERED_SURFACE_FLAGS == 0;
             let (mut triangles, compiled_triangulation) = face_triangle_indices(
                 face,
@@ -1859,7 +2431,18 @@ pub fn export_bsp_with_material_resolver(
                 primitive
                     .uv0
                     .push(dot4(texinfo.texture_vecs[1], *source) / texture.height as f32);
-                if let (Some(lookup), Some(mapping_index)) = (&lightmaps, mapping) {
+                if let (Some(extracted), Some(placement)) = (&direct_lightmaps, direct_mapping) {
+                    primitive.uv1.extend_from_slice(&lightmap_uv(
+                        placement,
+                        &extracted.artifacts.flat,
+                        face,
+                        texinfo,
+                        *source,
+                        face_index,
+                    )?);
+                } else if let (Some(lookup), Some(mapping_index)) =
+                    (&external_lightmaps, external_mapping)
+                {
                     primitive
                         .uv1
                         .extend_from_slice(&lookup.uv(mapping_index, *source));
@@ -1888,6 +2471,9 @@ pub fn export_bsp_with_material_resolver(
             stats.triangles += triangles.len();
             if has_lightmap {
                 stats.lightmapped_faces += 1;
+                if texinfo.flags & SURF_BUMPLIGHT != 0 {
+                    stats.bumped_lightmapped_faces += 1;
+                }
             }
             if compiled_triangulation {
                 stats.compiled_primitive_faces += 1;
@@ -2176,5 +2762,6 @@ pub fn export_bsp_with_material_resolver(
         stats,
         material_manifest,
         props: props_metadata,
+        lightmaps: direct_lightmaps.map(|extracted| extracted.artifacts),
     })
 }

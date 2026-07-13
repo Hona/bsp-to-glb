@@ -31,6 +31,10 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - VMT shader-family inputs and common render flags
 - bounded BSP PAK parsing for embedded VMT/VTF resources
 - lightmap UVs supplied by existing atlas metadata
+- direct LDR/HDR face and lighting-lump pair selection
+- exact per-face lightmap UVs from compiled vectors, mins and extents
+- lossless flat and three-channel directional bump-lightmap atlases
+- versioned lightmap manifests preserving face identity, styles and source offsets
 - hidden-but-preserved sky, trigger and disabled brush models
 - versioned direct-BSP collision sidecars with brush-model ownership
 - raw per-model PHYSCOLLIDE blocks and metadata (opaque, explicitly not decoded)
@@ -39,6 +43,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 Unsupported domains are detected or reported explicitly:
 
 - displacement geometry aborts export instead of being silently dropped
+- multi-style lightmaps abort export instead of being silently flattened
 - static and dynamic prop MDL geometry resolution
 - VTF pixel conversion and full shader execution
 - material proxies and animated materials (identified as metadata only)
@@ -108,14 +113,29 @@ cargo build --release
 bsp-to-glb \
   --bsp path/to/compiled.bsp \
   --out path/to/map.glb \
-  --lightmaps path/to/lightmap_data.json \
+  --lightmap-set auto \
+  --lightmap-atlas path/to/lightmap.png \
+  --lightmap-manifest path/to/lightmaps.json \
   --material-manifest path/to/map.materials.json \
   --collision-out path/to/map.collision.json \
   --props-out path/to/props.json
 ```
 
-`--lightmaps` is optional. The current input format is produced by the tf2jump map pipeline and
-will be replaced by direct atlas generation as the exporter matures.
+`--lightmap-set` accepts `auto`, `ldr`, `hdr`, or `none`. `auto` prefers a complete HDR
+face/lighting pair and falls back to a complete LDR pair. Explicit `ldr` and `hdr` selections fail
+if either half of the requested pair is absent or has an unsupported lump version.
+
+`--lightmap-atlas` writes the flat atlas at the requested PNG path and directional atlases beside
+it as `.bump-0.png`, `.bump-1.png`, and `.bump-2.png`. The PNG RGBA bytes preserve Source
+`ColorRGBExp32` samples losslessly: RGB contains the mantissa and alpha contains the signed
+two's-complement exponent. The manifest identifies this as linear data and records the decode
+formula, channel semantics, source pair, styles, face indices, offsets, extents, and atlas regions.
+These are raw data PNGs, not directly displayable sRGB images.
+
+The default maximum atlas row width is 4096 pixels and can be changed with `--atlas-width`.
+
+The legacy `--lightmaps path/to/lightmap_data.json` input remains available for pipeline-produced
+atlas metadata. It is mutually exclusive with direct atlas output options.
 
 `--material-manifest` is optional. It writes schema version 1 with the original BSP material name,
 canonical Source lookup paths, shader-family metadata, embedded resource inventory, per-resource
@@ -171,6 +191,9 @@ the exporter reports model resolution as unsupported and never fabricates missin
 cargo fmt --check
 cargo test --release
 cargo clippy --all-targets -- -D warnings
+
+# Local benchmark fixture (not distributed)
+cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
 ```
 
 Tests use synthetic BSP fixtures and do not include game assets.
@@ -180,6 +203,8 @@ The external Hydrogen acceptance test can be run without committing the map:
 ```bash
 HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --test hydrogen_collision -- --ignored
+HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --test hydrogen_props
 ```
@@ -187,6 +212,7 @@ BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
 It verifies 3,511 brushes, 31,092 brush sides, 2,575 world-model brushes, 259 playerclip brushes,
 151 model entries, collision ownership for zero-render model 147, and TF2 `sprp` v10 prop identity
 and solidity.
+The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529 bumped lit faces.
 
 ## Design Principles
 
@@ -200,7 +226,8 @@ and solidity.
 ## Roadmap
 
 1. Displacements and overlays
-2. Direct lightmap atlas generation, including directional bump channels
+2. Direct lightmap atlas generation, including directional bump channels (implemented for
+   single-style brush faces)
 3. Static prop game lumps and reusable model references (metadata implemented; MDL resolution pending)
 4. VMT/VTF material package integration
 5. Collision brush and opaque physics sidecars (implemented)
@@ -211,6 +238,9 @@ and solidity.
 
 - [ValveSoftware/source-sdk-2013](https://github.com/ValveSoftware/source-sdk-2013) for the publicly
   available Source SDK and BSP definitions. Its own license applies to that repository.
+- Public SDK lightmap references:
+  [`bspfile.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/bspfile.h)
+  and [`bspflags.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/bspflags.h).
 - [BSPSource](https://github.com/ata4/bspsrc) for extensive Source BSP tooling and research.
 - [Plumber](https://github.com/lasa01/Plumber) for Source model, map, material and texture import
   tooling used by the pipeline this project is incrementally replacing.

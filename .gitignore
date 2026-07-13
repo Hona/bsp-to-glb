@@ -1,4 +1,5 @@
 /target/
 *.glb
 *.bsp
+*.bsp.bz2
 lightmap_data.json

@@ -97,15 +97,18 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
             offset + 12,
             if displacement && face == 1 { 0 } else { -1 },
         );
-        faces[offset + 16] = 0;
-        faces[offset + 17..offset + 20].fill(255);
-        put_i32(&mut faces, offset + 20, 0);
+        faces[offset + 16..offset + 20].fill(255);
+        if face == 0 {
+            faces[offset + 16] = 0;
+        }
+        put_i32(&mut faces, offset + 20, if face == 0 { 0 } else { -1 });
         put_i32(&mut faces, offset + 36, 4);
         put_i32(&mut faces, offset + 40, 4);
     }
     put_u16(&mut faces, 48, 1);
     put_u16(&mut faces, 50, 0);
     lumps[7] = faces;
+    lumps[8] = vec![0; 5 * 5 * 4];
 
     let mut edges = vec![0; 8 * 4];
     for face in 0..2 {
@@ -182,6 +185,9 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         let header = 8 + index * 16;
         put_i32(&mut bsp, header, offset as i32);
         put_i32(&mut bsp, header + 4, lump.len() as i32);
+        if matches!(index, 7 | 8) {
+            put_i32(&mut bsp, header + 8, 1);
+        }
     }
     bsp
 }
@@ -693,6 +699,7 @@ fn texinfo_nolight_flag_prevents_lightmap_false_positive() {
     let mut bsp = synthetic_bsp(false);
     let texinfo = lump_offset(&bsp, 6);
     put_i32(&mut bsp, texinfo + 64, 0x0400);
+
     let lightmaps = json!({
         "atlasWidth": 128,
         "atlasHeight": 64,
