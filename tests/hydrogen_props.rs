@@ -1,4 +1,4 @@
-use bsp_to_glb::export_bsp;
+use bsp_to_glb::{export_bsp, static_prop_collision_inputs};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ fn hydrogen_static_prop_v10_benchmark_preserves_identity_and_solidity() {
     let bsp = fs::read(&path).unwrap();
     let started = Instant::now();
     let result = export_bsp(&bsp, None).unwrap();
+    let collision_props = static_prop_collision_inputs(&bsp).unwrap().unwrap();
     let elapsed = started.elapsed();
 
     assert_eq!(result.stats.static_props, 235);
@@ -34,6 +35,14 @@ fn hydrogen_static_prop_v10_benchmark_preserves_identity_and_solidity() {
     assert_eq!(result.props["staticPropLump"]["version"], 10);
     assert_eq!(result.props["staticPropLump"]["layout"], "tf2-v10");
     assert_eq!(result.props["staticProps"].as_array().unwrap().len(), 235);
+    assert_eq!(collision_props.len(), 235);
+    assert_eq!(
+        collision_props
+            .iter()
+            .filter(|prop| prop.solid_mode != 0)
+            .count(),
+        73
+    );
     assert!(
         result.props["modelAssets"]
             .as_array()

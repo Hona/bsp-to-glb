@@ -1841,6 +1841,24 @@ fn find_static_props(bsp: &Bsp, file: &[u8]) -> Result<Option<StaticPropGameLump
         .transpose()
 }
 
+pub fn static_prop_collision_inputs(
+    data: &[u8],
+) -> Result<Option<Vec<StaticPropCollisionInput>>, String> {
+    let bsp = parse_bsp(data)?;
+    Ok(find_static_props(&bsp, data)?.map(|props| {
+        props
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(prop_index, instance)| StaticPropCollisionInput {
+                prop_index,
+                model_name: props.dictionary[usize::from(instance.dictionary_index)].clone(),
+                solid_mode: instance.solidity,
+            })
+            .collect()
+    }))
+}
+
 fn source_to_gltf(value: [f32; 3]) -> [f32; 3] {
     [value[0], value[2], -value[1]]
 }

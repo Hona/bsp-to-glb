@@ -1,6 +1,6 @@
 use bsp_to_glb::{
     ExportOptions, decode_compressed_pvs_row, export_bsp, export_bsp_with_options_and_visibility,
-    export_bsp_with_visibility,
+    export_bsp_with_visibility, static_prop_collision_inputs,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -695,6 +695,23 @@ fn exports_tf2_static_and_dynamic_props_as_unresolved_model_references() {
             .filter(|property| property["key"] == "model")
             .count(),
         1
+    );
+}
+
+#[test]
+fn shares_static_prop_identity_with_collision_export() {
+    let props = static_prop_collision_inputs(&synthetic_bsp_with_tf2_props())
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].prop_index, 0);
+    assert_eq!(props[0].model_name, "models/props_test/crate.mdl");
+    assert_eq!(props[0].solid_mode, 6);
+    assert!(
+        static_prop_collision_inputs(&synthetic_bsp(false))
+            .unwrap()
+            .is_none()
     );
 }
 

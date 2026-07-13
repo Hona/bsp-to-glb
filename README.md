@@ -39,6 +39,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - versioned lightmap manifests preserving face identity, styles and source offsets
 - hidden-but-preserved sky, trigger and disabled brush models
 - versioned direct-BSP collision sidecars with brush-model ownership
+- static-prop collision identity and solid-mode metadata when `sprp` is present
 - raw per-model PHYSCOLLIDE blocks and metadata (opaque, explicitly not decoded)
 - LZMA-compressed BSP lumps
 - exact leaf/cluster/PVS visibility sidecars with GLB chunk ownership
@@ -162,7 +163,8 @@ case-insensitive duplicate paths, oversized entries and malformed ZIP data, and 
 entry and decompression limits.
 
 `--out` and `--collision-out` are independently optional, but at least one is required. A
-collision-only export does not parse or triangulate render faces.
+collision-only export does not parse or triangulate render faces. Material, prop, lightmap and
+visibility outputs require `--out`; visibility references the emitted GLB chunk indices.
 
 ## Collision Sidecar
 
@@ -178,8 +180,8 @@ PHYSCOLLIDE model headers and raw blocks are retained as base64, while `decodeSt
 
 Static-prop collision metadata is modular library input through `CollisionExportInput`. `None`
 means GAME_LUMP data was unavailable; `Some` preserves supplied prop indices, model names and
-solid modes. The CLI currently reports static-prop collision input as unavailable; prop render
-metadata is parsed and exported separately.
+solid modes. The CLI parses supported `sprp` layouts and supplies this input automatically; an
+absent `sprp` remains distinguishable from an empty parsed list.
 
 `--props-out` is optional. Prop metadata is always embedded under
 `asset.extras.props` and on reference-only GLB nodes; this flag also writes the same
@@ -200,6 +202,11 @@ The CLI statistics include a `capabilities` object. Displacements report `export
 water overlays and cubemaps report `detectedOnly`. Unknown optional-feature lump versions report
 `unsupportedVersion` rather than implying support.
 
+Compiled displacement export supports version 0 displacement lumps, powers 2 through 4,
+quadrilateral parent faces, remove-tag filtering, alpha attributes and generated normals. Invalid
+references, orphaned records, unsupported powers or unsupported displacement lump versions abort
+the render export rather than dropping geometry.
+
 ## Verification
 
 ```bash
@@ -207,30 +214,24 @@ cargo fmt --check
 cargo test --release
 cargo clippy --all-targets -- -D warnings
 
-# Local benchmark fixture (not distributed)
-cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
-# With a local Hydrogen BSP fixture:
+HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_collision -- --ignored
+HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
+BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_props -- --nocapture
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_visibility -- --ignored
 ```
 
-Tests use synthetic BSP fixtures and do not include game assets.
-
-The external Hydrogen acceptance test can be run without committing the map:
-
-```bash
-HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
-  cargo test --test hydrogen_collision -- --ignored
-HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
-  cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
-BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
-  cargo test --test hydrogen_props
-```
+Tests use synthetic BSP fixtures and do not include game assets. The Hydrogen acceptance tests use
+a local map that is not distributed with this repository.
 
 It verifies 3,511 brushes, 31,092 brush sides, 2,575 world-model brushes, 259 playerclip brushes,
 151 model entries, collision ownership for zero-render model 147, and TF2 `sprp` v10 prop identity
-and solidity.
-The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529 bumped lit faces.
+and solidity. The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529
+bumped lit faces. Visibility preserves all 450 PVS rows and 6,248 leaves; all 435 clusters owning
+world render faces are represented by static GLB chunks.
 
 ## Design Principles
 
@@ -246,8 +247,8 @@ The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529
 1. Overlay projection and clipping
 2. Direct lightmap atlas generation, including directional bump channels (implemented for
    single-style brush faces)
-3. Static prop game lumps and reusable model references (metadata implemented; MDL resolution pending)
-4. VMT/VTF material package integration
+3. Static prop MDL geometry resolution (metadata and reusable references implemented)
+4. VTF pixel conversion and runtime shader integration
 5. Collision brush and opaque physics sidecars (implemented)
 6. ~~Leaf/cluster/PVS sidecars~~
 7. Versioned output manifests and runtime integration

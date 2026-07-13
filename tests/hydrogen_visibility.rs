@@ -12,8 +12,11 @@ fn hydrogen_has_complete_visibility_coverage() {
 
     assert_eq!(visibility.cluster_count, 450);
     assert_eq!(visibility.leaves.len(), 6_248);
-    assert_eq!(visibility.relevant_cluster_count, 450);
-    assert_eq!(visibility.covered_cluster_count, 450);
+    assert_eq!(visibility.relevant_cluster_count, 435);
+    assert_eq!(
+        visibility.covered_cluster_count,
+        visibility.relevant_cluster_count
+    );
     assert_eq!(
         visibility.pvs_words.len(),
         visibility.cluster_count * visibility.cluster_word_count

@@ -1,7 +1,7 @@
 use bsp_to_glb::{
     CollisionExportInput, ExportOptions, LightmapSet, encode_lightmap_png, export_bsp,
     export_bsp_with_options, export_bsp_with_options_and_visibility, export_bsp_with_visibility,
-    export_collision_sidecar,
+    export_collision_sidecar, static_prop_collision_inputs,
 };
 use std::env;
 use std::fs;
@@ -191,7 +191,13 @@ fn run() -> Result<(), String> {
         render_stats = Some(result.stats);
     }
     if let Some(output_path) = collision_output_path {
-        let result = export_collision_sidecar(&bsp, &CollisionExportInput::default())?;
+        let static_props = static_prop_collision_inputs(&bsp)?;
+        let result = export_collision_sidecar(
+            &bsp,
+            &CollisionExportInput {
+                static_props: static_props.as_deref(),
+            },
+        )?;
         write(&output_path, &result.json)?;
         collision_stats = Some(result.stats);
     }
