@@ -5,6 +5,7 @@ use std::io::Cursor;
 
 mod collision;
 mod materials;
+mod vtf;
 
 pub use collision::{
     CollisionExportInput, CollisionExportResult, CollisionStats, StaticPropCollisionInput,
@@ -12,10 +13,16 @@ pub use collision::{
 };
 pub use materials::{
     EmbeddedResourceMetadata, ManifestResource, ManifestTexture, MaterialLimitations,
-    MaterialResolver, PakResource, PakResourceKind, ResolvedMaterialResource, ResourceProvenance,
-    SourceMaterialEntry, SourceMaterialManifest, UnresolvedAsset, UnsupportedMaterialFeatures,
-    VmtFeatures, VmtMaterial, VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
-    parse_vmt, read_bsp_pak_resources,
+    MaterialResolver, MaterialTextureArtifact, MaterialTextureManifest, MaterialTextureOutput,
+    MaterialTextureSource, PakResource, PakResourceKind, ResolvedMaterialResource,
+    ResourceProvenance, SourceMaterialEntry, SourceMaterialManifest, SourceMaterialPackage,
+    TextureDecodeStatus, UnresolvedAsset, UnsupportedMaterialFeatures, VmtFeatures, VmtMaterial,
+    VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
+    build_source_material_package, parse_vmt, read_bsp_pak_resources,
+};
+pub use vtf::{
+    DecodedVtf, VtfError, VtfErrorKind, VtfFormatMetadata, VtfImageSelection, VtfMetadata,
+    decode_vtf, inspect_vtf,
 };
 
 const LUMP_ENTITIES: usize = 0;
@@ -99,6 +106,7 @@ pub enum LightmapSet {
 pub struct ExportOptions {
     pub lightmap_set: LightmapSet,
     pub atlas_width: u32,
+    pub material_texture_selection: Option<VtfImageSelection>,
 }
 
 impl Default for ExportOptions {
@@ -106,6 +114,7 @@ impl Default for ExportOptions {
         Self {
             lightmap_set: LightmapSet::Auto,
             atlas_width: DEFAULT_ATLAS_WIDTH,
+            material_texture_selection: None,
         }
     }
 }
@@ -130,6 +139,11 @@ pub struct ExportStats {
     pub initially_rendered_faces: usize,
     pub embedded_material_resources: usize,
     pub unresolved_material_assets: usize,
+    pub material_texture_sources: usize,
+    pub decoded_material_textures: usize,
+    pub unsupported_material_textures: usize,
+    pub invalid_material_textures: usize,
+    pub unique_material_texture_outputs: usize,
     pub static_prop_models: usize,
     pub static_props: usize,
     pub solid_static_props: usize,
@@ -175,6 +189,7 @@ pub struct ExportResult {
     pub glb: Vec<u8>,
     pub stats: ExportStats,
     pub material_manifest: SourceMaterialManifest,
+    pub material_textures: Option<SourceMaterialPackage>,
     pub props: Value,
     pub lightmaps: Option<LightmapArtifacts>,
     pub visibility: Option<VisibilitySidecar>,
@@ -3013,8 +3028,22 @@ fn export_bsp_internal(
         &bsp.lumps[LUMP_TEXDATA_STRING_TABLE],
     )?;
     let embedded_resources = materials::parse_embedded_resources(&bsp.lumps[LUMP_PAKFILE])?;
-    let material_manifest =
-        build_source_material_manifest(&material_names, &embedded_resources, material_resolver)?;
+    let material_textures = options
+        .material_texture_selection
+        .map(|selection| {
+            build_source_material_package(
+                &material_names,
+                &embedded_resources,
+                material_resolver,
+                selection,
+            )
+        })
+        .transpose()?;
+    let material_manifest = if let Some(package) = &material_textures {
+        package.material_manifest.clone()
+    } else {
+        build_source_material_manifest(&material_names, &embedded_resources, material_resolver)?
+    };
     let models = parse_models(&bsp.lumps[LUMP_MODELS])?;
     let entities = parse_entities(&bsp.lumps[LUMP_ENTITIES])?;
     let static_props = find_static_props(&bsp, data)?;
@@ -3228,6 +3257,47 @@ fn export_bsp_internal(
         displacement_faces: displacements.len(),
         embedded_material_resources: material_manifest.embedded_resources.len(),
         unresolved_material_assets: material_manifest.unresolved_assets.len(),
+        material_texture_sources: material_textures
+            .as_ref()
+            .map(|package| package.manifest.sources.len())
+            .unwrap_or(0),
+        decoded_material_textures: material_textures
+            .as_ref()
+            .map(|package| {
+                package
+                    .manifest
+                    .sources
+                    .iter()
+                    .filter(|source| source.status == TextureDecodeStatus::Decoded)
+                    .count()
+            })
+            .unwrap_or(0),
+        unsupported_material_textures: material_textures
+            .as_ref()
+            .map(|package| {
+                package
+                    .manifest
+                    .sources
+                    .iter()
+                    .filter(|source| source.status == TextureDecodeStatus::Unsupported)
+                    .count()
+            })
+            .unwrap_or(0),
+        invalid_material_textures: material_textures
+            .as_ref()
+            .map(|package| {
+                package
+                    .manifest
+                    .sources
+                    .iter()
+                    .filter(|source| source.status == TextureDecodeStatus::Invalid)
+                    .count()
+            })
+            .unwrap_or(0),
+        unique_material_texture_outputs: material_textures
+            .as_ref()
+            .map(|package| package.artifacts.len())
+            .unwrap_or(0),
         static_prop_models: static_props
             .as_ref()
             .map(|props| props.dictionary.len())
@@ -3811,6 +3881,7 @@ fn export_bsp_internal(
         glb,
         stats,
         material_manifest,
+        material_textures,
         props: props_metadata,
         lightmaps: direct_lightmaps.map(|extracted| extracted.artifacts),
         visibility,

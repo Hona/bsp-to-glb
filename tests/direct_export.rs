@@ -293,6 +293,22 @@ fn append_pak(bsp: &mut Vec<u8>, entries: &[(&str, &[u8])]) {
     put_i32(bsp, header + 4, pak.len() as i32);
 }
 
+fn rgba_vtf(pixel: [u8; 4]) -> Vec<u8> {
+    let mut data = vec![0; 65];
+    data[0..4].copy_from_slice(b"VTF\0");
+    put_u32(&mut data, 4, 7);
+    put_u32(&mut data, 8, 2);
+    put_u32(&mut data, 12, 65);
+    put_u16(&mut data, 16, 1);
+    put_u16(&mut data, 18, 1);
+    put_u16(&mut data, 24, 1);
+    data[56] = 1;
+    put_u32(&mut data, 57, u32::MAX);
+    put_u16(&mut data, 63, 1);
+    data.extend_from_slice(&pixel);
+    data
+}
+
 fn synthetic_bsp_with_tf2_props() -> Vec<u8> {
     let mut bsp = synthetic_bsp(false);
     let mut entities = bsp[lump_offset(&bsp, 0)..].to_vec();
@@ -1200,7 +1216,7 @@ fn exports_pak_backed_source_material_manifest_and_safe_gltf_flags() {
     let manifest = serde_json::to_value(&result.material_manifest).unwrap();
     let gltf = glb_json(&result.glb);
 
-    assert_eq!(manifest["schemaVersion"], 1);
+    assert_eq!(manifest["schemaVersion"], 2);
     assert_eq!(manifest["materials"][0]["name"], "brick/test");
     assert_eq!(
         manifest["materials"][0]["metadata"]["shader"]["family"],
@@ -1254,13 +1270,84 @@ fn cli_writes_requested_versioned_material_sidecar() {
         String::from_utf8_lossy(&output.stderr)
     );
     let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    assert_eq!(manifest["schemaVersion"], 1);
+    assert_eq!(manifest["schemaVersion"], 2);
     assert_eq!(manifest["lookupPolicy"], "pakFirst");
     assert_eq!(
         manifest["unresolvedAssets"][0]["lookupPath"],
         "materials/brick/test.vmt"
     );
     assert!(glb_path.is_file());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cli_writes_content_addressed_material_texture_package() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "bsp-to-glb-texture-test-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let bsp_path = directory.join("fixture.bsp");
+    let glb_path = directory.join("fixture.glb");
+    let material_manifest_path = directory.join("fixture.materials.json");
+    let texture_directory = directory.join("textures");
+    let texture_manifest_path = texture_directory.join("manifest.json");
+    let mut bsp = synthetic_bsp(false);
+    let texture = rgba_vtf([11, 22, 33, 44]);
+    append_pak(
+        &mut bsp,
+        &[
+            (
+                "materials/brick/test.vmt",
+                br#"LightmappedGeneric { "$basetexture" "brick/test" }"#,
+            ),
+            ("materials/brick/test.vtf", &texture),
+        ],
+    );
+    fs::write(&bsp_path, bsp).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
+        .args([
+            "--bsp",
+            bsp_path.to_str().unwrap(),
+            "--out",
+            glb_path.to_str().unwrap(),
+            "--material-manifest",
+            material_manifest_path.to_str().unwrap(),
+            "--texture-output",
+            texture_directory.to_str().unwrap(),
+            "--texture-manifest",
+            texture_manifest_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let textures: Value =
+        serde_json::from_slice(&fs::read(&texture_manifest_path).unwrap()).unwrap();
+    let materials: Value =
+        serde_json::from_slice(&fs::read(&material_manifest_path).unwrap()).unwrap();
+    let stats: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let file_name = textures["outputs"][0]["fileName"].as_str().unwrap();
+    assert!(file_name.starts_with("sha256-"));
+    assert!(file_name.ends_with(".png"));
+    assert!(texture_directory.join(file_name).is_file());
+    assert_eq!(textures["sources"][0]["status"], "decoded");
+    assert_eq!(stats["decodedMaterialTextures"], 1);
+    assert_eq!(stats["uniqueMaterialTextureOutputs"], 1);
+    assert_eq!(
+        materials["materials"][0]["textures"][0]["packageSourceIndex"],
+        0
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }

@@ -1,7 +1,7 @@
 use bsp_to_glb::{
-    CollisionExportInput, ExportOptions, LightmapSet, encode_lightmap_png, export_bsp,
-    export_bsp_with_options, export_bsp_with_options_and_visibility, export_bsp_with_visibility,
-    export_collision_sidecar, static_prop_collision_inputs,
+    CollisionExportInput, ExportOptions, LightmapSet, VtfImageSelection, encode_lightmap_png,
+    export_bsp, export_bsp_with_options, export_bsp_with_options_and_visibility,
+    export_bsp_with_visibility, export_collision_sidecar, static_prop_collision_inputs,
 };
 use std::env;
 use std::fs;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-manifest <materials.json>] [--props-out <props.json>]"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -56,6 +56,10 @@ fn run() -> Result<(), String> {
     let mut collision_output_path: Option<PathBuf> = None;
     let mut lightmap_path: Option<PathBuf> = None;
     let mut material_manifest_path: Option<PathBuf> = None;
+    let mut texture_output_path: Option<PathBuf> = None;
+    let mut texture_manifest_path: Option<PathBuf> = None;
+    let mut texture_selection = VtfImageSelection::default();
+    let mut texture_selection_set = false;
     let mut props_output_path: Option<PathBuf> = None;
     let mut atlas_path: Option<PathBuf> = None;
     let mut manifest_path: Option<PathBuf> = None;
@@ -74,6 +78,29 @@ fn run() -> Result<(), String> {
             "--collision-out" => collision_output_path = Some(value.into()),
             "--lightmaps" => lightmap_path = Some(value.into()),
             "--material-manifest" => material_manifest_path = Some(value.into()),
+            "--texture-output" => texture_output_path = Some(value.into()),
+            "--texture-manifest" => texture_manifest_path = Some(value.into()),
+            "--texture-mip" => {
+                texture_selection.mip = value
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| format!("invalid texture mip: {}", value.to_string_lossy()))?;
+                texture_selection_set = true;
+            }
+            "--texture-frame" => {
+                texture_selection.frame = value
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| format!("invalid texture frame: {}", value.to_string_lossy()))?;
+                texture_selection_set = true;
+            }
+            "--texture-face" => {
+                texture_selection.face = value
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| format!("invalid texture face: {}", value.to_string_lossy()))?;
+                texture_selection_set = true;
+            }
             "--props-out" => props_output_path = Some(value.into()),
             "--lightmap-atlas" => atlas_path = Some(value.into()),
             "--lightmap-manifest" => manifest_path = Some(value.into()),
@@ -105,6 +132,18 @@ fn run() -> Result<(), String> {
     }
     if output_path.is_none() && visibility_path.is_some() {
         return Err("--visibility-out requires --out because it references GLB chunks".to_owned());
+    }
+    if texture_output_path.is_none() && texture_manifest_path.is_some() {
+        return Err("--texture-manifest requires --texture-output".to_owned());
+    }
+    if texture_output_path.is_none() && texture_selection_set {
+        return Err("texture selection requires --texture-output".to_owned());
+    }
+    if output_path.is_none() && texture_output_path.is_some() {
+        return Err("--texture-output requires --out".to_owned());
+    }
+    if texture_output_path.is_some() {
+        options.material_texture_selection = Some(texture_selection);
     }
     let bsp = fs::read(&bsp_path)
         .map_err(|error| format!("failed to read {}: {error}", bsp_path.display()))?;
@@ -140,6 +179,17 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("failed to serialize material manifest: {error}"))
             })
             .transpose()?;
+        let texture_manifest = texture_manifest_path
+            .as_ref()
+            .map(|_| {
+                let package = result
+                    .material_textures
+                    .as_ref()
+                    .ok_or_else(|| "material texture package was not generated".to_owned())?;
+                serde_json::to_vec_pretty(&package.manifest)
+                    .map_err(|error| format!("failed to serialize texture manifest: {error}"))
+            })
+            .transpose()?;
         let props = props_output_path
             .as_ref()
             .map(|_| {
@@ -149,6 +199,18 @@ fn run() -> Result<(), String> {
             .transpose()?;
         write(&output_path, &result.glb)?;
         if let (Some(path), Some(manifest)) = (&material_manifest_path, material_manifest) {
+            write(path, &manifest)?;
+        }
+        if let Some(directory) = &texture_output_path {
+            let package = result
+                .material_textures
+                .as_ref()
+                .ok_or_else(|| "material texture package was not generated".to_owned())?;
+            for artifact in &package.artifacts {
+                write(&directory.join(&artifact.file_name), &artifact.png)?;
+            }
+        }
+        if let (Some(path), Some(manifest)) = (&texture_manifest_path, texture_manifest) {
             write(path, &manifest)?;
         }
         if let (Some(path), Some(props)) = (&props_output_path, props) {

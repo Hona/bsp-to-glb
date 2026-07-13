@@ -32,6 +32,8 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - versioned Source material manifests with PAK-first VMT/VTF provenance
 - VMT shader-family inputs and common render flags
 - bounded BSP PAK parsing for embedded VMT/VTF resources
+- bounded VTF 7.0-7.5 parsing and selected mip/frame/face decoding to lossless RGBA PNG
+- content-addressed material texture packages with decoded-pixel deduplication
 - lightmap UVs supplied by existing atlas metadata
 - direct LDR/HDR face and lighting-lump pair selection
 - exact per-face lightmap UVs from compiled vectors, mins and extents
@@ -48,7 +50,7 @@ Unsupported domains are detected or reported explicitly:
 
 - multi-style lightmaps abort export instead of being silently flattened
 - static and dynamic prop MDL geometry resolution
-- VTF pixel conversion and full shader execution
+- full Source shader execution and material proxy evaluation
 - material proxies and animated materials (identified as metadata only)
 - decoded VPhysics collision meshes
 - overlays and water overlays (presence and lump versions are reported, geometry is not exported)
@@ -121,6 +123,8 @@ bsp-to-glb \
   --lightmap-atlas path/to/lightmap.png \
   --lightmap-manifest path/to/lightmaps.json \
   --material-manifest path/to/map.materials.json \
+  --texture-output path/to/textures \
+  --texture-manifest path/to/textures/manifest.json \
   --collision-out path/to/map.collision.json \
   --props-out path/to/props.json \
   --visibility-out path/to/map.visibility.json
@@ -142,9 +146,10 @@ The default maximum atlas row width is 4096 pixels and can be changed with `--at
 The legacy `--lightmaps path/to/lightmap_data.json` input remains available for pipeline-produced
 atlas metadata. It is mutually exclusive with direct atlas output options.
 
-`--material-manifest` is optional. It writes schema version 1 with the original BSP material name,
+`--material-manifest` is optional. It writes schema version 2 with the original BSP material name,
 canonical Source lookup paths, shader-family metadata, embedded resource inventory, per-resource
-provenance and unresolved assets. Embedded PAK resources always win over an external resolver.
+provenance, optional texture-package source indices and unresolved assets. Embedded PAK resources
+always win over an external resolver.
 
 ## Material Resolution
 
@@ -153,14 +158,30 @@ provide resources from an installation or another asset store. A resolver receiv
 such as `materials/brick/wall.vtf` and must return real bytes plus a stable provenance label. The
 exporter does not include a game-asset resolver and does not emit placeholder textures.
 
-VMT parsing currently records shader inputs for unlit, translucency, additive blending, alpha test,
-no-cull, base texture, bump/SSBump, detail, self-illumination, envmap and surface properties. VTF
-resources are inventoried and resolved, but their pixels are not converted. Proxies and animated
-materials are retained as explicit unsupported metadata rather than represented as glTF parity.
+VMT parsing records shader inputs for unlit, translucency, additive blending, alpha test, no-cull,
+base texture, bump/SSBump, detail, self-illumination, envmap and surface properties. Proxies and
+animated materials are retained as explicit unsupported metadata rather than represented as glTF
+parity.
+
+`--texture-output` opts into VTF decoding and writes one PNG per unique decoded image. Output names
+are `sha256-<PNG digest>.png`; textures with identical dimensions and RGBA pixels share one output.
+`--texture-manifest` optionally writes the `bsp-to-glb/material-textures` version 1 manifest beside
+that package. `--texture-mip`, `--texture-frame`, and `--texture-face` select the image, defaulting
+to zero. VTF mip zero is the full-resolution image. Material texture conversion is also available
+through `VtfImageSelection`, `decode_vtf`, `inspect_vtf`, `build_source_material_package`, and
+`ExportOptions::material_texture_selection`.
+
+The decoder supports VTF 7.0 through 7.5 and RGBA8888, ABGR8888, RGB888, BGR888, BGRA8888, DXT1,
+DXT1 one-bit alpha, DXT3, DXT5, I8, IA88 and A8. It handles block edges without expanding output
+dimensions and follows VTF's smallest-to-largest mip storage. Unsupported image formats and volume
+textures produce explicit `unsupported` package-source records with format metadata. Malformed or
+truncated inputs produce `invalid` records. Neither case emits placeholder pixels or aborts other
+texture conversions.
 
 PAK parsing only exposes `materials/**/*.vmt` and `materials/**/*.vtf`. It rejects traversal,
 case-insensitive duplicate paths, oversized entries and malformed ZIP data, and applies bounded
-entry and decompression limits.
+entry and decompression limits. VTF files, encoded image ranges and decoded RGBA output are each
+bounded to 256 MiB; dimensions are bounded to 16,384 and resource dictionaries to 4,096 entries.
 
 `--out` and `--collision-out` are independently optional, but at least one is required. A
 collision-only export does not parse or triangulate render faces. Material, prop, lightmap and
@@ -218,6 +239,8 @@ HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_collision -- --ignored
 HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
+HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_materials -- --ignored --nocapture
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_props -- --nocapture
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
@@ -248,7 +271,7 @@ world render faces are represented by static GLB chunks.
 2. Direct lightmap atlas generation, including directional bump channels (implemented for
    single-style brush faces)
 3. Static prop MDL geometry resolution (metadata and reusable references implemented)
-4. VTF pixel conversion and runtime shader integration
+4. VTF pixel conversion (implemented); runtime shader integration remains
 5. Collision brush and opaque physics sidecars (implemented)
 6. ~~Leaf/cluster/PVS sidecars~~
 7. Versioned output manifests and runtime integration
@@ -260,6 +283,8 @@ world render faces are represented by static GLB chunks.
 - Public SDK lightmap references:
   [`bspfile.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/bspfile.h)
   and [`bspflags.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/bspflags.h).
+- Public SDK VTF concepts and image-format identifiers from
+  [`vtf.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/vtf/vtf.h).
 - [BSPSource](https://github.com/ata4/bspsrc) for extensive Source BSP tooling and research.
 - [Plumber](https://github.com/lasa01/Plumber) for Source model, map, material and texture import
   tooling used by the pipeline this project is incrementally replacing.

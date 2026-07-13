@@ -1,4 +1,7 @@
+use crate::vtf::{VtfErrorKind, VtfImageSelection, VtfMetadata, decode_vtf, inspect_vtf};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 
@@ -115,6 +118,8 @@ pub struct ManifestTexture {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lookup_path: Option<String>,
     pub provenance: ResourceProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_source_index: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -162,6 +167,64 @@ pub struct SourceMaterialManifest {
     pub embedded_resources: Vec<EmbeddedResourceMetadata>,
     pub unresolved_assets: Vec<UnresolvedAsset>,
     pub limitations: MaterialLimitations,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextureDecodeStatus {
+    Decoded,
+    Unsupported,
+    Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialTextureOutput {
+    pub content_id: String,
+    pub file_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub byte_length: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialTextureSource {
+    pub lookup_path: String,
+    pub provenance: ResourceProvenance,
+    pub status: TextureDecodeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<VtfMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<MaterialTextureOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialTextureManifest {
+    pub schema: String,
+    pub version: u32,
+    pub selection: VtfImageSelection,
+    pub sources: Vec<MaterialTextureSource>,
+    pub outputs: Vec<MaterialTextureOutput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterialTextureArtifact {
+    pub content_id: String,
+    pub file_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceMaterialPackage {
+    pub material_manifest: SourceMaterialManifest,
+    pub manifest: MaterialTextureManifest,
+    pub artifacts: Vec<MaterialTextureArtifact>,
 }
 
 #[derive(Debug)]
@@ -588,11 +651,165 @@ fn resolve_external(
         .map(Option::flatten)
 }
 
-pub fn build_source_material_manifest(
+struct TexturePackageBuilder {
+    selection: VtfImageSelection,
+    sources: Vec<MaterialTextureSource>,
+    source_by_path: HashMap<String, usize>,
+    outputs: Vec<MaterialTextureOutput>,
+    artifacts: Vec<MaterialTextureArtifact>,
+    artifact_by_pixels: HashMap<String, usize>,
+}
+
+impl TexturePackageBuilder {
+    fn new(selection: VtfImageSelection) -> Self {
+        Self {
+            selection,
+            sources: Vec::new(),
+            source_by_path: HashMap::new(),
+            outputs: Vec::new(),
+            artifacts: Vec::new(),
+            artifact_by_pixels: HashMap::new(),
+        }
+    }
+
+    fn source(&self, lookup_path: &str) -> Option<(usize, ResourceProvenance)> {
+        self.source_by_path
+            .get(&lookup_path.to_ascii_lowercase())
+            .map(|index| (*index, self.sources[*index].provenance.clone()))
+    }
+
+    fn add_source(
+        &mut self,
+        lookup_path: String,
+        provenance: ResourceProvenance,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        let (status, metadata, output, error) = match decode_vtf(data, self.selection) {
+            Ok(decoded) => {
+                let pixel_key = rgba_pixel_key(decoded.width, decoded.height, &decoded.pixels);
+                let output = if let Some(index) = self.artifact_by_pixels.get(&pixel_key) {
+                    self.outputs[*index].clone()
+                } else {
+                    let png = encode_rgba_png(decoded.width, decoded.height, &decoded.pixels)?;
+                    let content_id = sha256_content_id(&png);
+                    let digest = content_id
+                        .strip_prefix("sha256:")
+                        .expect("RGBA content IDs use SHA-256");
+                    let file_name = format!("sha256-{digest}.png");
+                    let output = MaterialTextureOutput {
+                        content_id: content_id.clone(),
+                        file_name: file_name.clone(),
+                        width: decoded.width,
+                        height: decoded.height,
+                        byte_length: png.len(),
+                    };
+                    let index = self.artifacts.len();
+                    self.artifact_by_pixels.insert(pixel_key, index);
+                    self.outputs.push(output.clone());
+                    self.artifacts.push(MaterialTextureArtifact {
+                        content_id,
+                        file_name,
+                        width: decoded.width,
+                        height: decoded.height,
+                        png,
+                    });
+                    output
+                };
+                (
+                    TextureDecodeStatus::Decoded,
+                    Some(decoded.metadata),
+                    Some(output),
+                    None,
+                )
+            }
+            Err(decode_error) => {
+                let metadata = inspect_vtf(data).ok();
+                let status = match decode_error.kind {
+                    VtfErrorKind::Invalid => TextureDecodeStatus::Invalid,
+                    VtfErrorKind::Unsupported => TextureDecodeStatus::Unsupported,
+                };
+                (status, metadata, None, Some(decode_error.message))
+            }
+        };
+        let index = self.sources.len();
+        self.source_by_path
+            .insert(lookup_path.to_ascii_lowercase(), index);
+        self.sources.push(MaterialTextureSource {
+            lookup_path,
+            provenance,
+            status,
+            metadata,
+            output,
+            error,
+        });
+        Ok(index)
+    }
+
+    fn finish(self) -> (MaterialTextureManifest, Vec<MaterialTextureArtifact>) {
+        (
+            MaterialTextureManifest {
+                schema: "bsp-to-glb/material-textures".to_owned(),
+                version: 1,
+                selection: self.selection,
+                sources: self.sources,
+                outputs: self.outputs,
+            },
+            self.artifacts,
+        )
+    }
+}
+
+fn rgba_pixel_key(width: u32, height: u32, pixels: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(width.to_le_bytes());
+    hasher.update(height.to_le_bytes());
+    hasher.update(pixels);
+    format!("{:x}", hasher.finalize())
+}
+
+fn sha256_content_id(data: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(data))
+}
+
+fn encode_rgba_png(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>, String> {
+    let expected = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "material texture dimensions overflow".to_owned())?;
+    if width == 0 || height == 0 || pixels.len() != expected {
+        return Err("material texture dimensions do not match its RGBA pixels".to_owned());
+    }
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| format!("failed to encode material texture PNG header: {error}"))?;
+        writer
+            .write_image_data(pixels)
+            .map_err(|error| format!("failed to encode material texture PNG pixels: {error}"))?;
+    }
+    Ok(output)
+}
+
+struct MaterialBuild {
+    manifest: SourceMaterialManifest,
+    texture_package: Option<(MaterialTextureManifest, Vec<MaterialTextureArtifact>)>,
+}
+
+fn build_materials(
     material_names: &[String],
     embedded_resources: &[PakResource],
     resolver: Option<&dyn MaterialResolver>,
-) -> Result<SourceMaterialManifest, String> {
+    texture_selection: Option<VtfImageSelection>,
+) -> Result<MaterialBuild, String> {
     let mut by_path = HashMap::new();
     for (index, resource) in embedded_resources.iter().enumerate() {
         let normalized = normalize_archive_path(&resource.path)?;
@@ -615,6 +832,7 @@ pub fn build_source_material_manifest(
 
     let mut materials = Vec::with_capacity(material_names.len());
     let mut unresolved_assets = Vec::new();
+    let mut texture_package = texture_selection.map(TexturePackageBuilder::new);
     for (material_index, name) in material_names.iter().enumerate() {
         let vmt_path = source_lookup_path(name, ".vmt")?;
         let (vmt_data, vmt_provenance) = if let Some(resource) =
@@ -663,36 +881,61 @@ pub fn build_source_material_manifest(
                         reference: reference.to_owned(),
                         lookup_path: None,
                         provenance: ResourceProvenance::BuiltIn,
+                        package_source_index: None,
                     });
                     continue;
                 }
                 let lookup_path = source_lookup_path(reference, ".vtf")?;
-                let provenance = if let Some(resource) =
-                    lookup_pak(embedded_resources, &by_path, &lookup_path)
+                let existing_source = texture_package
+                    .as_ref()
+                    .and_then(|package| package.source(&lookup_path));
+                let (provenance, package_source_index) = if let Some((index, provenance)) =
+                    existing_source
                 {
-                    ResourceProvenance::Pak {
-                        path: resource.path.clone(),
-                    }
-                } else if let Some(resource) =
-                    resolve_external(resolver, &lookup_path, PakResourceKind::Vtf)?
-                {
-                    ResourceProvenance::External {
-                        resolver: resource.provenance,
-                    }
+                    (provenance, Some(index))
                 } else {
-                    unresolved_assets.push(UnresolvedAsset {
-                        kind: PakResourceKind::Vtf,
-                        lookup_path: lookup_path.clone(),
-                        referenced_by: name.clone(),
-                        role: role.to_owned(),
-                    });
-                    ResourceProvenance::Unresolved
+                    let (data, provenance) = if let Some(resource) =
+                        lookup_pak(embedded_resources, &by_path, &lookup_path)
+                    {
+                        (
+                            Some(Cow::Borrowed(resource.data.as_slice())),
+                            ResourceProvenance::Pak {
+                                path: resource.path.clone(),
+                            },
+                        )
+                    } else if let Some(resource) =
+                        resolve_external(resolver, &lookup_path, PakResourceKind::Vtf)?
+                    {
+                        (
+                            Some(Cow::Owned(resource.data)),
+                            ResourceProvenance::External {
+                                resolver: resource.provenance,
+                            },
+                        )
+                    } else {
+                        unresolved_assets.push(UnresolvedAsset {
+                            kind: PakResourceKind::Vtf,
+                            lookup_path: lookup_path.clone(),
+                            referenced_by: name.clone(),
+                            role: role.to_owned(),
+                        });
+                        (None, ResourceProvenance::Unresolved)
+                    };
+                    let index = if let (Some(package), Some(data)) =
+                        (texture_package.as_mut(), data.as_deref())
+                    {
+                        Some(package.add_source(lookup_path.clone(), provenance.clone(), data)?)
+                    } else {
+                        None
+                    };
+                    (provenance, index)
                 };
                 textures.push(ManifestTexture {
                     role: role.to_owned(),
                     reference: reference.to_owned(),
                     lookup_path: Some(lookup_path),
                     provenance,
+                    package_source_index,
                 });
             }
         }
@@ -708,8 +951,8 @@ pub fn build_source_material_manifest(
         });
     }
 
-    Ok(SourceMaterialManifest {
-        schema_version: 1,
+    let manifest = SourceMaterialManifest {
+        schema_version: 2,
         lookup_policy: "pakFirst".to_owned(),
         materials,
         embedded_resources: embedded_resources
@@ -722,10 +965,44 @@ pub fn build_source_material_manifest(
             .collect(),
         unresolved_assets,
         limitations: MaterialLimitations {
-            vtf_pixel_conversion: "notImplemented".to_owned(),
+            vtf_pixel_conversion: "optionalSelectedRgbaPngPackage".to_owned(),
             proxies: "metadataOnly".to_owned(),
             animated_materials: "metadataOnly".to_owned(),
         },
+    };
+    Ok(MaterialBuild {
+        manifest,
+        texture_package: texture_package.map(TexturePackageBuilder::finish),
+    })
+}
+
+pub fn build_source_material_manifest(
+    material_names: &[String],
+    embedded_resources: &[PakResource],
+    resolver: Option<&dyn MaterialResolver>,
+) -> Result<SourceMaterialManifest, String> {
+    Ok(build_materials(material_names, embedded_resources, resolver, None)?.manifest)
+}
+
+pub fn build_source_material_package(
+    material_names: &[String],
+    embedded_resources: &[PakResource],
+    resolver: Option<&dyn MaterialResolver>,
+    selection: VtfImageSelection,
+) -> Result<SourceMaterialPackage, String> {
+    let built = build_materials(
+        material_names,
+        embedded_resources,
+        resolver,
+        Some(selection),
+    )?;
+    let (manifest, artifacts) = built
+        .texture_package
+        .expect("texture selection creates a material texture package");
+    Ok(SourceMaterialPackage {
+        material_manifest: built.manifest,
+        manifest,
+        artifacts,
     })
 }
 

@@ -184,6 +184,7 @@ fn owns_exact_face_uvs_and_all_bump_channels() {
         &ExportOptions {
             lightmap_set: LightmapSet::Ldr,
             atlas_width: 64,
+            ..ExportOptions::default()
         },
     )
     .unwrap();

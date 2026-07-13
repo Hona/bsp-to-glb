@@ -189,7 +189,7 @@ fn manifest_uses_pak_first_then_reports_external_and_unresolved_assets() {
             .unwrap();
     let json = to_value(&manifest).unwrap();
 
-    assert_eq!(json["schemaVersion"], 1);
+    assert_eq!(json["schemaVersion"], 2);
     assert_eq!(json["lookupPolicy"], "pakFirst");
     assert_eq!(
         json["materials"][0]["vmt"]["lookupPath"],
@@ -208,7 +208,10 @@ fn manifest_uses_pak_first_then_reports_external_and_unresolved_assets() {
         json["unresolvedAssets"][0]["lookupPath"],
         "materials/detail/missing.vtf"
     );
-    assert_eq!(json["limitations"]["vtfPixelConversion"], "notImplemented");
+    assert_eq!(
+        json["limitations"]["vtfPixelConversion"],
+        "optionalSelectedRgbaPngPackage"
+    );
     assert_eq!(json["limitations"]["proxies"], "metadataOnly");
     assert_eq!(json["limitations"]["animatedMaterials"], "metadataOnly");
 
