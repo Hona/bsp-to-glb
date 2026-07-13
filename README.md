@@ -24,6 +24,8 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - entity origins, angles, names, classes and initial-state metadata
 - compiled face polygons and referenced primitive triangulation
 - compiled vertex normals
+- compiled displacement grids, vector distances, alpha and triangle tags
+- generated displacement normals and Source displacement triangulation
 - texture UVs and material names
 - lightmap UVs supplied by existing atlas metadata
 - hidden-but-preserved sky, trigger and disabled brush models
@@ -31,12 +33,13 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 
 Unsupported domains are detected or reported explicitly:
 
-- displacement geometry aborts export instead of being silently dropped
 - static and dynamic prop model assets
 - VTF pixels and VMT shader behavior
 - collision brushes and physics meshes
 - PVS/leaf visibility data
-- overlays, particles and animated materials
+- overlays and water overlays (presence and lump versions are reported, geometry is not exported)
+- cubemap samples (presence and lump versions are reported, textures are not exported)
+- particles and animated materials
 
 Do not describe output as full Source parity until those domains are implemented and tested.
 
@@ -104,6 +107,10 @@ bsp-to-glb \
 `--lightmaps` is optional. The current input format is produced by the tf2jump map pipeline and
 will be replaced by direct atlas generation as the exporter matures.
 
+The CLI statistics include a `capabilities` object. Displacements report `exported`; overlays,
+water overlays and cubemaps report `detectedOnly`. Unknown optional-feature lump versions report
+`unsupportedVersion` rather than implying support.
+
 ## Verification
 
 ```bash
@@ -118,14 +125,14 @@ Tests use synthetic BSP fixtures and do not include game assets.
 
 - Compiled BSP is the authority for render geometry and model boundaries.
 - Named brush entities are never flattened into worldspawn.
-- Unsupported geometry fails closed.
+- Unsupported geometry and displacement lump versions fail closed.
 - Render, collision and visibility data remain separate domains.
 - Accuracy claims are scoped and machine-verifiable.
 - No game assets or proprietary source excerpts are included.
 
 ## Roadmap
 
-1. Displacements and overlays
+1. Overlay projection and clipping
 2. Direct lightmap atlas generation, including directional bump channels
 3. Static prop game lumps and reusable model references
 4. VMT/VTF material package integration

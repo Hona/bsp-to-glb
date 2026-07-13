@@ -85,7 +85,7 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         put_i16(
             &mut faces,
             offset + 12,
-            if displacement && face == 1 { 0 } else { -1 },
+            if displacement && face == 0 { 0 } else { -1 },
         );
         faces[offset + 16] = 0;
         faces[offset + 17..offset + 20].fill(255);
@@ -160,6 +160,54 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
     lumps[43] = b"brick/test\0".to_vec();
     lumps[44] = 0_i32.to_le_bytes().to_vec();
 
+    if displacement {
+        let mut dispinfo = vec![0; 176];
+        put_i32(&mut dispinfo, 12, 0);
+        put_i32(&mut dispinfo, 16, 0);
+        put_i32(&mut dispinfo, 20, 2);
+        put_u16(&mut dispinfo, 36, 0);
+        lumps[26] = dispinfo;
+
+        let mut dispverts = vec![0; 25 * 20];
+        for index in 0..25 {
+            put_f32(&mut dispverts, index * 20 + 8, 1.0);
+            put_f32(&mut dispverts, index * 20 + 16, index as f32 * 10.0);
+        }
+        put_f32(&mut dispverts, 6 * 20, 1.0);
+        put_f32(&mut dispverts, 6 * 20 + 8, 0.0);
+        put_f32(&mut dispverts, 6 * 20 + 12, 4.0);
+        put_f32(&mut dispverts, 12 * 20 + 12, 16.0);
+        lumps[33] = dispverts;
+
+        let mut disptris = vec![0; 32 * 2];
+        for index in 0_usize..32 {
+            let tags = 1 | if index.is_multiple_of(2) { 2 } else { 4 };
+            put_u16(&mut disptris, index * 2, tags);
+        }
+        lumps[48] = disptris;
+
+        let mut cubemap = vec![0; 16];
+        put_i32(&mut cubemap, 0, 32);
+        put_i32(&mut cubemap, 4, 48);
+        put_i32(&mut cubemap, 8, 64);
+        cubemap[12] = 5;
+        lumps[42] = cubemap;
+
+        let mut overlay = vec![0; 352];
+        put_i32(&mut overlay, 0, 7);
+        put_i16(&mut overlay, 4, 0);
+        put_u16(&mut overlay, 6, 1);
+        put_i32(&mut overlay, 8, 0);
+        lumps[45] = overlay;
+
+        let mut water_overlay = vec![0; 1120];
+        put_i32(&mut water_overlay, 0, 9);
+        put_i16(&mut water_overlay, 4, 0);
+        put_u16(&mut water_overlay, 6, 1);
+        put_i32(&mut water_overlay, 8, 0);
+        lumps[50] = water_overlay;
+    }
+
     let mut bsp = vec![0; HEADER_SIZE];
     bsp[0..4].copy_from_slice(b"VBSP");
     put_i32(&mut bsp, 4, 20);
@@ -191,6 +239,7 @@ fn read_f32_accessor(glb: &[u8], gltf: &Value, accessor_index: usize) -> Vec<f32
     let offset = view["byteOffset"].as_u64().unwrap_or(0) as usize
         + accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
     let width = match accessor["type"].as_str().unwrap() {
+        "SCALAR" => 1,
         "VEC2" => 2,
         "VEC3" => 3,
         value => panic!("unsupported test accessor type {value}"),
@@ -223,6 +272,16 @@ fn read_u32_accessor(glb: &[u8], gltf: &Value, accessor_index: usize) -> Vec<u32
 fn lump_offset(bsp: &[u8], lump: usize) -> usize {
     let header = 8 + lump * 16;
     i32::from_le_bytes(bsp[header..header + 4].try_into().unwrap()) as usize
+}
+
+fn set_lump_version(bsp: &mut [u8], lump: usize, version: i32) {
+    put_i32(bsp, 8 + lump * 16 + 8, version);
+}
+
+fn fnv1a64(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[test]
@@ -401,10 +460,205 @@ fn texinfo_nolight_flag_prevents_lightmap_false_positive() {
 }
 
 #[test]
-fn rejects_displacements_instead_of_dropping_them() {
-    let error = export_bsp(&synthetic_bsp(true), None).unwrap_err();
-    assert!(error.contains("displacement"), "unexpected error: {error}");
-    assert!(error.contains("face 1"), "unexpected error: {error}");
+fn exports_compiled_displacement_geometry_and_parent_face_mapping() {
+    let bsp = synthetic_bsp(true);
+    let lightmaps = json!({
+        "atlasWidth": 128,
+        "atlasHeight": 64,
+        "faces": [{
+            "faceIndex": 0,
+            "w": 5,
+            "h": 5,
+            "atlasX": 8,
+            "atlasY": 4,
+            "lmVecs": [[0.0625, 0.0, 0.0, 0.0], [0.0, 0.0625, 0.0, 0.0]],
+            "lmMinsS": 0,
+            "lmMinsT": 0,
+            "verts": [[0, 0, 0], [64, 0, 0], [64, 64, 0], [0, 64, 0]]
+        }]
+    });
+
+    let result = export_bsp(&bsp, Some(lightmaps.to_string().as_bytes())).unwrap();
+    let gltf = glb_json(&result.glb);
+    let displacement = gltf["meshes"][0]["primitives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|primitive| primitive["extras"]["geometry"] == "displacement")
+        .unwrap();
+    let attributes = &displacement["attributes"];
+    let positions = read_f32_accessor(
+        &result.glb,
+        &gltf,
+        attributes["POSITION"].as_u64().unwrap() as usize,
+    );
+    let normals = read_f32_accessor(
+        &result.glb,
+        &gltf,
+        attributes["NORMAL"].as_u64().unwrap() as usize,
+    );
+    let uv0 = read_f32_accessor(
+        &result.glb,
+        &gltf,
+        attributes["TEXCOORD_0"].as_u64().unwrap() as usize,
+    );
+    let uv1 = read_f32_accessor(
+        &result.glb,
+        &gltf,
+        attributes["TEXCOORD_1"].as_u64().unwrap() as usize,
+    );
+    let alpha = read_f32_accessor(
+        &result.glb,
+        &gltf,
+        attributes["_DISPLACEMENT_ALPHA"].as_u64().unwrap() as usize,
+    );
+    let indices = read_u32_accessor(
+        &result.glb,
+        &gltf,
+        displacement["indices"].as_u64().unwrap() as usize,
+    );
+
+    assert_eq!(result.stats.displacement_faces, 1);
+    assert_eq!(result.stats.faces, 2);
+    assert_eq!(result.stats.vertices, 29);
+    assert_eq!(result.stats.triangles, 34);
+    assert_eq!(&positions[6 * 3..6 * 3 + 3], &[20.0, 0.0, -16.0]);
+    assert_eq!(&positions[12 * 3..12 * 3 + 3], &[32.0, 16.0, -32.0]);
+    assert_eq!(&uv0[6 * 2..6 * 2 + 2], &[0.25, 0.25]);
+    assert_eq!(&uv1[0..2], &[8.5 / 128.0, 4.5 / 64.0]);
+    assert_eq!(
+        alpha,
+        (0..25).map(|index| index as f32 * 10.0).collect::<Vec<_>>()
+    );
+    assert_eq!(indices.len(), 32 * 3);
+    assert_eq!(
+        &indices[0..24],
+        &[
+            0, 5, 6, 1, 0, 6, 2, 1, 6, 7, 2, 6, 12, 7, 6, 11, 12, 6, 10, 11, 6, 5, 10, 6
+        ]
+    );
+    assert_eq!(displacement["extras"]["bspFaceIndices"], json!([0]));
+    assert_eq!(displacement["extras"]["bspDispInfoIndices"], json!([0]));
+    assert_eq!(
+        displacement["extras"]["bspDisplacementTriangleTags"]
+            .as_array()
+            .unwrap()[0],
+        json!(
+            (0_usize..32)
+                .map(|index| 1 | if index.is_multiple_of(2) { 2 } else { 4 })
+                .collect::<Vec<_>>()
+        )
+    );
+    for normal in normals.chunks_exact(3) {
+        let length = normal.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!((length - 1.0).abs() < 1e-5, "non-unit normal: {normal:?}");
+        assert!(normal[1] > 0.0, "inward normal: {normal:?}");
+    }
+}
+
+#[test]
+fn omits_removed_displacement_triangles_but_retains_their_source_tags() {
+    let mut bsp = synthetic_bsp(true);
+    let disptris = lump_offset(&bsp, 48);
+    put_u16(&mut bsp, disptris, 1 | 32);
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let gltf = glb_json(&result.glb);
+    let displacement = gltf["meshes"][0]["primitives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|primitive| primitive["extras"]["geometry"] == "displacement")
+        .unwrap();
+    let exported_tags = &displacement["extras"]["bspDisplacementTriangleTags"][0];
+    let source_tags = &displacement["extras"]["bspDisplacementSourceTriangleTags"][0];
+
+    assert_eq!(result.stats.displacement_triangles, 31);
+    assert_eq!(exported_tags.as_array().unwrap().len(), 31);
+    assert!(
+        exported_tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tag| tag.as_u64().unwrap() & 32 == 0)
+    );
+    assert_eq!(source_tags.as_array().unwrap().len(), 32);
+    assert_eq!(source_tags[0], 33);
+}
+
+#[test]
+fn reports_optional_feature_capabilities_without_claiming_export_support() {
+    let result = export_bsp(&synthetic_bsp(true), None).unwrap();
+    let stats = serde_json::to_value(&result.stats).unwrap();
+
+    assert_eq!(stats["capabilities"]["displacements"]["present"], true);
+    assert_eq!(stats["capabilities"]["displacements"]["count"], 1);
+    assert_eq!(stats["capabilities"]["displacements"]["status"], "exported");
+    assert_eq!(stats["capabilities"]["overlays"]["count"], 1);
+    assert_eq!(stats["capabilities"]["overlays"]["status"], "detectedOnly");
+    assert_eq!(stats["capabilities"]["waterOverlays"]["count"], 1);
+    assert_eq!(
+        stats["capabilities"]["waterOverlays"]["status"],
+        "detectedOnly"
+    );
+    assert_eq!(stats["capabilities"]["cubemaps"]["count"], 1);
+    assert_eq!(stats["capabilities"]["cubemaps"]["status"], "detectedOnly");
+}
+
+#[test]
+fn reports_unsupported_optional_metadata_versions_without_claiming_support() {
+    let mut bsp = synthetic_bsp(true);
+    set_lump_version(&mut bsp, 45, 7);
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let stats = serde_json::to_value(&result.stats).unwrap();
+
+    assert_eq!(
+        stats["capabilities"]["overlays"]["lumpVersions"]["OVERLAYS"],
+        7
+    );
+    assert_eq!(
+        stats["capabilities"]["overlays"]["status"],
+        "unsupportedVersion"
+    );
+    assert_eq!(stats["capabilities"]["overlays"]["count"], Value::Null);
+}
+
+#[test]
+fn rejects_unsupported_displacement_lump_versions() {
+    let mut bsp = synthetic_bsp(true);
+    set_lump_version(&mut bsp, 26, 1);
+
+    let error = export_bsp(&bsp, None).unwrap_err();
+    assert!(error.contains("DISPINFO lump version 1"), "{error}");
+}
+
+#[test]
+#[ignore = "requires BSP_TO_GLB_LOCAL_DISP_MAP to point to a locally installed map"]
+fn exports_a_local_displacement_map() {
+    let path = std::env::var("BSP_TO_GLB_LOCAL_DISP_MAP")
+        .expect("BSP_TO_GLB_LOCAL_DISP_MAP must name a local BSP");
+    let bsp = std::fs::read(&path).unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let stats = serde_json::to_value(&result.stats).unwrap();
+
+    assert!(result.stats.displacement_faces > 0);
+    assert!(result.stats.displacement_vertices > result.stats.displacement_faces * 4);
+    assert!(result.stats.displacement_triangles > 0);
+    assert_eq!(&result.glb[0..4], b"glTF");
+    assert_eq!(stats["capabilities"]["displacements"]["status"], "exported");
+}
+
+#[test]
+fn no_displacement_export_remains_byte_and_metric_stable() {
+    let result = export_bsp(&synthetic_bsp(false), None).unwrap();
+
+    assert_eq!(fnv1a64(&result.glb), 3_257_560_727_136_978_702);
+    assert_eq!(result.stats.faces, 2);
+    assert_eq!(result.stats.vertices, 8);
+    assert_eq!(result.stats.triangles, 4);
+    assert_eq!(result.stats.displacement_faces, 0);
 }
 
 #[test]
