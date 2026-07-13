@@ -1,5 +1,5 @@
 use super::{
-    Bsp, Model, entity_property, parse_bsp, parse_entities, parse_models, parse_planes,
+    Bsp, Entity, Model, entity_property, parse_bsp, parse_entities, parse_models, parse_planes,
     parse_source_vector, read_i16, read_i32, read_u16,
 };
 use base64::Engine;
@@ -384,9 +384,7 @@ fn parse_physics(data: &[u8]) -> Result<PhysicsCollision, String> {
     })
 }
 
-fn entity_by_model(
-    entities: &[HashMap<String, String>],
-) -> HashMap<usize, (usize, &HashMap<String, String>)> {
+fn entity_by_model(entities: &[Entity]) -> HashMap<usize, (usize, &Entity)> {
     let mut output = HashMap::new();
     for (entity_index, entity) in entities.iter().enumerate() {
         let Some(model_value) =
@@ -409,7 +407,7 @@ fn entity_by_model(
 
 fn collision_models(
     models: &[Model],
-    entities: &[HashMap<String, String>],
+    entities: &[Entity],
     model_brush_indices: Vec<Vec<usize>>,
 ) -> Vec<CollisionModel> {
     let entities = entity_by_model(entities);

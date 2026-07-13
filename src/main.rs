@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--lightmaps <lightmap_data.json>] [--material-manifest <materials.json>]"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--lightmaps <lightmap_data.json>] [--material-manifest <materials.json>] [--props-out <props.json>]"
 }
 
 fn run() -> Result<(), String> {
@@ -14,6 +14,7 @@ fn run() -> Result<(), String> {
     let mut collision_output_path: Option<PathBuf> = None;
     let mut lightmap_path: Option<PathBuf> = None;
     let mut material_manifest_path: Option<PathBuf> = None;
+    let mut props_output_path: Option<PathBuf> = None;
     let args: Vec<_> = env::args_os().skip(1).collect();
     let mut index = 0;
     while index < args.len() {
@@ -27,6 +28,7 @@ fn run() -> Result<(), String> {
             "--collision-out" => collision_output_path = Some(value.into()),
             "--lightmaps" => lightmap_path = Some(value.into()),
             "--material-manifest" => material_manifest_path = Some(value.into()),
+            "--props-out" => props_output_path = Some(value.into()),
             _ => return Err(format!("unknown argument: {flag}\n{}", usage())),
         }
         index += 2;
@@ -54,6 +56,13 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("failed to serialize material manifest: {error}"))
             })
             .transpose()?;
+        let props = props_output_path
+            .as_ref()
+            .map(|_| {
+                serde_json::to_vec_pretty(&result.props)
+                    .map_err(|error| format!("failed to serialize prop metadata: {error}"))
+            })
+            .transpose()?;
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
@@ -66,6 +75,14 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
             }
             fs::write(path, manifest)
+                .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+        }
+        if let (Some(path), Some(props)) = (&props_output_path, props) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            }
+            fs::write(path, props)
                 .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
         }
         render_stats = Some(result.stats);

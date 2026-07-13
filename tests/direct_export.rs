@@ -21,6 +21,10 @@ fn put_i32(data: &mut [u8], offset: usize, value: i32) {
     data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 fn put_f32(data: &mut [u8], offset: usize, value: f32) {
     data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -197,6 +201,159 @@ fn append_pak(bsp: &mut Vec<u8>, entries: &[(&str, &[u8])]) {
     put_i32(bsp, header + 4, pak.len() as i32);
 }
 
+fn synthetic_bsp_with_tf2_props() -> Vec<u8> {
+    let mut bsp = synthetic_bsp(false);
+    let mut entities = bsp[lump_offset(&bsp, 0)..].to_vec();
+    let entity_length = i32::from_le_bytes(bsp[12..16].try_into().unwrap()) as usize;
+    entities.truncate(entity_length);
+    entities.extend_from_slice(
+        br#"
+{
+"classname" "prop_dynamic"
+"targetname" "animated_crate"
+"model" "models/props_test/crate.mdl"
+"origin" "10 20 30"
+"angles" "0 45 0"
+"skin" "2"
+"solid" "6"
+"StartDisabled" "1"
+"DefaultAnim" "idle"
+}
+"#,
+    );
+    let entities_offset = bsp.len();
+    bsp.extend_from_slice(&entities);
+    put_i32(&mut bsp, 8, entities_offset as i32);
+    put_i32(&mut bsp, 12, entities.len() as i32);
+
+    let mut static_props = Vec::new();
+    static_props.extend_from_slice(&1_u32.to_le_bytes());
+    let mut model_name = [0_u8; 128];
+    let model_path = b"models/props_test/crate.mdl";
+    model_name[..model_path.len()].copy_from_slice(model_path);
+    static_props.extend_from_slice(&model_name);
+    static_props.extend_from_slice(&3_u32.to_le_bytes());
+    static_props.extend_from_slice(&7_u16.to_le_bytes());
+    static_props.extend_from_slice(&9_u16.to_le_bytes());
+    static_props.extend_from_slice(&12_u16.to_le_bytes());
+    static_props.extend_from_slice(&1_u32.to_le_bytes());
+    let record_offset = static_props.len();
+    static_props.resize(record_offset + 72, 0);
+    for (axis, value) in [1.0, 2.0, 3.0].iter().enumerate() {
+        put_f32(&mut static_props, record_offset + axis * 4, *value);
+    }
+    for (axis, value) in [10.0, 20.0, 30.0].iter().enumerate() {
+        put_f32(&mut static_props, record_offset + 12 + axis * 4, *value);
+    }
+    put_u16(&mut static_props, record_offset + 24, 0);
+    put_u16(&mut static_props, record_offset + 26, 0);
+    put_u16(&mut static_props, record_offset + 28, 2);
+    static_props[record_offset + 30] = 6;
+    put_i32(&mut static_props, record_offset + 32, 4);
+    put_f32(&mut static_props, record_offset + 36, 128.0);
+    put_f32(&mut static_props, record_offset + 40, 512.0);
+    for (axis, value) in [4.0, 5.0, 6.0].iter().enumerate() {
+        put_f32(&mut static_props, record_offset + 44 + axis * 4, *value);
+    }
+    put_f32(&mut static_props, record_offset + 56, 1.25);
+    put_u16(&mut static_props, record_offset + 60, 80);
+    put_u16(&mut static_props, record_offset + 62, 95);
+    put_u32(&mut static_props, record_offset + 64, 0x101);
+    put_u16(&mut static_props, record_offset + 68, 16);
+    put_u16(&mut static_props, record_offset + 70, 32);
+
+    let game_lump_offset = bsp.len();
+    let static_props_offset = game_lump_offset + 20;
+    let mut game_lump = vec![0; 20];
+    put_i32(&mut game_lump, 0, 1);
+    // Source writes the multi-character constant 'sprp' as little-endian bytes.
+    game_lump[4..8].copy_from_slice(b"prps");
+    put_u16(&mut game_lump, 8, 0);
+    put_u16(&mut game_lump, 10, 10);
+    put_i32(&mut game_lump, 12, static_props_offset as i32);
+    put_i32(&mut game_lump, 16, static_props.len() as i32);
+    game_lump.extend_from_slice(&static_props);
+    bsp.extend_from_slice(&game_lump);
+    let game_lump_header = 8 + 35 * 16;
+    put_i32(&mut bsp, game_lump_header, game_lump_offset as i32);
+    put_i32(&mut bsp, game_lump_header + 4, game_lump.len() as i32);
+    bsp
+}
+
+fn replace_static_prop_game_lump(
+    bsp: &mut Vec<u8>,
+    payload: &[u8],
+    version: u16,
+    compressed: bool,
+) {
+    let child_data = if compressed {
+        let mut alone = Vec::new();
+        lzma_rs::lzma_compress(&mut Cursor::new(payload), &mut alone).unwrap();
+        let compressed_size = alone.len() - 13;
+        let mut source_lzma = Vec::with_capacity(17 + compressed_size);
+        source_lzma.extend_from_slice(b"LZMA");
+        source_lzma.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        source_lzma.extend_from_slice(&(compressed_size as u32).to_le_bytes());
+        source_lzma.extend_from_slice(&alone[..5]);
+        source_lzma.extend_from_slice(&alone[13..]);
+        source_lzma
+    } else {
+        payload.to_vec()
+    };
+    let game_lump_offset = bsp.len();
+    let child_offset = game_lump_offset + 20;
+    let mut game_lump = vec![0; 20];
+    put_i32(&mut game_lump, 0, 1);
+    game_lump[4..8].copy_from_slice(b"prps");
+    put_u16(&mut game_lump, 8, u16::from(compressed));
+    put_u16(&mut game_lump, 10, version);
+    put_i32(&mut game_lump, 12, child_offset as i32);
+    put_i32(&mut game_lump, 16, payload.len() as i32);
+    game_lump.extend_from_slice(&child_data);
+    bsp.extend_from_slice(&game_lump);
+    let game_lump_header = 8 + 35 * 16;
+    put_i32(bsp, game_lump_header, game_lump_offset as i32);
+    put_i32(bsp, game_lump_header + 4, game_lump.len() as i32);
+}
+
+fn static_prop_payload(bsp: &[u8]) -> Vec<u8> {
+    let game_lump = lump_offset(bsp, 35);
+    let child_offset =
+        i32::from_le_bytes(bsp[game_lump + 12..game_lump + 16].try_into().unwrap()) as usize;
+    let child_length =
+        i32::from_le_bytes(bsp[game_lump + 16..game_lump + 20].try_into().unwrap()) as usize;
+    bsp[child_offset..child_offset + child_length].to_vec()
+}
+
+fn sdk_v11_static_prop_payload() -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&1_u32.to_le_bytes());
+    let mut model_name = [0_u8; 128];
+    let model_path = b"models/props_test/scaled.mdl";
+    model_name[..model_path.len()].copy_from_slice(model_path);
+    data.extend_from_slice(&model_name);
+    data.extend_from_slice(&1_u32.to_le_bytes());
+    data.extend_from_slice(&42_u16.to_le_bytes());
+    data.extend_from_slice(&1_u32.to_le_bytes());
+    let record = data.len();
+    data.resize(record + 76, 0);
+    put_f32(&mut data, record, 8.0);
+    put_f32(&mut data, record + 4, 16.0);
+    put_f32(&mut data, record + 8, 24.0);
+    put_u16(&mut data, record + 24, 0);
+    put_u16(&mut data, record + 26, 0);
+    put_u16(&mut data, record + 28, 1);
+    data[record + 30] = 2;
+    data[record + 31] = 0x10;
+    put_i32(&mut data, record + 32, 3);
+    put_f32(&mut data, record + 56, 0.75);
+    data[record + 60..record + 64].copy_from_slice(&[1, 2, 3, 4]);
+    data[record + 64..record + 68].copy_from_slice(&[128, 192, 255, 255]);
+    put_u32(&mut data, record + 68, 0x200);
+    put_f32(&mut data, record + 72, 2.5);
+    data
+}
+
 fn glb_json(glb: &[u8]) -> Value {
     assert_eq!(&glb[0..4], b"glTF");
     let json_length = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
@@ -244,6 +401,141 @@ fn read_u32_accessor(glb: &[u8], gltf: &Value, accessor_index: usize) -> Vec<u32
 fn lump_offset(bsp: &[u8], lump: usize) -> usize {
     let header = 8 + lump * 16;
     i32::from_le_bytes(bsp[header..header + 4].try_into().unwrap()) as usize
+}
+
+#[test]
+fn exports_tf2_static_and_dynamic_props_as_unresolved_model_references() {
+    let result = export_bsp(&synthetic_bsp_with_tf2_props(), None).unwrap();
+    let gltf = glb_json(&result.glb);
+    let props = &gltf["asset"]["extras"]["props"];
+
+    assert_eq!(props["schema"], "bsp-to-glb.props");
+    assert_eq!(props["schemaVersion"], 1);
+    assert_eq!(props["staticPropLump"]["version"], 10);
+    assert_eq!(props["staticPropLump"]["layout"], "tf2-v10");
+    assert_eq!(props["staticPropLump"]["dictionaryCount"], 1);
+    assert_eq!(props["staticPropLump"]["instanceCount"], 1);
+    assert_eq!(props["staticPropLump"]["solidInstanceCount"], 1);
+    assert_eq!(props["modelAssets"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        props["modelAssets"][0]["sourcePath"],
+        "models/props_test/crate.mdl"
+    );
+    assert_eq!(props["modelAssets"][0]["resolutionStatus"], "unsupported");
+
+    let nodes = gltf["nodes"].as_array().unwrap();
+    let static_prop = nodes
+        .iter()
+        .find(|node| node["extras"]["sourceType"] == "staticProp")
+        .unwrap();
+    assert!(static_prop.get("mesh").is_none());
+    assert_eq!(static_prop["extras"]["staticPropIndex"], 0);
+    assert_eq!(static_prop["extras"]["dictionaryIndex"], 0);
+    assert_eq!(static_prop["extras"]["modelAssetIndex"], 0);
+    assert_eq!(
+        static_prop["extras"]["sourceOrigin"],
+        json!([1.0, 2.0, 3.0])
+    );
+    assert_eq!(
+        static_prop["extras"]["sourceAngles"],
+        json!([10.0, 20.0, 30.0])
+    );
+    assert_eq!(static_prop["extras"]["firstLeaf"], 0);
+    assert_eq!(static_prop["extras"]["leafCount"], 2);
+    assert_eq!(static_prop["extras"]["leaves"], json!([7, 9]));
+    assert_eq!(static_prop["extras"]["skin"], 4);
+    assert_eq!(static_prop["extras"]["solidity"], 6);
+    assert_eq!(static_prop["extras"]["solid"], true);
+    assert_eq!(static_prop["extras"]["flags"], 0x101);
+    assert_eq!(static_prop["extras"]["fadeMinDistance"], 128.0);
+    assert_eq!(static_prop["extras"]["fadeMaxDistance"], 512.0);
+    assert_eq!(
+        static_prop["extras"]["lightingOrigin"],
+        json!([4.0, 5.0, 6.0])
+    );
+    assert_eq!(static_prop["extras"]["forcedFadeScale"], 1.25);
+    assert_eq!(static_prop["extras"]["minDxLevel"], 80);
+    assert_eq!(static_prop["extras"]["maxDxLevel"], 95);
+    assert_eq!(static_prop["extras"]["lightmapResolution"], json!([16, 32]));
+
+    let dynamic_prop = nodes
+        .iter()
+        .find(|node| node["extras"]["sourceType"] == "dynamicPropEntity")
+        .unwrap();
+    assert!(dynamic_prop.get("mesh").is_none());
+    assert_eq!(dynamic_prop["extras"]["entityIndex"], 2);
+    assert_eq!(dynamic_prop["extras"]["targetname"], "animated_crate");
+    assert_eq!(dynamic_prop["extras"]["modelAssetIndex"], 0);
+    assert_eq!(dynamic_prop["extras"]["initialState"]["startDisabled"], "1");
+    assert_eq!(
+        dynamic_prop["extras"]["initialState"]["defaultAnim"],
+        "idle"
+    );
+    assert_eq!(
+        dynamic_prop["extras"]["keyValues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|property| property["key"] == "model")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn parses_compressed_tf2_static_prop_child_lump() {
+    let original = synthetic_bsp_with_tf2_props();
+    let payload = static_prop_payload(&original);
+    let mut bsp = synthetic_bsp(false);
+    replace_static_prop_game_lump(&mut bsp, &payload, 10, true);
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let gltf = glb_json(&result.glb);
+    assert_eq!(result.stats.static_props, 1);
+    assert_eq!(result.stats.solid_static_props, 1);
+    assert_eq!(
+        gltf["asset"]["extras"]["props"]["staticPropLump"]["layout"],
+        "tf2-v10"
+    );
+}
+
+#[test]
+fn exports_uniform_scale_from_supported_v11_layout() {
+    let mut bsp = synthetic_bsp(false);
+    replace_static_prop_game_lump(&mut bsp, &sdk_v11_static_prop_payload(), 11, false);
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let gltf = glb_json(&result.glb);
+    let node = gltf["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["extras"]["sourceType"] == "staticProp")
+        .unwrap();
+    assert_eq!(
+        gltf["asset"]["extras"]["props"]["staticPropLump"]["layout"],
+        "sdk2013-v11"
+    );
+    assert_eq!(node["extras"]["uniformScale"], 2.5);
+    assert_eq!(node["extras"]["flagsEx"], 0x200);
+    assert_eq!(node["matrix"][0], 2.5);
+}
+
+#[test]
+fn rejects_static_prop_with_missing_dictionary_identity() {
+    let mut bsp = synthetic_bsp_with_tf2_props();
+    let game_lump = lump_offset(&bsp, 35);
+    let child =
+        i32::from_le_bytes(bsp[game_lump + 12..game_lump + 16].try_into().unwrap()) as usize;
+    let record = child + 4 + 128 + 4 + 3 * 2 + 4;
+    put_u16(&mut bsp, record + 24, 1);
+
+    let error = export_bsp(&bsp, None).unwrap_err();
+    assert!(error.contains("static prop 0"), "unexpected error: {error}");
+    assert!(
+        error.contains("dictionary entry 1"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

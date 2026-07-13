@@ -22,6 +22,8 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 
 - BSP models and entity/model relationships
 - entity origins, angles, names, classes and initial-state metadata
+- TF2 static prop `GAME_LUMP` metadata and reusable MDL path references
+- dynamic prop entity references and ordered key/value state metadata
 - compiled face polygons and referenced primitive triangulation
 - compiled vertex normals
 - texture UVs and material names
@@ -37,7 +39,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 Unsupported domains are detected or reported explicitly:
 
 - displacement geometry aborts export instead of being silently dropped
-- static and dynamic prop model assets
+- static and dynamic prop MDL geometry resolution
 - VTF pixel conversion and full shader execution
 - material proxies and animated materials (identified as metadata only)
 - decoded VPhysics collision meshes
@@ -85,6 +87,8 @@ Strict supported-domain checks for that map:
 - 9,135/9,135 eligible lightmapped faces, zero false positives
 - 151/151 BSP model identities and transforms
 - 104/104 named brush entities
+- 235/235 TF2 `sprp` v10 static prop identities
+- 73/73 solid static props
 - zero rendered-bounds error
 - zero winding mismatches
 - maximum position error: 0.000427 Source units
@@ -107,6 +111,7 @@ bsp-to-glb \
   --lightmaps path/to/lightmap_data.json \
   --material-manifest path/to/map.materials.json \
   --collision-out path/to/map.collision.json \
+  --props-out path/to/props.json
 ```
 
 `--lightmaps` is optional. The current input format is produced by the tf2jump map pipeline and
@@ -149,8 +154,16 @@ PHYSCOLLIDE model headers and raw blocks are retained as base64, while `decodeSt
 
 Static-prop collision metadata is modular library input through `CollisionExportInput`. `None`
 means GAME_LUMP data was unavailable; `Some` preserves supplied prop indices, model names and
-solid modes. The CLI currently reports static-prop input as unavailable because this branch has no
-shared GAME_LUMP parser.
+solid modes. The CLI currently reports static-prop collision input as unavailable; prop render
+metadata is parsed and exported separately.
+
+`--props-out` is optional. Prop metadata is always embedded under
+`asset.extras.props` and on reference-only GLB nodes; this flag also writes the same
+`bsp-to-glb.props` schema as a versioned JSON sidecar. Static prop nodes preserve dictionary/model
+identity, transforms, leaf membership, skin, solidity, flags, fade and lighting fields. Supported
+later layouts preserve uniform scale. Dynamic prop entities remain separate nodes with their
+original entity index and ordered key/value state. MDL paths are reusable asset references only;
+the exporter reports model resolution as unsupported and never fabricates missing geometry.
 
 ## Verification
 
@@ -167,10 +180,13 @@ The external Hydrogen acceptance test can be run without committing the map:
 ```bash
 HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --test hydrogen_collision -- --ignored
+BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --test hydrogen_props
 ```
 
 It verifies 3,511 brushes, 31,092 brush sides, 2,575 world-model brushes, 259 playerclip brushes,
-151 model entries, and collision ownership for zero-render model 147.
+151 model entries, collision ownership for zero-render model 147, and TF2 `sprp` v10 prop identity
+and solidity.
 
 ## Design Principles
 
@@ -185,7 +201,7 @@ It verifies 3,511 brushes, 31,092 brush sides, 2,575 world-model brushes, 259 pl
 
 1. Displacements and overlays
 2. Direct lightmap atlas generation, including directional bump channels
-3. Static prop game lumps and reusable model references
+3. Static prop game lumps and reusable model references (metadata implemented; MDL resolution pending)
 4. VMT/VTF material package integration
 5. Collision brush and opaque physics sidecars (implemented)
 6. Leaf/cluster/PVS sidecars
