@@ -28,6 +28,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - lightmap UVs supplied by existing atlas metadata
 - hidden-but-preserved sky, trigger and disabled brush models
 - LZMA-compressed BSP lumps
+- exact leaf/cluster/PVS visibility sidecars with GLB chunk ownership
 
 Unsupported domains are detected or reported explicitly:
 
@@ -35,7 +36,6 @@ Unsupported domains are detected or reported explicitly:
 - static and dynamic prop model assets
 - VTF pixels and VMT shader behavior
 - collision brushes and physics meshes
-- PVS/leaf visibility data
 - overlays, particles and animated materials
 
 Do not describe output as full Source parity until those domains are implemented and tested.
@@ -98,11 +98,19 @@ cargo build --release
 bsp-to-glb \
   --bsp path/to/compiled.bsp \
   --out path/to/map.glb \
-  --lightmaps path/to/lightmap_data.json
+  --lightmaps path/to/lightmap_data.json \
+  --visibility-out path/to/map.visibility.json
 ```
 
 `--lightmaps` is optional. The current input format is produced by the tf2jump map pipeline and
 will be replaced by direct atlas generation as the exporter matures.
+
+`--visibility-out` is optional. It writes `bsp-to-glb.visibility` version 1 JSON. PVS rows and
+face/chunk cluster memberships are flattened little-endian `u32` bitsets, with
+`clusterWordCount = ceil(clusterCount / 32)`. Leaf memberships use compact offset/index arrays:
+entry `n` occupies `indices[offsets[n]..offsets[n + 1]]`. World-face memberships come directly
+from `LEAFFACES`; bounds are not sampled. Chunks for non-world brush models have `staticPvs=false`
+and remain runtime-controlled rather than being culled by the static world PVS.
 
 ## Verification
 
@@ -110,6 +118,10 @@ will be replaced by direct atlas generation as the exporter matures.
 cargo fmt --check
 cargo test --release
 cargo clippy --all-targets -- -D warnings
+
+# With a local Hydrogen BSP fixture:
+BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_visibility -- --ignored
 ```
 
 Tests use synthetic BSP fixtures and do not include game assets.
@@ -130,7 +142,7 @@ Tests use synthetic BSP fixtures and do not include game assets.
 3. Static prop game lumps and reusable model references
 4. VMT/VTF material package integration
 5. Collision brush and physics sidecars
-6. Leaf/cluster/PVS sidecars
+6. ~~Leaf/cluster/PVS sidecars~~
 7. Versioned output manifests and runtime integration
 
 ## Acknowledgements

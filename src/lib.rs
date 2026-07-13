@@ -1,17 +1,20 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 
 const LUMP_ENTITIES: usize = 0;
 const LUMP_PLANES: usize = 1;
 const LUMP_TEXDATA: usize = 2;
 const LUMP_VERTEXES: usize = 3;
+const LUMP_VISIBILITY: usize = 4;
 const LUMP_TEXINFO: usize = 6;
 const LUMP_FACES: usize = 7;
+const LUMP_LEAFS: usize = 10;
 const LUMP_EDGES: usize = 12;
 const LUMP_SURFEDGES: usize = 13;
 const LUMP_MODELS: usize = 14;
+const LUMP_LEAFFACES: usize = 16;
 const LUMP_VERTNORMALS: usize = 30;
 const LUMP_VERTNORMALINDICES: usize = 31;
 const LUMP_PRIMITIVES: usize = 37;
@@ -26,6 +29,10 @@ const TEXINFO_SIZE: usize = 72;
 const TEXDATA_SIZE: usize = 32;
 const MODEL_SIZE: usize = 48;
 const PRIMITIVE_SIZE: usize = 10;
+const LEAF_VERSION_0_SIZE: usize = 56;
+const LEAF_VERSION_1_SIZE: usize = 32;
+
+pub const VISIBILITY_SIDECAR_VERSION: u32 = 1;
 
 const SURF_SKY2D: i32 = 0x0002;
 const SURF_SKY: i32 = 0x0004;
@@ -60,18 +67,74 @@ pub struct ExportStats {
 pub struct ExportResult {
     pub glb: Vec<u8>,
     pub stats: ExportStats,
+    pub visibility: Option<VisibilitySidecar>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisibilityLeaf {
+    pub cluster: i16,
+    pub mins: [i16; 3],
+    pub maxs: [i16; 3],
+    pub first_leaf_face: u16,
+    pub leaf_face_count: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisibilityChunk {
+    pub index: usize,
+    pub mesh_index: usize,
+    pub primitive_index: usize,
+    pub model_index: usize,
+    pub static_pvs: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisibilitySidecar {
+    pub format: String,
+    pub version: u32,
+    pub bsp_version: i32,
+    pub cluster_count: usize,
+    pub cluster_word_count: usize,
+    pub pvs_words: Vec<u32>,
+    pub leaves: Vec<VisibilityLeaf>,
+    pub face_model_indices: Vec<i32>,
+    pub world_face_indices: Vec<u32>,
+    pub world_face_leaf_offsets: Vec<u32>,
+    pub world_face_leaf_indices: Vec<u32>,
+    pub world_face_cluster_words: Vec<u32>,
+    pub chunks: Vec<VisibilityChunk>,
+    pub chunk_face_offsets: Vec<u32>,
+    pub chunk_face_indices: Vec<u32>,
+    pub chunk_leaf_offsets: Vec<u32>,
+    pub chunk_leaf_indices: Vec<u32>,
+    pub chunk_cluster_words: Vec<u32>,
+    pub dynamic_model_indices: Vec<u32>,
+    pub relevant_cluster_count: usize,
+    pub covered_cluster_count: usize,
+}
+
+impl VisibilitySidecar {
+    pub fn to_json(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self)
+            .map_err(|error| format!("failed to serialize visibility sidecar: {error}"))
+    }
 }
 
 #[derive(Clone, Copy)]
 struct LumpHeader {
     offset: usize,
     length: usize,
+    version: i32,
     uncompressed_size: usize,
 }
 
 struct Bsp {
     version: i32,
     lumps: Vec<Vec<u8>>,
+    lump_versions: Vec<i32>,
 }
 
 #[derive(Clone, Copy)]
@@ -126,6 +189,11 @@ struct Model {
     origin: [f32; 3],
     first_face: i32,
     num_faces: i32,
+}
+
+struct VisibilityBuild {
+    sidecar: VisibilitySidecar,
+    face_leaf_indices: Vec<Vec<u32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +285,7 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
         let offset = 8 + index * 16;
         let file_offset = read_i32(data, offset, "lump table")?;
         let file_length = read_i32(data, offset + 4, "lump table")?;
+        let lump_version = read_i32(data, offset + 8, "lump table")?;
         let uncompressed_size = read_i32(data, offset + 12, "lump table")?;
         if file_offset < 0 || file_length < 0 || uncompressed_size < 0 {
             return Err(format!("lump {index} has a negative offset or length"));
@@ -224,6 +293,7 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
         headers.push(LumpHeader {
             offset: file_offset as usize,
             length: file_length as usize,
+            version: lump_version,
             uncompressed_size: uncompressed_size as usize,
         });
     }
@@ -272,7 +342,12 @@ fn parse_bsp(data: &[u8]) -> Result<Bsp, String> {
             lumps.push(raw.to_vec());
         }
     }
-    Ok(Bsp { version, lumps })
+    let lump_versions = headers.iter().map(|header| header.version).collect();
+    Ok(Bsp {
+        version,
+        lumps,
+        lump_versions,
+    })
 }
 
 fn parse_vec3_lump(data: &[u8], label: &str) -> Result<Vec<[f32; 3]>, String> {
@@ -441,6 +516,324 @@ fn parse_u16_lump(data: &[u8], label: &str) -> Result<Vec<u16>, String> {
     (0..data.len() / 2)
         .map(|index| read_u16(data, index * 2, label))
         .collect()
+}
+
+pub fn decode_compressed_pvs_row(
+    data: &[u8],
+    offset: usize,
+    cluster_count: usize,
+) -> Result<Vec<u32>, String> {
+    let row_bytes = cluster_count.div_ceil(8);
+    let mut decoded = Vec::with_capacity(row_bytes);
+    let mut cursor = offset;
+    while decoded.len() < row_bytes {
+        let byte = *data
+            .get(cursor)
+            .ok_or_else(|| "compressed PVS row is truncated".to_owned())?;
+        cursor += 1;
+        if byte != 0 {
+            decoded.push(byte);
+            continue;
+        }
+        let repeat = *data
+            .get(cursor)
+            .ok_or_else(|| "compressed PVS zero run is truncated".to_owned())?
+            as usize;
+        cursor += 1;
+        if repeat == 0 {
+            return Err("compressed PVS row contains a zero-length run".to_owned());
+        }
+        if decoded.len() + repeat > row_bytes {
+            return Err("compressed PVS zero run exceeds the decoded row".to_owned());
+        }
+        decoded.resize(decoded.len() + repeat, 0);
+    }
+
+    let mut words = vec![0_u32; cluster_count.div_ceil(32)];
+    for cluster in 0..cluster_count {
+        if decoded[cluster / 8] & (1 << (cluster % 8)) != 0 {
+            words[cluster / 32] |= 1 << (cluster % 32);
+        }
+    }
+    Ok(words)
+}
+
+fn parse_pvs(data: &[u8]) -> Result<(usize, Vec<u32>), String> {
+    let cluster_count = usize::try_from(read_i32(data, 0, "visibility cluster count")?)
+        .map_err(|_| "visibility cluster count is negative".to_owned())?;
+    if cluster_count == 0 {
+        return Err("VISIBILITY data contains no clusters".to_owned());
+    }
+    let table_size = 4_usize
+        .checked_add(
+            cluster_count
+                .checked_mul(8)
+                .ok_or_else(|| "visibility offset table overflows".to_owned())?,
+        )
+        .ok_or_else(|| "visibility offset table overflows".to_owned())?;
+    if table_size > data.len() {
+        return Err("visibility offset table is truncated".to_owned());
+    }
+    let word_count = cluster_count.div_ceil(32);
+    let mut words = Vec::with_capacity(cluster_count.saturating_mul(word_count));
+    for cluster in 0..cluster_count {
+        let raw_offset = read_i32(data, 4 + cluster * 8, "PVS offset")?;
+        let offset = usize::try_from(raw_offset)
+            .map_err(|_| format!("cluster {cluster} has a negative PVS offset"))?;
+        if offset < table_size {
+            return Err(format!(
+                "cluster {cluster} PVS offset points inside the visibility header"
+            ));
+        }
+        words.extend(
+            decode_compressed_pvs_row(data, offset, cluster_count).map_err(|error| {
+                format!("failed to decode PVS row for cluster {cluster}: {error}")
+            })?,
+        );
+    }
+    Ok((cluster_count, words))
+}
+
+fn parse_visibility_leaves(data: &[u8], version: i32) -> Result<Vec<VisibilityLeaf>, String> {
+    let size = match version {
+        0 => LEAF_VERSION_0_SIZE,
+        1 => LEAF_VERSION_1_SIZE,
+        _ => return Err(format!("unsupported LEAFS lump version {version}")),
+    };
+    if !data.len().is_multiple_of(size) {
+        return Err(format!(
+            "LEAFS lump version {version} length {} is not divisible by {size}",
+            data.len()
+        ));
+    }
+    (0..data.len() / size)
+        .map(|index| {
+            let offset = index * size;
+            Ok(VisibilityLeaf {
+                cluster: read_i16(data, offset + 4, "leaf cluster")?,
+                mins: [
+                    read_i16(data, offset + 8, "leaf mins")?,
+                    read_i16(data, offset + 10, "leaf mins")?,
+                    read_i16(data, offset + 12, "leaf mins")?,
+                ],
+                maxs: [
+                    read_i16(data, offset + 14, "leaf maxs")?,
+                    read_i16(data, offset + 16, "leaf maxs")?,
+                    read_i16(data, offset + 18, "leaf maxs")?,
+                ],
+                first_leaf_face: read_u16(data, offset + 20, "leaf face range")?,
+                leaf_face_count: read_u16(data, offset + 22, "leaf face range")?,
+            })
+        })
+        .collect()
+}
+
+fn set_cluster_bit(words: &mut [u32], cluster: usize) {
+    words[cluster / 32] |= 1 << (cluster % 32);
+}
+
+fn count_set_bits(words: &[u32]) -> usize {
+    words.iter().map(|word| word.count_ones() as usize).sum()
+}
+
+fn checked_u32(value: usize, label: &str) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("{label} exceeds the sidecar u32 range"))
+}
+
+fn build_visibility(
+    bsp: &Bsp,
+    faces: &[Face],
+    models: &[Model],
+    face_owner: &[Option<usize>],
+) -> Result<VisibilityBuild, String> {
+    if bsp.lumps[LUMP_VISIBILITY].is_empty() {
+        return Err("BSP has no VISIBILITY data".to_owned());
+    }
+    if bsp.lumps[LUMP_LEAFS].is_empty() {
+        return Err("BSP has no LEAFS data".to_owned());
+    }
+    let (cluster_count, pvs_words) = parse_pvs(&bsp.lumps[LUMP_VISIBILITY])?;
+    let cluster_word_count = cluster_count.div_ceil(32);
+    let leaves = parse_visibility_leaves(&bsp.lumps[LUMP_LEAFS], bsp.lump_versions[LUMP_LEAFS])?;
+    let leaf_faces = parse_u16_lump(&bsp.lumps[LUMP_LEAFFACES], "leaf face")?;
+    let world = models
+        .first()
+        .ok_or_else(|| "BSP contains no world model".to_owned())?;
+    let world_start = usize::try_from(world.first_face)
+        .map_err(|_| "world model has a negative face range".to_owned())?;
+    let world_count = usize::try_from(world.num_faces)
+        .map_err(|_| "world model has a negative face range".to_owned())?;
+    let world_end = world_start
+        .checked_add(world_count)
+        .ok_or_else(|| "world model face range overflows".to_owned())?;
+    if world_end > faces.len() {
+        return Err("world model face range is out of bounds".to_owned());
+    }
+
+    let mut face_leaf_indices = vec![Vec::new(); faces.len()];
+    for (leaf_index, leaf) in leaves.iter().enumerate() {
+        if leaf.cluster < -1 || (leaf.cluster >= 0 && leaf.cluster as usize >= cluster_count) {
+            return Err(format!(
+                "leaf {leaf_index} references invalid cluster {}",
+                leaf.cluster
+            ));
+        }
+        let first = leaf.first_leaf_face as usize;
+        let end = first
+            .checked_add(leaf.leaf_face_count as usize)
+            .ok_or_else(|| format!("leaf {leaf_index} face range overflows"))?;
+        let references = leaf_faces
+            .get(first..end)
+            .ok_or_else(|| format!("leaf {leaf_index} face range is out of bounds"))?;
+        for face_index in references.iter().copied().map(usize::from) {
+            if face_index >= faces.len() {
+                return Err(format!(
+                    "leaf {leaf_index} references missing face {face_index}"
+                ));
+            }
+            if face_owner[face_index] == Some(0) {
+                face_leaf_indices[face_index].push(checked_u32(leaf_index, "leaf index")?);
+            }
+        }
+    }
+    for memberships in &mut face_leaf_indices {
+        memberships.sort_unstable();
+        memberships.dedup();
+    }
+
+    let world_face_indices = (world_start..world_end)
+        .map(|face| checked_u32(face, "face index"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut world_face_leaf_offsets = vec![0];
+    let mut world_face_leaf_indices = Vec::new();
+    let mut world_face_cluster_words = Vec::with_capacity(world_count * cluster_word_count);
+    let mut relevant_clusters = vec![0_u32; cluster_word_count];
+    for memberships in &face_leaf_indices[world_start..world_end] {
+        world_face_leaf_indices.extend_from_slice(memberships);
+        world_face_leaf_offsets.push(checked_u32(
+            world_face_leaf_indices.len(),
+            "world face leaf membership offset",
+        )?);
+        let mut cluster_words = vec![0_u32; cluster_word_count];
+        for leaf_index in memberships {
+            let cluster = leaves[*leaf_index as usize].cluster;
+            if cluster >= 0 {
+                set_cluster_bit(&mut cluster_words, cluster as usize);
+                set_cluster_bit(&mut relevant_clusters, cluster as usize);
+            }
+        }
+        world_face_cluster_words.extend(cluster_words);
+    }
+    let face_model_indices = face_owner
+        .iter()
+        .map(|owner| owner.map_or(-1, |index| index as i32))
+        .collect();
+    let dynamic_model_indices = (1..models.len())
+        .map(|index| checked_u32(index, "model index"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let relevant_cluster_count = count_set_bits(&relevant_clusters);
+    Ok(VisibilityBuild {
+        sidecar: VisibilitySidecar {
+            format: "bsp-to-glb.visibility".to_owned(),
+            version: VISIBILITY_SIDECAR_VERSION,
+            bsp_version: bsp.version,
+            cluster_count,
+            cluster_word_count,
+            pvs_words,
+            leaves,
+            face_model_indices,
+            world_face_indices,
+            world_face_leaf_offsets,
+            world_face_leaf_indices,
+            world_face_cluster_words,
+            chunks: Vec::new(),
+            chunk_face_offsets: vec![0],
+            chunk_face_indices: Vec::new(),
+            chunk_leaf_offsets: vec![0],
+            chunk_leaf_indices: Vec::new(),
+            chunk_cluster_words: Vec::new(),
+            dynamic_model_indices,
+            relevant_cluster_count,
+            covered_cluster_count: 0,
+        },
+        face_leaf_indices,
+    })
+}
+
+impl VisibilityBuild {
+    fn add_chunk(
+        &mut self,
+        mesh_index: usize,
+        primitive_index: usize,
+        model_index: usize,
+        face_indices: &[usize],
+    ) -> Result<usize, String> {
+        let index = self.sidecar.chunks.len();
+        let static_pvs = model_index == 0;
+        self.sidecar.chunks.push(VisibilityChunk {
+            index,
+            mesh_index,
+            primitive_index,
+            model_index,
+            static_pvs,
+        });
+        self.sidecar.chunk_face_indices.extend(
+            face_indices
+                .iter()
+                .map(|face| checked_u32(*face, "chunk face index"))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        self.sidecar.chunk_face_offsets.push(checked_u32(
+            self.sidecar.chunk_face_indices.len(),
+            "chunk face membership offset",
+        )?);
+
+        let mut leaf_indices = BTreeSet::new();
+        if static_pvs {
+            for face_index in face_indices {
+                leaf_indices.extend(self.face_leaf_indices[*face_index].iter().copied());
+            }
+        }
+        self.sidecar
+            .chunk_leaf_indices
+            .extend(leaf_indices.iter().copied());
+        self.sidecar.chunk_leaf_offsets.push(checked_u32(
+            self.sidecar.chunk_leaf_indices.len(),
+            "chunk leaf membership offset",
+        )?);
+        let mut cluster_words = vec![0_u32; self.sidecar.cluster_word_count];
+        for leaf_index in leaf_indices {
+            let cluster = self.sidecar.leaves[leaf_index as usize].cluster;
+            if cluster >= 0 {
+                set_cluster_bit(&mut cluster_words, cluster as usize);
+            }
+        }
+        self.sidecar.chunk_cluster_words.extend(cluster_words);
+        Ok(index)
+    }
+
+    fn finish(mut self) -> Result<VisibilitySidecar, String> {
+        let mut covered = vec![0_u32; self.sidecar.cluster_word_count];
+        for (chunk, words) in self.sidecar.chunks.iter().zip(
+            self.sidecar
+                .chunk_cluster_words
+                .chunks(self.sidecar.cluster_word_count),
+        ) {
+            if chunk.static_pvs {
+                for (target, word) in covered.iter_mut().zip(words) {
+                    *target |= *word;
+                }
+            }
+        }
+        self.sidecar.covered_cluster_count = count_set_bits(&covered);
+        if self.sidecar.covered_cluster_count != self.sidecar.relevant_cluster_count {
+            return Err(format!(
+                "static visibility chunks cover {} of {} relevant clusters",
+                self.sidecar.covered_cluster_count, self.sidecar.relevant_cluster_count
+            ));
+        }
+        Ok(self.sidecar)
+    }
 }
 
 fn parse_edges(data: &[u8]) -> Result<Vec<[u16; 2]>, String> {
@@ -1044,6 +1437,21 @@ fn encode_glb(mut document: Value, mut binary: Vec<u8>) -> Result<Vec<u8>, Strin
 }
 
 pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportResult, String> {
+    export_bsp_internal(data, lightmap_json, false)
+}
+
+pub fn export_bsp_with_visibility(
+    data: &[u8],
+    lightmap_json: Option<&[u8]>,
+) -> Result<ExportResult, String> {
+    export_bsp_internal(data, lightmap_json, true)
+}
+
+fn export_bsp_internal(
+    data: &[u8],
+    lightmap_json: Option<&[u8]>,
+    include_visibility: bool,
+) -> Result<ExportResult, String> {
     let bsp = parse_bsp(data)?;
     let planes = parse_planes(&bsp.lumps[LUMP_PLANES])?;
     let vertices = parse_vec3_lump(&bsp.lumps[LUMP_VERTEXES], "vertex")?;
@@ -1125,6 +1533,9 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
             displacements.len()
         ));
     }
+    let mut visibility = include_visibility
+        .then(|| build_visibility(&bsp, &faces, &models, &face_owner))
+        .transpose()?;
 
     let mut entity_by_model: HashMap<usize, (usize, &HashMap<String, String>)> = HashMap::new();
     for (entity_index, entity) in entities.iter().enumerate() {
@@ -1368,26 +1779,41 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
                 attributes.insert("TEXCOORD_1".to_owned(), json!(uv1));
             }
             let indices = arrays.add_indices(&primitive.indices);
+            let visibility_chunk_index = visibility
+                .as_mut()
+                .map(|builder| {
+                    builder.add_chunk(
+                        meshes_json.len(),
+                        primitives_json.len(),
+                        model_index,
+                        &primitive.face_indices,
+                    )
+                })
+                .transpose()?;
+            let mut extras = json!({
+                "bspModelIndex": model_index,
+                "bspFaceIndices": primitive.face_indices,
+                "bspFaceVertexCounts": primitive.face_vertex_counts,
+                "bspFaceStyles": primitive.face_styles,
+                "bspFaceLightOffsets": primitive.face_light_offsets,
+                "bspFaceLightmapMins": primitive.face_lightmap_mins,
+                "bspFaceLightmapSizes": primitive.face_lightmap_sizes,
+                "bspTriangleCount": primitive.triangles,
+                "hasLightmap": has_lightmap,
+                "surfaceFlags": surface_flags,
+                "surfaceInitiallyRendered": surface_rendered,
+                "initiallyRendered": entity_rendered && surface_rendered,
+                "triangulation": if compiled_triangulation { "compiled" } else { "fan" }
+            });
+            if let Some(chunk_index) = visibility_chunk_index {
+                extras["visibilityChunkIndex"] = json!(chunk_index);
+            }
             primitives_json.push(json!({
                 "attributes": attributes,
                 "indices": indices,
                 "material": material_index,
                 "mode": 4,
-                "extras": {
-                    "bspModelIndex": model_index,
-                    "bspFaceIndices": primitive.face_indices,
-                    "bspFaceVertexCounts": primitive.face_vertex_counts,
-                    "bspFaceStyles": primitive.face_styles,
-                    "bspFaceLightOffsets": primitive.face_light_offsets,
-                    "bspFaceLightmapMins": primitive.face_lightmap_mins,
-                    "bspFaceLightmapSizes": primitive.face_lightmap_sizes,
-                    "bspTriangleCount": primitive.triangles,
-                    "hasLightmap": has_lightmap,
-                    "surfaceFlags": surface_flags,
-                    "surfaceInitiallyRendered": surface_rendered,
-                    "initiallyRendered": entity_rendered && surface_rendered,
-                    "triangulation": if compiled_triangulation { "compiled" } else { "fan" }
-                }
+                "extras": extras
             }));
             stats.primitives += 1;
         }
@@ -1432,6 +1858,7 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         }));
         stats.meshes += 1;
     }
+    let visibility = visibility.map(VisibilityBuild::finish).transpose()?;
 
     let document = json!({
         "asset": {
@@ -1452,5 +1879,9 @@ pub fn export_bsp(data: &[u8], lightmap_json: Option<&[u8]>) -> Result<ExportRes
         "accessors": arrays.accessors
     });
     let glb = encode_glb(document, arrays.binary)?;
-    Ok(ExportResult { glb, stats })
+    Ok(ExportResult {
+        glb,
+        stats,
+        visibility,
+    })
 }
