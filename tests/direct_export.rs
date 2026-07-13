@@ -1,4 +1,4 @@
-use bsp_to_glb::export_bsp;
+use bsp_to_glb::{decode_compressed_pvs_row, export_bsp, export_bsp_with_visibility};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Cursor, Write};
@@ -76,6 +76,16 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
     }
     lumps[3] = vertices;
 
+    let mut visibility = vec![0; 4 + 3 * 8];
+    put_i32(&mut visibility, 0, 3);
+    for (cluster, row) in [0b101_u8, 0b010, 0b111].into_iter().enumerate() {
+        let offset = visibility.len();
+        put_i32(&mut visibility, 4 + cluster * 8, offset as i32);
+        put_i32(&mut visibility, 8 + cluster * 8, -1);
+        visibility.push(row);
+    }
+    lumps[4] = visibility;
+
     let mut texinfo = vec![0; 72];
     put_f32(&mut texinfo, 0, 1.0);
     put_f32(&mut texinfo, 20, 1.0);
@@ -110,6 +120,25 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
     lumps[7] = faces;
     lumps[8] = vec![0; 5 * 5 * 4];
 
+    let mut leaves = vec![0; 4 * 32];
+    for (leaf, (cluster, first_face, face_count)) in
+        [(-1_i16, 0_u16, 0_u16), (0, 0, 1), (1, 1, 1), (2, 2, 1)]
+            .into_iter()
+            .enumerate()
+    {
+        let offset = leaf * 32;
+        put_i16(&mut leaves, offset + 4, cluster);
+        put_i16(&mut leaves, offset + 8, leaf as i16);
+        put_i16(&mut leaves, offset + 10, leaf as i16);
+        put_i16(&mut leaves, offset + 12, leaf as i16);
+        put_i16(&mut leaves, offset + 14, leaf as i16 + 1);
+        put_i16(&mut leaves, offset + 16, leaf as i16 + 1);
+        put_i16(&mut leaves, offset + 18, leaf as i16 + 1);
+        put_u16(&mut leaves, offset + 20, first_face);
+        put_u16(&mut leaves, offset + 22, face_count);
+    }
+    lumps[10] = leaves;
+
     let mut edges = vec![0; 8 * 4];
     for face in 0..2 {
         for edge in 0..4 {
@@ -136,6 +165,12 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
     put_f32(&mut models, 48 + 28, 32.0);
     put_f32(&mut models, 48 + 32, 16.0);
     lumps[14] = models;
+
+    let mut leaf_faces = vec![0; 3 * 2];
+    for (index, face) in [0_u16, 0, 1].into_iter().enumerate() {
+        put_u16(&mut leaf_faces, index * 2, face);
+    }
+    lumps[16] = leaf_faces;
 
     let compiled_normals = [
         [0.0, 0.0, 1.0],
@@ -185,7 +220,7 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         let header = 8 + index * 16;
         put_i32(&mut bsp, header, offset as i32);
         put_i32(&mut bsp, header + 4, lump.len() as i32);
-        if matches!(index, 7 | 8) {
+        if matches!(index, 7 | 8 | 10) {
             put_i32(&mut bsp, header + 8, 1);
         }
     }
@@ -358,6 +393,97 @@ fn sdk_v11_static_prop_payload() -> Vec<u8> {
     put_u32(&mut data, record + 68, 0x200);
     put_f32(&mut data, record + 72, 2.5);
     data
+}
+
+#[test]
+fn decodes_compressed_pvs_rows_exactly() {
+    let words = decode_compressed_pvs_row(&[0b0000_0101, 0, 2, 0b1000_0000], 0, 32).unwrap();
+    assert_eq!(words, [0x8000_0005]);
+
+    assert!(decode_compressed_pvs_row(&[0, 0], 0, 8).is_err());
+    assert!(decode_compressed_pvs_row(&[0, 2], 0, 8).is_err());
+    assert!(decode_compressed_pvs_row(&[0], 0, 8).is_err());
+}
+
+#[test]
+fn exports_exact_versioned_visibility_memberships() {
+    let result = export_bsp_with_visibility(&synthetic_bsp(false), None).unwrap();
+    let sidecar = result.visibility.as_ref().unwrap();
+
+    assert_eq!(sidecar.format, "bsp-to-glb.visibility");
+    assert_eq!(sidecar.version, 1);
+    assert_eq!(sidecar.cluster_count, 3);
+    assert_eq!(sidecar.leaves.len(), 4);
+    assert_eq!(sidecar.pvs_words, [0b101, 0b010, 0b111]);
+    assert_eq!(sidecar.world_face_indices, [0]);
+    assert_eq!(sidecar.world_face_leaf_offsets, [0, 2]);
+    assert_eq!(sidecar.world_face_leaf_indices, [1, 2]);
+    assert_eq!(sidecar.world_face_cluster_words, [0b011]);
+    assert_eq!(sidecar.face_model_indices, [0, 1]);
+    assert_eq!(sidecar.dynamic_model_indices, [1]);
+    assert_eq!(sidecar.relevant_cluster_count, 2);
+    assert_eq!(sidecar.covered_cluster_count, 2);
+
+    assert_eq!(sidecar.chunks.len(), 2);
+    assert!(sidecar.chunks[0].static_pvs);
+    assert!(!sidecar.chunks[1].static_pvs);
+    assert_eq!(sidecar.chunk_leaf_offsets, [0, 2, 2]);
+    assert_eq!(sidecar.chunk_leaf_indices, [1, 2]);
+    assert_eq!(sidecar.chunk_cluster_words, [0b011, 0]);
+    assert_eq!(sidecar.chunk_face_offsets, [0, 1, 2]);
+    assert_eq!(sidecar.chunk_face_indices, [0, 1]);
+
+    let encoded = sidecar.to_json().unwrap();
+    assert_eq!(encoded, sidecar.to_json().unwrap());
+    let decoded: bsp_to_glb::VisibilitySidecar = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(sidecar, &decoded);
+    assert_eq!(encoded, decoded.to_json().unwrap());
+
+    let gltf = glb_json(&result.glb);
+    assert_eq!(
+        gltf["meshes"][0]["primitives"][0]["extras"]["visibilityChunkIndex"],
+        0
+    );
+    assert_eq!(
+        gltf["meshes"][1]["primitives"][0]["extras"]["visibilityChunkIndex"],
+        1
+    );
+}
+
+#[test]
+fn cli_writes_visibility_sidecar() {
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!("visibility-cli-test-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let bsp_path = directory.join("synthetic.bsp");
+    let glb_path = directory.join("synthetic.glb");
+    let visibility_path = directory.join("synthetic.visibility.json");
+    fs::write(&bsp_path, synthetic_bsp(false)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
+        .args([
+            "--bsp",
+            bsp_path.to_str().unwrap(),
+            "--out",
+            glb_path.to_str().unwrap(),
+            "--visibility-out",
+            visibility_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sidecar: bsp_to_glb::VisibilitySidecar =
+        serde_json::from_slice(&fs::read(&visibility_path).unwrap()).unwrap();
+    assert_eq!(sidecar.cluster_count, 3);
+    assert!(glb_path.is_file());
+
+    fs::remove_dir_all(directory).unwrap();
 }
 
 fn glb_json(glb: &[u8]) -> Value {

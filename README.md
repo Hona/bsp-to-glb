@@ -39,6 +39,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - versioned direct-BSP collision sidecars with brush-model ownership
 - raw per-model PHYSCOLLIDE blocks and metadata (opaque, explicitly not decoded)
 - LZMA-compressed BSP lumps
+- exact leaf/cluster/PVS visibility sidecars with GLB chunk ownership
 
 Unsupported domains are detected or reported explicitly:
 
@@ -48,7 +49,6 @@ Unsupported domains are detected or reported explicitly:
 - VTF pixel conversion and full shader execution
 - material proxies and animated materials (identified as metadata only)
 - decoded VPhysics collision meshes
-- PVS/leaf visibility data
 - overlays and particles
 
 Do not describe output as full Source parity until those domains are implemented and tested.
@@ -118,7 +118,8 @@ bsp-to-glb \
   --lightmap-manifest path/to/lightmaps.json \
   --material-manifest path/to/map.materials.json \
   --collision-out path/to/map.collision.json \
-  --props-out path/to/props.json
+  --props-out path/to/props.json \
+  --visibility-out path/to/map.visibility.json
 ```
 
 `--lightmap-set` accepts `auto`, `ldr`, `hdr`, or `none`. `auto` prefers a complete HDR
@@ -185,6 +186,13 @@ later layouts preserve uniform scale. Dynamic prop entities remain separate node
 original entity index and ordered key/value state. MDL paths are reusable asset references only;
 the exporter reports model resolution as unsupported and never fabricates missing geometry.
 
+`--visibility-out` is optional. It writes `bsp-to-glb.visibility` version 1 JSON. PVS rows and
+face/chunk cluster memberships are flattened little-endian `u32` bitsets, with
+`clusterWordCount = ceil(clusterCount / 32)`. Leaf memberships use compact offset/index arrays:
+entry `n` occupies `indices[offsets[n]..offsets[n + 1]]`. World-face memberships come directly
+from `LEAFFACES`; bounds are not sampled. Chunks for non-world brush models have `staticPvs=false`
+and remain runtime-controlled rather than being culled by the static world PVS.
+
 ## Verification
 
 ```bash
@@ -194,6 +202,9 @@ cargo clippy --all-targets -- -D warnings
 
 # Local benchmark fixture (not distributed)
 cargo test --release --test hydrogen_benchmark -- --ignored --nocapture
+# With a local Hydrogen BSP fixture:
+BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_visibility -- --ignored
 ```
 
 Tests use synthetic BSP fixtures and do not include game assets.
@@ -231,7 +242,7 @@ The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529
 3. Static prop game lumps and reusable model references (metadata implemented; MDL resolution pending)
 4. VMT/VTF material package integration
 5. Collision brush and opaque physics sidecars (implemented)
-6. Leaf/cluster/PVS sidecars
+6. ~~Leaf/cluster/PVS sidecars~~
 7. Versioned output manifests and runtime integration
 
 ## Acknowledgements

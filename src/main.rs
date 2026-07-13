@@ -1,6 +1,7 @@
 use bsp_to_glb::{
     CollisionExportInput, ExportOptions, LightmapSet, encode_lightmap_png, export_bsp,
-    export_bsp_with_options, export_collision_sidecar,
+    export_bsp_with_options, export_bsp_with_options_and_visibility, export_bsp_with_visibility,
+    export_collision_sidecar,
 };
 use std::env;
 use std::fs;
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-manifest <materials.json>] [--props-out <props.json>]"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-manifest <materials.json>] [--props-out <props.json>]"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -59,6 +60,7 @@ fn run() -> Result<(), String> {
     let mut atlas_path: Option<PathBuf> = None;
     let mut manifest_path: Option<PathBuf> = None;
     let mut options = ExportOptions::default();
+    let mut visibility_path: Option<PathBuf> = None;
     let args: Vec<_> = env::args_os().skip(1).collect();
     let mut index = 0;
     while index < args.len() {
@@ -92,6 +94,7 @@ fn run() -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("invalid atlas width: {}", value.to_string_lossy()))?;
             }
+            "--visibility-out" => visibility_path = Some(value.into()),
             _ => return Err(format!("unknown argument: {flag}\n{}", usage())),
         }
         index += 2;
@@ -99,6 +102,9 @@ fn run() -> Result<(), String> {
     let bsp_path = bsp_path.ok_or_else(|| usage().to_owned())?;
     if output_path.is_none() && collision_output_path.is_none() {
         return Err(usage().to_owned());
+    }
+    if output_path.is_none() && visibility_path.is_some() {
+        return Err("--visibility-out requires --out because it references GLB chunks".to_owned());
     }
     let bsp = fs::read(&bsp_path)
         .map_err(|error| format!("failed to read {}: {error}", bsp_path.display()))?;
@@ -117,7 +123,13 @@ fn run() -> Result<(), String> {
                     "--lightmaps cannot be combined with direct lightmap atlas outputs".to_owned(),
                 );
             }
-            export_bsp(&bsp, lightmaps.as_deref())?
+            if visibility_path.is_some() {
+                export_bsp_with_visibility(&bsp, lightmaps.as_deref())?
+            } else {
+                export_bsp(&bsp, lightmaps.as_deref())?
+            }
+        } else if visibility_path.is_some() {
+            export_bsp_with_options_and_visibility(&bsp, &options)?
         } else {
             export_bsp_with_options(&bsp, &options)?
         };
@@ -168,6 +180,13 @@ fn run() -> Result<(), String> {
                     .map_err(|error| format!("failed to serialize lightmap manifest: {error}"))?;
                 write(path, &manifest)?;
             }
+        }
+        if let Some(path) = &visibility_path {
+            let sidecar = result
+                .visibility
+                .as_ref()
+                .ok_or_else(|| "visibility sidecar was not generated".to_owned())?;
+            write(path, &sidecar.to_json()?)?;
         }
         render_stats = Some(result.stats);
     }
