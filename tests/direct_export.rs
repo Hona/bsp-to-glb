@@ -292,6 +292,28 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
     bsp
 }
 
+fn bsp_with_oriented_side_one_face() -> Vec<u8> {
+    let mut bsp = synthetic_bsp(false);
+
+    let planes = lump_offset(&bsp, 1);
+    put_f32(&mut bsp, planes + 2 * 20 + 4, 0.0);
+    put_f32(&mut bsp, planes + 2 * 20 + 8, -1.0);
+
+    let faces = lump_offset(&bsp, 7);
+    put_u16(&mut bsp, faces + 56, 2);
+
+    let surfedges = lump_offset(&bsp, 13);
+    for (index, surfedge) in [-7, -6, -5, -4].iter().enumerate() {
+        put_i32(&mut bsp, surfedges + (4 + index) * 4, *surfedge);
+    }
+
+    let normals = lump_offset(&bsp, 30);
+    for index in 4..8 {
+        put_f32(&mut bsp, normals + index * 12 + 8, -1.0);
+    }
+    bsp
+}
+
 fn append_pak(bsp: &mut Vec<u8>, entries: &[(&str, &[u8])]) {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -1073,18 +1095,85 @@ fn exports_compiled_faces_with_model_boundaries_and_uvs() {
         &gltf,
         entity_attributes["NORMAL"].as_u64().unwrap() as usize,
     );
-    assert_eq!(&entity_normals[0..3], &[0.0, -1.0, 0.0]);
+    assert_eq!(&entity_normals[0..3], &[0.0, 1.0, 0.0]);
     let entity_indices = read_u32_accessor(
         &result.glb,
         &gltf,
         entity_primitive["indices"].as_u64().unwrap() as usize,
     );
-    assert_eq!(entity_indices, [0, 2, 1, 0, 3, 2]);
+    assert_eq!(entity_indices, [0, 1, 2, 0, 2, 3]);
     assert!(
         gltf["meshes"][1]["primitives"][0]["attributes"]
             .get("TEXCOORD_1")
             .is_none()
     );
+}
+
+#[test]
+fn preserves_oriented_plane_winding_for_side_zero_and_one_fans() {
+    let mut bsp = bsp_with_oriented_side_one_face();
+    let faces = lump_offset(&bsp, 7);
+    put_u16(&mut bsp, faces + 48, 0);
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let gltf = glb_json(&result.glb);
+    for mesh_index in 0..2 {
+        let primitive = &gltf["meshes"][mesh_index]["primitives"][0];
+        let indices = read_u32_accessor(
+            &result.glb,
+            &gltf,
+            primitive["indices"].as_u64().unwrap() as usize,
+        );
+        assert_eq!(indices, [0, 1, 2, 0, 2, 3]);
+        assert_eq!(primitive["extras"]["triangulation"], "fan");
+    }
+
+    let entity_primitive = &gltf["meshes"][1]["primitives"][0];
+    let entity_normals = read_f32_accessor(
+        &result.glb,
+        &gltf,
+        entity_primitive["attributes"]["NORMAL"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&entity_normals[0..3], &[0.0, -1.0, 0.0]);
+}
+
+#[test]
+fn preserves_compiled_triangle_lists_and_strips_on_both_face_sides() {
+    let list_bsp = bsp_with_oriented_side_one_face();
+    let list_result = export_bsp(&list_bsp, None).unwrap();
+    let list_gltf = glb_json(&list_result.glb);
+    let list_primitive = &list_gltf["meshes"][0]["primitives"][0];
+    let list_indices = read_u32_accessor(
+        &list_result.glb,
+        &list_gltf,
+        list_primitive["indices"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(list_indices, [0, 1, 3, 1, 2, 3]);
+    assert_eq!(list_primitive["extras"]["triangulation"], "compiled");
+
+    let mut strip_bsp = bsp_with_oriented_side_one_face();
+    let faces = lump_offset(&strip_bsp, 7);
+    put_u16(&mut strip_bsp, faces + 48, 0);
+    put_u16(&mut strip_bsp, faces + 56 + 48, 1);
+    put_u16(&mut strip_bsp, faces + 56 + 50, 0);
+    let primitive = lump_offset(&strip_bsp, 37);
+    strip_bsp[primitive] = 1;
+    put_u16(&mut strip_bsp, primitive + 4, 4);
+    let primitive_indices = lump_offset(&strip_bsp, 39);
+    for (index, value) in [0, 1, 3, 2].iter().enumerate() {
+        put_u16(&mut strip_bsp, primitive_indices + index * 2, *value);
+    }
+
+    let strip_result = export_bsp(&strip_bsp, None).unwrap();
+    let strip_gltf = glb_json(&strip_result.glb);
+    let strip_primitive = &strip_gltf["meshes"][1]["primitives"][0];
+    let strip_indices = read_u32_accessor(
+        &strip_result.glb,
+        &strip_gltf,
+        strip_primitive["indices"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(strip_indices, [0, 1, 3, 3, 1, 2]);
+    assert_eq!(strip_primitive["extras"]["triangulation"], "compiled");
 }
 
 #[test]
@@ -1369,7 +1458,7 @@ fn exports_a_local_displacement_map() {
 fn no_displacement_export_remains_byte_and_metric_stable() {
     let result = export_bsp(&synthetic_bsp(false), None).unwrap();
 
-    assert_eq!(fnv1a64(&result.glb), 9_571_780_838_537_332_067);
+    assert_eq!(fnv1a64(&result.glb), 16_361_024_428_849_545_199);
     assert_eq!(result.stats.faces, 2);
     assert_eq!(result.stats.vertices, 8);
     assert_eq!(result.stats.triangles, 4);

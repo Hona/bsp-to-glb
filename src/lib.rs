@@ -624,7 +624,7 @@ struct TexData {
 #[derive(Clone, Copy)]
 struct Face {
     plane: usize,
-    side: bool,
+    _side: bool,
     first_edge: i32,
     num_edges: i16,
     texinfo: i16,
@@ -989,7 +989,7 @@ fn parse_faces(data: &[u8]) -> Result<Vec<Face>, String> {
             let offset = index * FACE_SIZE;
             Ok(Face {
                 plane: read_u16(data, offset, "face")? as usize,
-                side: data[offset + 2] != 0,
+                _side: data[offset + 2] != 0,
                 first_edge: read_i32(data, offset + 4, "face")?,
                 num_edges: read_i16(data, offset + 8, "face")?,
                 texinfo: read_i16(data, offset + 10, "face")?,
@@ -2766,7 +2766,7 @@ fn face_normals(
     let indices = vertex_normal_indices
         .get(normal_start..normal_start + face.num_edges as usize)
         .ok_or_else(|| format!("face {face_index} vertex-normal index range is out of bounds"))?;
-    let mut normals = indices
+    let normals = indices
         .iter()
         .map(|normal_index| {
             vertex_normals
@@ -2777,11 +2777,6 @@ fn face_normals(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if face.side {
-        for normal in &mut normals {
-            *normal = [-normal[0], -normal[1], -normal[2]];
-        }
-    }
     Ok((normals, true))
 }
 
@@ -3771,11 +3766,7 @@ fn export_bsp_internal(
                     format!("face {face_index} references missing plane {}", face.plane)
                 })?
                 .normal;
-            let outward_normal = if face.side {
-                [-plane_normal[0], -plane_normal[1], -plane_normal[2]]
-            } else {
-                plane_normal
-            };
+            let outward_normal = plane_normal;
             let displacement = (face.dispinfo >= 0)
                 .then(|| {
                     build_displacement_geometry(
