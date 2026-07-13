@@ -7,13 +7,31 @@ decompiling to VMF or routing world geometry through Blender.
 
 ## Benchmark TL;DR
 
-Direct compiled-BSP export is approximately **119x faster** while exactly preserving the supported
-compiled brush-geometry domain.
+Direct compiled-BSP export is approximately **136x faster** than the measured Blender/Plumber path
+while preserving the supported compiled brush-geometry domain more faithfully than a
+BSP-to-VMF-to-mesh reconstruction.
 
 | Export path | Warm median | Output size |
 |---|---:|---:|
-| Direct Rust BSP export | 233.5 ms | 3.46 MB |
-| Blender/Plumber export | 27.84 s | 23.06 MB |
+| Direct Rust BSP export | 155.8 ms | 3.82 MB |
+| Blender/Plumber export | 21.21 s | 23.06 MB |
+
+## Accuracy TL;DR
+
+The exporter consumes the compiled render data that Source actually loads. It does not attempt to
+reverse VBSP's CSG, clipping, face splitting, primitive generation or lightmap ownership into an
+editable VMF and then compile that reconstruction into a second mesh.
+
+On `jump_hydrogen_rc1_bmv`, an independent polygon audit reports:
+
+- **100% BSP-to-direct and direct-to-BSP polygon coverage**
+- **0/32,616 nondegenerate triangle orientation mismatches**
+- exact compiled normals across all 57,299 exported vertices
+- 99.5168% BSP-to-VMF area coverage from a BSPSource-decompiled VMF of the same BSP
+
+The direct result is therefore demonstrably more accurate than the tested decompile/rebuild route
+for supported compiled brush rendering. This is not a claim that unsupported renderer domains are
+already complete, nor a universal benchmark of every BSP tool.
 
 ## Status
 
@@ -76,8 +94,10 @@ where those tools remain valuable.
 
 Direct BSP export has two important benefits:
 
-1. Compiled geometry, topology, normals, model identity and lightmap ownership remain authoritative.
-2. Export avoids Blender startup, scene construction and Python glTF serialization costs.
+1. **Compiled-data accuracy:** geometry, primitive topology, oriented planes, compiled normals,
+   model identity and lightmap ownership remain authoritative instead of being reconstructed.
+2. **Speed:** export avoids VMF reconstruction, Blender startup, scene construction and Python glTF
+   serialization costs.
 
 ## Benchmark
 
@@ -85,10 +105,10 @@ Reference map: `jump_hydrogen_rc1_bmv` (BSP v20, no displacements).
 
 | Export path | Warm median | Output size |
 |---|---:|---:|
-| Direct Rust BSP export | 233.5 ms | 3.46 MB |
-| Blender/Plumber export | 27.84 s | 23.06 MB |
+| Direct Rust BSP export | 155.8 ms | 3.82 MB |
+| Blender/Plumber export | 21.21 s | 23.06 MB |
 
-Measured speedup: `119x`.
+Measured speedup: `136x`.
 
 Strict supported-domain checks for that map:
 
@@ -104,9 +124,13 @@ Strict supported-domain checks for that map:
 - zero rendered-bounds error
 - zero winding mismatches
 - maximum position error: 0.000427 Source units
+- 100% bidirectional compiled-BSP/direct polygon coverage
+- zero orientation mismatches across 32,616 nondegenerate exported triangles
 
-The Blender output contains props and reconstructed VMF geometry outside this strict comparison.
-Exact-triangle comparisons therefore measure compiled-BSP identity, not subjective visual quality.
+The BSPSource-decompiled VMF covers 99.5168% of compiled BSP render area in the same independent
+audit. The Blender output also contains props and reconstructed VMF geometry outside the strict
+brush comparison. Exact-triangle checks therefore measure compiled-BSP identity, not subjective
+visual quality or unsupported renderer domains.
 
 ## Releases
 
