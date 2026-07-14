@@ -1138,6 +1138,58 @@ fn preserves_oriented_plane_winding_for_side_zero_and_one_fans() {
 }
 
 #[test]
+fn omits_zero_area_fan_triangles_without_losing_face_metadata() {
+    let mut bsp = synthetic_bsp(false);
+    let faces = lump_offset(&bsp, 7);
+    put_u16(&mut bsp, faces + 48, 0);
+    let vertices = lump_offset(&bsp, 3);
+    for (index, x) in [0.0, 16.0, 32.0, 48.0].into_iter().enumerate() {
+        put_f32(&mut bsp, vertices + index * 12, x);
+        put_f32(&mut bsp, vertices + index * 12 + 4, 0.0);
+        put_f32(&mut bsp, vertices + index * 12 + 8, 0.0);
+    }
+
+    let result = export_bsp_with_options_and_visibility(&bsp, &ExportOptions::default()).unwrap();
+    let gltf = glb_json(&result.glb);
+    let stats = serde_json::to_value(&result.stats).unwrap();
+    let metadata = &gltf["nodes"][0]["extras"]["nonRasterizedFaceGroups"][0];
+
+    assert!(gltf["nodes"][0].get("mesh").is_none());
+    assert_eq!(gltf["meshes"].as_array().unwrap().len(), 1);
+    assert_eq!(metadata["bspFaceIndices"], json!([0]));
+    assert_eq!(metadata["bspFaceVertexCounts"], json!([4]));
+    assert_eq!(metadata["bspFaceTriangleCounts"], json!([2]));
+    assert_eq!(metadata["bspFaceRasterizableTriangleCounts"], json!([0]));
+    assert_eq!(metadata["bspFaceZeroAreaTriangleCounts"], json!([2]));
+    assert_eq!(metadata["bspTriangleCount"], 2);
+    assert_eq!(metadata["rasterizableTriangleCount"], 0);
+    assert_eq!(metadata["zeroAreaTriangleCount"], 2);
+    assert_eq!(metadata["hasLightmap"], true);
+    assert_eq!(metadata["triangulation"], "fan");
+    let position_accessor = metadata["attributes"]["POSITION"].as_u64().unwrap() as usize;
+    assert_eq!(gltf["accessors"][position_accessor]["count"], 4);
+    assert_eq!(
+        read_f32_accessor(&result.glb, &gltf, position_accessor),
+        [
+            0.0, 0.0, -0.0, 16.0, 0.0, -0.0, 32.0, 0.0, -0.0, 48.0, 0.0, -0.0
+        ]
+    );
+    assert!(metadata["attributes"].get("TEXCOORD_1").is_some());
+    assert_eq!(result.stats.faces, 2);
+    assert_eq!(result.stats.triangles, 2);
+    assert_eq!(stats["sourceTriangles"], 4);
+    assert_eq!(stats["rasterizableTriangles"], 2);
+    assert_eq!(stats["zeroAreaTriangles"], 2);
+    let lightmaps = serde_json::to_value(&result.lightmaps.unwrap().manifest).unwrap();
+    assert_eq!(lightmaps["faces"][0]["faceIndex"], 0);
+    let visibility = result.visibility.unwrap();
+    assert_eq!(visibility.face_model_indices, [0, 1]);
+    assert_eq!(visibility.world_face_indices, [0]);
+    assert_eq!(visibility.world_face_leaf_indices, [1, 2]);
+    assert_eq!(visibility.dynamic_model_indices, [1]);
+}
+
+#[test]
 fn preserves_compiled_triangle_lists_and_strips_on_both_face_sides() {
     let list_bsp = bsp_with_oriented_side_one_face();
     let list_result = export_bsp(&list_bsp, None).unwrap();
@@ -1174,6 +1226,46 @@ fn preserves_compiled_triangle_lists_and_strips_on_both_face_sides() {
     );
     assert_eq!(strip_indices, [0, 1, 3, 3, 1, 2]);
     assert_eq!(strip_primitive["extras"]["triangulation"], "compiled");
+}
+
+#[test]
+fn omits_zero_area_compiled_triangles_without_changing_source_topology_counts() {
+    let mut bsp = synthetic_bsp(false);
+    let vertices = lump_offset(&bsp, 3);
+    put_f32(&mut bsp, vertices, 32.0);
+    put_f32(&mut bsp, vertices + 4, 32.0);
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let gltf = glb_json(&result.glb);
+    let stats = serde_json::to_value(&result.stats).unwrap();
+    let primitive = &gltf["meshes"][0]["primitives"][0];
+    let indices = read_u32_accessor(
+        &result.glb,
+        &gltf,
+        primitive["indices"].as_u64().unwrap() as usize,
+    );
+
+    assert_eq!(indices, [1, 2, 3]);
+    assert_eq!(primitive["extras"]["bspFaceIndices"], json!([0]));
+    assert_eq!(primitive["extras"]["bspFaceVertexCounts"], json!([4]));
+    assert_eq!(primitive["extras"]["bspFaceTriangleCounts"], json!([2]));
+    assert_eq!(
+        primitive["extras"]["bspFaceRasterizableTriangleCounts"],
+        json!([1])
+    );
+    assert_eq!(
+        primitive["extras"]["bspFaceZeroAreaTriangleCounts"],
+        json!([1])
+    );
+    assert_eq!(primitive["extras"]["bspTriangleCount"], 2);
+    assert_eq!(primitive["extras"]["rasterizableTriangleCount"], 1);
+    assert_eq!(primitive["extras"]["zeroAreaTriangleCount"], 1);
+    assert_eq!(primitive["extras"]["triangulation"], "compiled");
+    assert_eq!(result.stats.faces, 2);
+    assert_eq!(result.stats.triangles, 3);
+    assert_eq!(stats["sourceTriangles"], 4);
+    assert_eq!(stats["rasterizableTriangles"], 3);
+    assert_eq!(stats["zeroAreaTriangles"], 1);
 }
 
 #[test]

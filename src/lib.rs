@@ -225,6 +225,9 @@ pub struct ExportStats {
     pub primitives: usize,
     pub faces: usize,
     pub triangles: usize,
+    pub source_triangles: usize,
+    pub rasterizable_triangles: usize,
+    pub zero_area_triangles: usize,
     pub vertices: usize,
     pub materials: usize,
     pub lightmapped_faces: usize,
@@ -709,6 +712,7 @@ struct ExtractedLightmaps {
 struct VisibilityBuild {
     sidecar: VisibilitySidecar,
     face_leaf_indices: Vec<Vec<u32>>,
+    non_rasterized_face_indices: BTreeSet<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -751,6 +755,9 @@ struct PrimitiveData {
     indices: Vec<u32>,
     face_indices: Vec<usize>,
     face_vertex_counts: Vec<usize>,
+    face_triangle_counts: Vec<usize>,
+    face_rasterizable_triangle_counts: Vec<usize>,
+    face_zero_area_triangle_counts: Vec<usize>,
     face_styles: Vec<[u8; 4]>,
     face_light_offsets: Vec<i32>,
     face_lightmap_mins: Vec<[i32; 2]>,
@@ -761,7 +768,67 @@ struct PrimitiveData {
     displacement_contents: Vec<i32>,
     displacement_triangle_tags: Vec<Vec<u16>>,
     displacement_source_triangle_tags: Vec<Vec<u16>>,
-    triangles: usize,
+    source_triangles: usize,
+    zero_area_triangles: usize,
+}
+
+type PrimitiveGroupKey = (usize, bool, bool, bool, i32, bool);
+
+fn primitive_extras(
+    primitive: &PrimitiveData,
+    model_index: usize,
+    entity_rendered: bool,
+    group: PrimitiveGroupKey,
+) -> Value {
+    let (
+        material_index,
+        has_lightmap,
+        surface_rendered,
+        compiled_triangulation,
+        surface_flags,
+        is_displacement,
+    ) = group;
+    let rasterizable_triangles = primitive.source_triangles - primitive.zero_area_triangles;
+    let mut extras = json!({
+        "bspModelIndex": model_index,
+        "bspFaceIndices": primitive.face_indices,
+        "bspFaceVertexCounts": primitive.face_vertex_counts,
+        "bspFaceStyles": primitive.face_styles,
+        "bspFaceLightOffsets": primitive.face_light_offsets,
+        "bspFaceLightmapMins": primitive.face_lightmap_mins,
+        "bspFaceLightmapSizes": primitive.face_lightmap_sizes,
+        "bspTriangleCount": primitive.source_triangles,
+        "hasLightmap": has_lightmap,
+        "surfaceFlags": surface_flags,
+        "surfaceInitiallyRendered": surface_rendered,
+        "initiallyRendered": entity_rendered && surface_rendered,
+        "triangulation": if is_displacement {
+            "displacement"
+        } else if compiled_triangulation {
+            "compiled"
+        } else {
+            "fan"
+        }
+    });
+    if primitive.zero_area_triangles > 0 {
+        extras["materialIndex"] = json!(material_index);
+        extras["bspFaceTriangleCounts"] = json!(primitive.face_triangle_counts);
+        extras["bspFaceRasterizableTriangleCounts"] =
+            json!(primitive.face_rasterizable_triangle_counts);
+        extras["bspFaceZeroAreaTriangleCounts"] = json!(primitive.face_zero_area_triangle_counts);
+        extras["rasterizableTriangleCount"] = json!(rasterizable_triangles);
+        extras["zeroAreaTriangleCount"] = json!(primitive.zero_area_triangles);
+    }
+    if is_displacement {
+        extras["bspDispInfoIndices"] = json!(primitive.dispinfo_indices);
+        extras["bspDisplacementPowers"] = json!(primitive.displacement_powers);
+        extras["bspDisplacementContents"] = json!(primitive.displacement_contents);
+        extras["bspDisplacementTriangleTags"] = json!(primitive.displacement_triangle_tags);
+        extras["bspDisplacementSourceTriangleTags"] =
+            json!(primitive.displacement_source_triangle_tags);
+        extras["geometry"] = json!("displacement");
+    }
+    extras
 }
 
 fn read_i16(data: &[u8], offset: usize, context: &str) -> Result<i16, String> {
@@ -1696,10 +1763,15 @@ fn build_visibility(
             covered_cluster_count: 0,
         },
         face_leaf_indices,
+        non_rasterized_face_indices: BTreeSet::new(),
     })
 }
 
 impl VisibilityBuild {
+    fn mark_non_rasterized_face(&mut self, face_index: usize) {
+        self.non_rasterized_face_indices.insert(face_index);
+    }
+
     fn add_chunk(
         &mut self,
         mesh_index: usize,
@@ -1752,6 +1824,22 @@ impl VisibilityBuild {
     }
 
     fn finish(mut self) -> Result<VisibilitySidecar, String> {
+        let mut relevant = vec![0_u32; self.sidecar.cluster_word_count];
+        for (face_offset, face_index) in self.sidecar.world_face_indices.iter().enumerate() {
+            if !self
+                .non_rasterized_face_indices
+                .contains(&(*face_index as usize))
+            {
+                let start = face_offset * self.sidecar.cluster_word_count;
+                for (target, word) in relevant.iter_mut().zip(
+                    &self.sidecar.world_face_cluster_words
+                        [start..start + self.sidecar.cluster_word_count],
+                ) {
+                    *target |= *word;
+                }
+            }
+        }
+        self.sidecar.relevant_cluster_count = count_set_bits(&relevant);
         let mut covered = vec![0_u32; self.sidecar.cluster_word_count];
         for (chunk, words) in self.sidecar.chunks.iter().zip(
             self.sidecar
@@ -2825,12 +2913,7 @@ fn face_triangle_indices(
                     "primitive {primitive_index} on face {face_index} references a vertex outside the face"
                 ));
             }
-            if triangle[0] != triangle[1]
-                && triangle[1] != triangle[2]
-                && triangle[0] != triangle[2]
-            {
-                triangles.push(triangle);
-            }
+            triangles.push(triangle);
             Ok(())
         };
         match primitive.primitive_type {
@@ -2981,6 +3064,25 @@ fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn triangle_is_zero_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
+    let edge = |from: [f32; 3], to: [f32; 3]| {
+        [
+            f64::from(to[0]) - f64::from(from[0]),
+            f64::from(to[1]) - f64::from(from[1]),
+            f64::from(to[2]) - f64::from(from[2]),
+        ]
+    };
+    let ab = edge(a, b);
+    let ac = edge(a, c);
+    let twice_area = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let squared = twice_area.iter().map(|value| value * value).sum::<f64>();
+    squared.is_finite() && squared <= 4.0e-20
 }
 
 fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -3274,6 +3376,30 @@ impl GlbArrays {
         }));
         accessor
     }
+}
+
+fn add_primitive_attributes(
+    arrays: &mut GlbArrays,
+    primitive: &PrimitiveData,
+    has_lightmap: bool,
+    is_displacement: bool,
+) -> serde_json::Map<String, Value> {
+    let position = arrays.add_f32(&primitive.positions, 3, 34962);
+    let normal = arrays.add_f32(&primitive.normals, 3, 34962);
+    let uv0 = arrays.add_f32(&primitive.uv0, 2, 34962);
+    let mut attributes = serde_json::Map::new();
+    attributes.insert("POSITION".to_owned(), json!(position));
+    attributes.insert("NORMAL".to_owned(), json!(normal));
+    attributes.insert("TEXCOORD_0".to_owned(), json!(uv0));
+    if has_lightmap {
+        let uv1 = arrays.add_f32(&primitive.uv1, 2, 34962);
+        attributes.insert("TEXCOORD_1".to_owned(), json!(uv1));
+    }
+    if is_displacement {
+        let alpha = arrays.add_f32(&primitive.displacement_alphas, 1, 34962);
+        attributes.insert("_DISPLACEMENT_ALPHA".to_owned(), json!(alpha));
+    }
+    attributes
 }
 
 fn encode_glb(mut document: Value, mut binary: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -3741,8 +3867,7 @@ fn export_bsp_internal(
             entity.and_then(|item| entity_property(item, "angles")),
             [0.0; 3],
         );
-        let mut groups: BTreeMap<(usize, bool, bool, bool, i32, bool), PrimitiveData> =
-            BTreeMap::new();
+        let mut groups: BTreeMap<PrimitiveGroupKey, PrimitiveData> = BTreeMap::new();
         let start = model.first_face as usize;
         let end = start + model.num_faces as usize;
         for (face_index, face) in faces.iter().copied().enumerate().take(end).skip(start) {
@@ -3911,27 +4036,50 @@ fn export_bsp_internal(
                     .displacement_source_triangle_tags
                     .push(geometry.source_triangle_tags.clone());
             }
+            let source_triangle_count = triangles.len();
+            let mut zero_area_triangle_count = 0;
             for triangle in &mut triangles {
                 let a = gltf_positions[triangle[0]];
                 let b = gltf_positions[triangle[1]];
                 let c = gltf_positions[triangle[2]];
+                if triangle_is_zero_area(a, b, c) {
+                    zero_area_triangle_count += 1;
+                    continue;
+                }
                 if dot(cross(sub(b, a), sub(c, a)), winding_normal) < 0.0 {
                     triangle.swap(1, 2);
                 }
                 primitive
                     .indices
                     .extend(triangle.map(|index| base_vertex + index as u32));
-                primitive.triangles += 1;
             }
+            let rasterizable_triangle_count = source_triangle_count - zero_area_triangle_count;
+            primitive.source_triangles += source_triangle_count;
+            primitive.zero_area_triangles += zero_area_triangle_count;
             primitive.face_indices.push(face_index);
             primitive.face_vertex_counts.push(source_positions.len());
+            primitive.face_triangle_counts.push(source_triangle_count);
+            primitive
+                .face_rasterizable_triangle_counts
+                .push(rasterizable_triangle_count);
+            primitive
+                .face_zero_area_triangle_counts
+                .push(zero_area_triangle_count);
             primitive.face_styles.push(face.styles);
             primitive.face_light_offsets.push(face.light_offset);
             primitive.face_lightmap_mins.push(face.lightmap_mins);
             primitive.face_lightmap_sizes.push(face.lightmap_size);
             stats.faces += 1;
             stats.vertices += source_positions.len();
-            stats.triangles += triangles.len();
+            stats.triangles += rasterizable_triangle_count;
+            stats.source_triangles += source_triangle_count;
+            stats.rasterizable_triangles += rasterizable_triangle_count;
+            stats.zero_area_triangles += zero_area_triangle_count;
+            if rasterizable_triangle_count == 0
+                && let Some(builder) = &mut visibility
+            {
+                builder.mark_non_rasterized_face(face_index);
+            }
             if has_lightmap {
                 stats.lightmapped_faces += 1;
                 if texinfo.flags & SURF_BUMPLIGHT != 0 {
@@ -3945,7 +4093,7 @@ fn export_bsp_internal(
             }
             if is_displacement {
                 stats.displacement_vertices += source_positions.len();
-                stats.displacement_triangles += triangles.len();
+                stats.displacement_triangles += rasterizable_triangle_count;
             }
             if has_compiled_normals {
                 stats.compiled_normal_vertices += source_positions.len();
@@ -3960,37 +4108,31 @@ fn export_bsp_internal(
         }
 
         let mut primitives_json = Vec::new();
-        for (
-            (
+        let mut non_rasterized_face_groups = Vec::new();
+        for (group, primitive) in groups {
+            let (
                 material_index,
                 has_lightmap,
-                surface_rendered,
-                compiled_triangulation,
-                surface_flags,
+                _surface_rendered,
+                _compiled_triangulation,
+                _surface_flags,
                 is_displacement,
-            ),
-            primitive,
-        ) in groups
-        {
+            ) = group;
+            let mut extras = primitive_extras(&primitive, model_index, entity_rendered, group);
+            let attributes =
+                add_primitive_attributes(&mut arrays, &primitive, has_lightmap, is_displacement);
             if primitive.indices.is_empty() {
+                extras["attributes"] = Value::Object(attributes);
+                non_rasterized_face_groups.push(extras);
                 continue;
             }
-            let position = arrays.add_f32(&primitive.positions, 3, 34962);
-            let normal = arrays.add_f32(&primitive.normals, 3, 34962);
-            let uv0 = arrays.add_f32(&primitive.uv0, 2, 34962);
-            let mut attributes = serde_json::Map::new();
-            attributes.insert("POSITION".to_owned(), json!(position));
-            attributes.insert("NORMAL".to_owned(), json!(normal));
-            attributes.insert("TEXCOORD_0".to_owned(), json!(uv0));
-            if has_lightmap {
-                let uv1 = arrays.add_f32(&primitive.uv1, 2, 34962);
-                attributes.insert("TEXCOORD_1".to_owned(), json!(uv1));
-            }
-            if is_displacement {
-                let alpha = arrays.add_f32(&primitive.displacement_alphas, 1, 34962);
-                attributes.insert("_DISPLACEMENT_ALPHA".to_owned(), json!(alpha));
-            }
             let indices = arrays.add_indices(&primitive.indices);
+            let rasterizable_face_indices: Vec<_> = primitive
+                .face_indices
+                .iter()
+                .zip(&primitive.face_rasterizable_triangle_counts)
+                .filter_map(|(face_index, count)| (*count > 0).then_some(*face_index))
+                .collect();
             let visibility_chunk_index = visibility
                 .as_mut()
                 .map(|builder| {
@@ -3998,40 +4140,10 @@ fn export_bsp_internal(
                         meshes_json.len(),
                         primitives_json.len(),
                         model_index,
-                        &primitive.face_indices,
+                        &rasterizable_face_indices,
                     )
                 })
                 .transpose()?;
-            let mut extras = json!({
-                "bspModelIndex": model_index,
-                "bspFaceIndices": primitive.face_indices,
-                "bspFaceVertexCounts": primitive.face_vertex_counts,
-                "bspFaceStyles": primitive.face_styles,
-                "bspFaceLightOffsets": primitive.face_light_offsets,
-                "bspFaceLightmapMins": primitive.face_lightmap_mins,
-                "bspFaceLightmapSizes": primitive.face_lightmap_sizes,
-                "bspTriangleCount": primitive.triangles,
-                "hasLightmap": has_lightmap,
-                "surfaceFlags": surface_flags,
-                "surfaceInitiallyRendered": surface_rendered,
-                "initiallyRendered": entity_rendered && surface_rendered,
-                "triangulation": if is_displacement {
-                    "displacement"
-                } else if compiled_triangulation {
-                    "compiled"
-                } else {
-                    "fan"
-                }
-            });
-            if is_displacement {
-                extras["bspDispInfoIndices"] = json!(primitive.dispinfo_indices);
-                extras["bspDisplacementPowers"] = json!(primitive.displacement_powers);
-                extras["bspDisplacementContents"] = json!(primitive.displacement_contents);
-                extras["bspDisplacementTriangleTags"] = json!(primitive.displacement_triangle_tags);
-                extras["bspDisplacementSourceTriangleTags"] =
-                    json!(primitive.displacement_source_triangle_tags);
-                extras["geometry"] = json!("displacement");
-            }
             if let Some(chunk_index) = visibility_chunk_index {
                 extras["visibilityChunkIndex"] = json!(chunk_index);
             }
@@ -4045,7 +4157,6 @@ fn export_bsp_internal(
             stats.primitives += 1;
         }
 
-        let mesh_index = meshes_json.len();
         let node_name = if model_index == 0 {
             "worldspawn".to_owned()
         } else if let Some(target) = targetname {
@@ -4053,37 +4164,46 @@ fn export_bsp_internal(
         } else {
             format!("model_{model_index}_{classname}")
         };
-        meshes_json.push(json!({
+        let mut node_extras = json!({
+            "bspModelIndex": model_index,
+            "entityIndex": entity_index,
+            "classname": classname,
+            "targetname": targetname,
+            "model": entity.and_then(|item| entity_property(item, "model")),
+            "startDisabled": entity.and_then(|item| entity_property(item, "StartDisabled")),
+            "solid": entity.and_then(|item| entity_property(item, "solid")),
+            "rendermode": entity.and_then(|item| entity_property(item, "rendermode")),
+            "initiallyRendered": entity_rendered,
+            "sourceOrigin": model.origin,
+            "entityOrigin": origin,
+            "entityAngles": angles,
+            "sourceMins": model.mins,
+            "sourceMaxs": model.maxs
+        });
+        let has_non_rasterized_face_groups = !non_rasterized_face_groups.is_empty();
+        if has_non_rasterized_face_groups {
+            node_extras["nonRasterizedFaceGroups"] = json!(non_rasterized_face_groups);
+        }
+        let mut node = json!({
             "name": node_name,
-            "primitives": primitives_json,
-            "extras": {
-                "bspModelIndex": model_index,
-                "firstFace": model.first_face,
-                "numFaces": model.num_faces
-            }
-        }));
-        nodes_json.push(json!({
-            "name": node_name,
-            "mesh": mesh_index,
             "matrix": source_entity_matrix(origin, angles),
-            "extras": {
-                "bspModelIndex": model_index,
-                "entityIndex": entity_index,
-                "classname": classname,
-                "targetname": targetname,
-                "model": entity.and_then(|item| entity_property(item, "model")),
-                "startDisabled": entity.and_then(|item| entity_property(item, "StartDisabled")),
-                "solid": entity.and_then(|item| entity_property(item, "solid")),
-                "rendermode": entity.and_then(|item| entity_property(item, "rendermode")),
-                "initiallyRendered": entity_rendered,
-                "sourceOrigin": model.origin,
-                "entityOrigin": origin,
-                "entityAngles": angles,
-                "sourceMins": model.mins,
-                "sourceMaxs": model.maxs
-            }
-        }));
-        stats.meshes += 1;
+            "extras": node_extras
+        });
+        if !primitives_json.is_empty() || !has_non_rasterized_face_groups {
+            let mesh_index = meshes_json.len();
+            meshes_json.push(json!({
+                "name": node_name,
+                "primitives": primitives_json,
+                "extras": {
+                    "bspModelIndex": model_index,
+                    "firstFace": model.first_face,
+                    "numFaces": model.num_faces
+                }
+            }));
+            node["mesh"] = json!(mesh_index);
+            stats.meshes += 1;
+        }
+        nodes_json.push(node);
     }
     let visibility = visibility.map(VisibilityBuild::finish).transpose()?;
 
