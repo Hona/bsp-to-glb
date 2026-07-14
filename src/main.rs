@@ -1,3 +1,4 @@
+use bsp_to_glb::static_physics::{StaticPhysicsLimits, export_bsp_static_physics};
 use bsp_to_glb::{
     CollisionExportInput, ExportOptions, LightmapSet, MaterialResolver, MountedMaterialResolver,
     VtfImageSelection, build_metadata, encode_lightmap_png, export_bsp_with_material_resolver,
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--entities-out <map.entities.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -58,6 +59,8 @@ fn run() -> Result<(), String> {
     let mut output_path: Option<PathBuf> = None;
     let mut collision_output_path: Option<PathBuf> = None;
     let mut entity_output_path: Option<PathBuf> = None;
+    let mut physics_manifest_path: Option<PathBuf> = None;
+    let mut physics_binary_path: Option<PathBuf> = None;
     let mut lightmap_path: Option<PathBuf> = None;
     let mut material_manifest_path: Option<PathBuf> = None;
     let mut material_mount_plan_path: Option<PathBuf> = None;
@@ -94,6 +97,8 @@ fn run() -> Result<(), String> {
             "--out" => output_path = Some(value.into()),
             "--collision-out" => collision_output_path = Some(value.into()),
             "--entities-out" => entity_output_path = Some(value.into()),
+            "--physics-manifest" => physics_manifest_path = Some(value.into()),
+            "--physics-binary" => physics_binary_path = Some(value.into()),
             "--lightmaps" => lightmap_path = Some(value.into()),
             "--material-manifest" => material_manifest_path = Some(value.into()),
             "--material-mount-plan" => material_mount_plan_path = Some(value.into()),
@@ -146,8 +151,15 @@ fn run() -> Result<(), String> {
         index += 2;
     }
     let bsp_path = bsp_path.ok_or_else(|| usage().to_owned())?;
-    if output_path.is_none() && collision_output_path.is_none() && entity_output_path.is_none() {
+    if output_path.is_none()
+        && collision_output_path.is_none()
+        && entity_output_path.is_none()
+        && physics_manifest_path.is_none()
+    {
         return Err(usage().to_owned());
+    }
+    if physics_manifest_path.is_some() != physics_binary_path.is_some() {
+        return Err("--physics-manifest and --physics-binary must be supplied together".to_owned());
     }
     if output_path.is_none() && visibility_path.is_some() {
         return Err("--visibility-out requires --out because it references GLB chunks".to_owned());
@@ -185,6 +197,7 @@ fn run() -> Result<(), String> {
     let mut render_stats = None;
     let mut collision_stats = None;
     let mut entity_stats = None;
+    let mut physics_stats = None;
     if let Some(output_path) = output_path {
         let mut result = if lightmaps.is_some() {
             if atlas_path.is_some() || manifest_path.is_some() {
@@ -301,19 +314,32 @@ fn run() -> Result<(), String> {
         write(&output_path, &result.json)?;
         collision_stats = Some(result.stats);
     }
+    if let (Some(manifest_path), Some(binary_path)) = (physics_manifest_path, physics_binary_path) {
+        let result = export_bsp_static_physics(&bsp, StaticPhysicsLimits::default())?;
+        write(&manifest_path, &result.manifest.to_json()?)?;
+        write(&binary_path, &result.binary)?;
+        physics_stats = Some(result.manifest.stats);
+    }
     if let Some(output_path) = entity_output_path {
         let graph = export_entity_graph(&bsp)?;
         write(&output_path, &graph.to_json()?)?;
         entity_stats = Some(graph.inventory);
     }
-    let stats = match (&render_stats, &collision_stats, &entity_stats) {
-        (Some(render), None, None) => serde_json::to_value(render),
-        (None, Some(collision), None) => serde_json::to_value(collision),
-        (None, None, Some(entities)) => serde_json::to_value(entities),
+    let stats = match (
+        &render_stats,
+        &collision_stats,
+        &entity_stats,
+        &physics_stats,
+    ) {
+        (Some(render), None, None, None) => serde_json::to_value(render),
+        (None, Some(collision), None, None) => serde_json::to_value(collision),
+        (None, None, Some(entities), None) => serde_json::to_value(entities),
+        (None, None, None, Some(physics)) => serde_json::to_value(physics),
         _ => Ok(serde_json::json!({
             "render": render_stats,
             "collision": collision_stats,
-            "entityGraph": entity_stats
+            "entityGraph": entity_stats,
+            "staticPhysics": physics_stats
         })),
     }
     .map_err(|error| format!("failed to serialize stats: {error}"))?;

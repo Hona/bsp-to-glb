@@ -17,7 +17,7 @@ as `build-metadata.json` in every archive.
 | Static and dynamic prop model geometry | Unsupported |
 | VTF pixel conversion and content-addressed PNG packages | Supported |
 | Ordered directory and native VPK v1/v2 material resolution | Supported |
-| Decoded physics collision meshes | Unsupported |
+| Bounded polygon PHY/PHYSCOLLIDE decoding and static-physics packages | Supported |
 
 ## Component Versions
 
@@ -29,6 +29,7 @@ as `build-metadata.json` in every archive.
 | Material texture manifest | 1 |
 | Visibility sidecar | 2 |
 | Entity graph sidecar | 1 |
+| Static-physics manifest and binary | 1 |
 
 `detectedOnly` means the input is reported but no corresponding render geometry or texture output
 is produced. `unsupported` means callers must provide another implementation for that domain.

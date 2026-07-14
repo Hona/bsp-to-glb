@@ -7,6 +7,8 @@ mod collision;
 mod entities;
 mod material_resolver;
 mod materials;
+pub mod phy;
+pub mod static_physics;
 mod vtf;
 
 pub use collision::{
@@ -76,6 +78,7 @@ pub struct BuildComponentVersions {
     pub material_textures: u32,
     pub visibility_sidecar: u32,
     pub entity_graph: u32,
+    pub static_physics: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -112,7 +115,7 @@ pub fn build_metadata() -> BuildMetadata {
             prop_metadata: BuildCapabilityStatus::Supported,
             prop_geometry: BuildCapabilityStatus::Unsupported,
             brush_collision: BuildCapabilityStatus::Supported,
-            decoded_physics_collision: BuildCapabilityStatus::Unsupported,
+            decoded_physics_collision: BuildCapabilityStatus::Supported,
             visibility: BuildCapabilityStatus::Supported,
             entity_graph: BuildCapabilityStatus::Supported,
             overlays: BuildCapabilityStatus::DetectedOnly,
@@ -125,6 +128,7 @@ pub fn build_metadata() -> BuildMetadata {
             material_textures: MATERIAL_TEXTURE_MANIFEST_VERSION,
             visibility_sidecar: VISIBILITY_SIDECAR_VERSION,
             entity_graph: ENTITY_GRAPH_VERSION,
+            static_physics: static_physics::STATIC_PHYSICS_SCHEMA_VERSION,
         },
     }
 }

@@ -61,7 +61,8 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - hidden-but-preserved sky, trigger and disabled brush models
 - versioned direct-BSP collision sidecars with brush-model ownership
 - static-prop collision identity and solid-mode metadata when `sprp` is present
-- raw per-model PHYSCOLLIDE blocks and metadata (opaque, explicitly not decoded)
+- raw per-model PHYSCOLLIDE blocks and metadata in the collision sidecar
+- bounded polygon PHY/PHYSCOLLIDE decoding and versioned static-physics shape packages
 - LZMA-compressed BSP lumps
 - exact BSP-tree leaf/cluster/PVS visibility sidecars with GLB chunk ownership
 - versioned compiled entity graphs with ordered raw key/value pairs and parsed I/O connections
@@ -72,7 +73,7 @@ Unsupported domains are detected or reported explicitly:
 - static and dynamic prop MDL geometry resolution
 - full Source shader execution and material proxy evaluation
 - material proxies and animated materials (identified as metadata only)
-- decoded VPhysics collision meshes
+- MOPP, ball, virtual, swapped-endian, and unknown VPhysics shape decoding
 - overlays and water overlays (presence and lump versions are reported, geometry is not exported)
 - cubemap samples (presence and lump versions are reported, textures are not exported)
 - particles
@@ -163,7 +164,7 @@ bsp-to-glb --version-json
 Build-metadata schema version 2 includes package version, build target/profile, release source
 commit, supported/detected-only/unsupported capability states, and serialized component versions.
 The current component versions are material manifest 3, material mount plan 1, material textures 1,
-visibility sidecar 2, and entity graph 1.
+visibility sidecar 2, entity graph 1, and static physics 1.
 
 ```bash
 bsp-to-glb \
@@ -177,6 +178,8 @@ bsp-to-glb \
   --texture-output path/to/textures \
   --texture-manifest path/to/textures/manifest.json \
   --collision-out path/to/map.collision.json \
+  --physics-manifest path/to/map.physics.json \
+  --physics-binary path/to/map.physics.bin \
   --entities-out path/to/map.entities.json \
   --props-out path/to/props.json \
   --visibility-out path/to/map.visibility.json
@@ -262,10 +265,10 @@ case-insensitive duplicate paths, oversized entries and malformed ZIP data, and 
 entry and decompression limits. VTF files, encoded image ranges and decoded RGBA output are each
 bounded to 256 MiB; dimensions are bounded to 16,384 and resource dictionaries to 4,096 entries.
 
-`--out`, `--collision-out`, and `--entities-out` are independently optional, but at least one is
-required. Collision-only and entity-only exports do not parse or triangulate render faces.
-Material, prop, lightmap and visibility outputs require `--out`; visibility references the emitted
-GLB chunk indices.
+`--out`, `--collision-out`, `--entities-out`, and the paired static-physics outputs are independently
+optional, but at least one output is required. Collision-only, entity-only, and physics-only exports
+do not parse or triangulate render faces. Material, prop, lightmap and visibility outputs require
+`--out`; visibility references the emitted GLB chunk indices.
 
 ## Collision Sidecar
 
@@ -277,7 +280,30 @@ contents mask and is also exposed as `playerClip` for consumers.
 The sidecar declares `geometrySource: "bspBrushes"` and
 `renderTriangleSubstitution: false`; render triangles are never used as collision fallback.
 PHYSCOLLIDE model headers and raw blocks are retained as base64, while `decodeStatus` is
-`"unsupported"` until a compatible VPhysics decoder is implemented.
+`"unsupported"` because this legacy collision schema intentionally remains lossless and opaque.
+Decoded polygon shapes are a separate package so raw preservation and runtime-ready geometry do not
+silently substitute for one another.
+
+## Static Physics Package
+
+`--physics-manifest` and `--physics-binary` must be supplied together and are independent of GLB
+output. They decode polygon compact-ledge solids from the compiled PHYSCOLLIDE lump into a bounded,
+engine-neutral `bsp-to-glb/static-physics` version 1 manifest and
+`bsp-to-glb/static-physics-binary` version 1 shape bundle. The manifest preserves BSP model and solid
+identity, typed solid key data, unknown key data, per-solid status, binary byte length, and SHA-256.
+The binary preserves Source-space vertices, triangle winding, material indices, virtual-face flags,
+center of mass, inertia, drag metadata, and convex ownership.
+
+Modern polygon and legacy compact polygon solids are decoded. MOPP, ball, virtual,
+swapped-endian, and unknown shape kinds remain explicit `unsupported` manifest records with no
+invented geometry. Malformed framing, non-finite values, cycles, noncanonical table ranges,
+truncation, unsupported versions, and exhausted byte/count/depth limits fail the requested export.
+Default limits cap input and binary output at 128 MiB, with additional independent model, solid,
+tree, convex, triangle, vertex, key-token, key-depth, and string bounds.
+
+`decode-phy` applies the same decoder to standalone model `.phy` files and can optionally write the
+same shape binary. Consumers must validate manifest/binary versions, byte length, hash, table
+ranges, indices, and unsupported statuses before constructing a physics-engine adapter.
 
 Static-prop collision metadata is modular library input through `CollisionExportInput`. `None`
 means GAME_LUMP data was unavailable; `Some` preserves supplied prop indices, model names and
@@ -405,7 +431,7 @@ includes 100 `func_brush` entities and 68 `OnTrigger` connections.
    single-style brush faces)
 3. Static prop MDL geometry resolution (metadata and reusable references implemented)
 4. VTF pixel conversion (implemented); runtime shader integration remains
-5. Collision brush and opaque physics sidecars (implemented)
+5. Collision brush, opaque raw physics, and decoded polygon static-physics sidecars (implemented)
 6. ~~Leaf/cluster/PVS sidecars~~
 7. Versioned output manifests and runtime integration
 
