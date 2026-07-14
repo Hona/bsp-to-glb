@@ -694,6 +694,7 @@ struct DispVert {
 struct DisplacementGeometry {
     positions: Vec<[f32; 3]>,
     flat_positions: Vec<[f32; 3]>,
+    lightmap_coordinates: Vec<[f32; 2]>,
     normals: Vec<[f32; 3]>,
     triangles: Vec<[usize; 3]>,
     alphas: Vec<f32>,
@@ -2848,6 +2849,16 @@ fn lightmap_uv(
         dot4(texinfo.lightmap_vecs[0], position) - face.lightmap_mins[0] as f32,
         dot4(texinfo.lightmap_vecs[1], position) - face.lightmap_mins[1] as f32,
     ];
+    lightmap_uv_from_local(placement, atlas, face, local, face_index)
+}
+
+fn lightmap_uv_from_local(
+    placement: LightmapPlacement,
+    atlas: &LightmapImage,
+    face: Face,
+    local: [f32; 2],
+    face_index: usize,
+) -> Result<[f32; 2], String> {
     let limit = [face.lightmap_size[0] as f32, face.lightmap_size[1] as f32];
     for axis in 0..2 {
         if !local[axis].is_finite() || local[axis] < -0.01 || local[axis] > limit[axis] + 0.01 {
@@ -3263,12 +3274,21 @@ fn build_displacement_geometry(
     ];
     let denominator = (side - 1) as f32;
     let mut flat_positions = Vec::with_capacity(vertex_count);
+    let mut lightmap_coordinates = Vec::with_capacity(vertex_count);
+    let lightmap_step = [
+        face.lightmap_size[0] as f32 / denominator,
+        face.lightmap_size[1] as f32 / denominator,
+    ];
     for row in 0..side {
         let row_amount = row as f32 / denominator;
         let left = lerp(corners[0], corners[1], row_amount);
         let right = lerp(corners[3], corners[2], row_amount);
         for column in 0..side {
             flat_positions.push(lerp(left, right, column as f32 / denominator));
+            lightmap_coordinates.push([
+                lightmap_step[0] * column as f32,
+                lightmap_step[1] * row as f32,
+            ]);
         }
     }
     let positions: Vec<_> = flat_positions
@@ -3336,6 +3356,7 @@ fn build_displacement_geometry(
     Ok(DisplacementGeometry {
         positions,
         flat_positions,
+        lightmap_coordinates,
         normals,
         triangles,
         alphas: source_vertices.iter().map(|vertex| vertex.alpha).collect(),
@@ -4051,11 +4072,12 @@ fn export_bsp_internal(
                 .copied()
                 .map(source_to_gltf)
                 .collect();
-            for (((_source, uv_source), gltf), source_normal) in source_positions
+            for (vertex_index, (((_source, uv_source), gltf), source_normal)) in source_positions
                 .iter()
                 .zip(&uv_positions)
                 .zip(&gltf_positions)
                 .zip(&source_normals)
+                .enumerate()
             {
                 primitive.positions.extend_from_slice(gltf);
                 primitive
@@ -4068,14 +4090,25 @@ fn export_bsp_internal(
                     .uv0
                     .push(dot4(texinfo.texture_vecs[1], *uv_source) / texture.height as f32);
                 if let (Some(extracted), Some(placement)) = (&direct_lightmaps, direct_mapping) {
-                    primitive.uv1.extend_from_slice(&lightmap_uv(
-                        placement,
-                        &extracted.artifacts.flat,
-                        face,
-                        texinfo,
-                        *uv_source,
-                        face_index,
-                    )?);
+                    let uv = if let Some(geometry) = &displacement {
+                        lightmap_uv_from_local(
+                            placement,
+                            &extracted.artifacts.flat,
+                            face,
+                            geometry.lightmap_coordinates[vertex_index],
+                            face_index,
+                        )?
+                    } else {
+                        lightmap_uv(
+                            placement,
+                            &extracted.artifacts.flat,
+                            face,
+                            texinfo,
+                            *uv_source,
+                            face_index,
+                        )?
+                    };
+                    primitive.uv1.extend_from_slice(&uv);
                 } else if let (Some(lookup), Some(mapping_index)) =
                     (&external_lightmaps, external_mapping)
                 {

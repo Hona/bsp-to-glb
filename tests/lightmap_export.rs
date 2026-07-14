@@ -155,6 +155,88 @@ fn synthetic_bsp(
     bsp
 }
 
+fn replace_lump(bsp: &[u8], target: usize, replacement: &[u8]) -> Vec<u8> {
+    let mut rebuilt = bsp[..HEADER_SIZE].to_vec();
+    for lump in 0..64 {
+        let header = 8 + lump * 16;
+        let offset = i32::from_le_bytes(bsp[header..header + 4].try_into().unwrap()) as usize;
+        let length = i32::from_le_bytes(bsp[header + 4..header + 8].try_into().unwrap()) as usize;
+        let data = if lump == target {
+            replacement
+        } else {
+            &bsp[offset..offset + length]
+        };
+        if data.is_empty() {
+            put_i32(&mut rebuilt, header, 0);
+            put_i32(&mut rebuilt, header + 4, 0);
+            continue;
+        }
+        let offset = rebuilt.len();
+        rebuilt.extend_from_slice(data);
+        put_i32(&mut rebuilt, header, offset as i32);
+        put_i32(&mut rebuilt, header + 4, data.len() as i32);
+    }
+    rebuilt
+}
+
+fn synthetic_swapped_displacement_bsp() -> Vec<u8> {
+    const WIDTH: usize = 27;
+    const HEIGHT: usize = 18;
+    let mut bsp = synthetic_bsp(
+        Some(vec![0; WIDTH * HEIGHT * 4]),
+        None,
+        false,
+        [0, 255, 255, 255],
+        0,
+        0,
+    );
+
+    let vertex_lump = i32::from_le_bytes(bsp[8 + 3 * 16..12 + 3 * 16].try_into().unwrap()) as usize;
+    let positions = [
+        [156.245, -4_624.0, -1_280.0],
+        [-648.0, -4_624.0, -1_280.0],
+        [-648.0, -4_112.0, -1_280.0],
+        [156.245, -4_112.0, -1_280.0],
+    ];
+    for (index, position) in positions.iter().enumerate() {
+        for (axis, value) in position.iter().enumerate() {
+            put_f32(&mut bsp, vertex_lump + index * 12 + axis * 4, *value);
+        }
+    }
+
+    let texinfo = i32::from_le_bytes(bsp[8 + 6 * 16..12 + 6 * 16].try_into().unwrap()) as usize;
+    for offset in (32..64).step_by(4) {
+        put_f32(&mut bsp, texinfo + offset, 0.0);
+    }
+    for (offset, value) in [
+        (36, -1.0 / 32.0),
+        (44, -0.09375),
+        (48, 1.0 / 32.0),
+        (60, -0.249_908_6),
+    ] {
+        put_f32(&mut bsp, texinfo + offset, value);
+    }
+
+    let face = i32::from_le_bytes(bsp[8 + 7 * 16..12 + 7 * 16].try_into().unwrap()) as usize;
+    put_i16(&mut bsp, face + 12, 0);
+    put_i32(&mut bsp, face + 28, 128);
+    put_i32(&mut bsp, face + 32, -21);
+    put_i32(&mut bsp, face + 36, (WIDTH - 1) as i32);
+    put_i32(&mut bsp, face + 40, (HEIGHT - 1) as i32);
+
+    let mut dispinfo = vec![0; 176];
+    for (axis, value) in positions[0].iter().enumerate() {
+        put_f32(&mut dispinfo, axis * 4, *value);
+    }
+    put_i32(&mut dispinfo, 12, 0);
+    put_i32(&mut dispinfo, 16, 0);
+    put_i32(&mut dispinfo, 20, 2);
+    put_u16(&mut dispinfo, 36, 0);
+    bsp = replace_lump(&bsp, 26, &dispinfo);
+    bsp = replace_lump(&bsp, 33, &[0; 25 * 20]);
+    replace_lump(&bsp, 48, &[0; 32 * 2])
+}
+
 fn glb_json(glb: &[u8]) -> Value {
     let json_length = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
     serde_json::from_slice(&glb[20..20 + json_length]).unwrap()
@@ -228,6 +310,35 @@ fn owns_exact_face_uvs_and_all_bump_channels() {
 
     let png = encode_lightmap_png(&artifacts.flat).unwrap();
     assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn displacement_uvs_own_compiled_extents_independently_of_swapped_face_vectors() {
+    let result = export_bsp_with_options(
+        &synthetic_swapped_displacement_bsp(),
+        &ExportOptions {
+            lightmap_set: LightmapSet::Ldr,
+            atlas_width: 64,
+            ..ExportOptions::default()
+        },
+    )
+    .unwrap();
+    let artifacts = result.lightmaps.as_ref().unwrap();
+    assert_eq!((artifacts.flat.width, artifacts.flat.height), (27, 18));
+
+    let gltf = glb_json(&result.glb);
+    let attributes = &gltf["meshes"][0]["primitives"][0]["attributes"];
+    let uv1 = read_f32_accessor(
+        &result.glb,
+        &gltf,
+        attributes["TEXCOORD_1"].as_u64().unwrap() as usize,
+    );
+    let uv = |vertex: usize| &uv1[vertex * 2..vertex * 2 + 2];
+    assert_eq!(uv(0), &[0.5 / 27.0, 0.5 / 18.0]);
+    assert_eq!(uv(4), &[26.5 / 27.0, 0.5 / 18.0]);
+    assert_eq!(uv(20), &[0.5 / 27.0, 17.5 / 18.0]);
+    assert_eq!(uv(24), &[26.5 / 27.0, 17.5 / 18.0]);
+    assert!(uv1.iter().all(|value| (0.0..=1.0).contains(value)));
 }
 
 #[test]
