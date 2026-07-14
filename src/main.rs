@@ -5,7 +5,7 @@ use bsp_to_glb::{
     export_bsp_with_material_resolver_and_visibility,
     export_bsp_with_options_and_material_resolver,
     export_bsp_with_options_and_material_resolver_and_visibility, export_collision_sidecar,
-    export_entity_graph, static_prop_collision_inputs,
+    export_entity_graph, read_bsp_pak_archive, static_prop_collision_inputs,
 };
 use std::env;
 use std::fs;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -64,6 +64,8 @@ fn run() -> Result<(), String> {
     let mut lightmap_path: Option<PathBuf> = None;
     let mut material_manifest_path: Option<PathBuf> = None;
     let mut material_mount_plan_path: Option<PathBuf> = None;
+    let mut pak_output_path: Option<PathBuf> = None;
+    let mut pak_manifest_path: Option<PathBuf> = None;
     let mut texture_output_path: Option<PathBuf> = None;
     let mut texture_manifest_path: Option<PathBuf> = None;
     let mut texture_selection = VtfImageSelection::default();
@@ -102,6 +104,8 @@ fn run() -> Result<(), String> {
             "--lightmaps" => lightmap_path = Some(value.into()),
             "--material-manifest" => material_manifest_path = Some(value.into()),
             "--material-mount-plan" => material_mount_plan_path = Some(value.into()),
+            "--pak-output" => pak_output_path = Some(value.into()),
+            "--pak-manifest" => pak_manifest_path = Some(value.into()),
             "--texture-output" => texture_output_path = Some(value.into()),
             "--texture-manifest" => texture_manifest_path = Some(value.into()),
             "--texture-mip" => {
@@ -123,6 +127,13 @@ fn run() -> Result<(), String> {
                     .to_string_lossy()
                     .parse()
                     .map_err(|_| format!("invalid texture face: {}", value.to_string_lossy()))?;
+                texture_selection_set = true;
+            }
+            "--texture-slice" => {
+                texture_selection.slice = value
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| format!("invalid texture slice: {}", value.to_string_lossy()))?;
                 texture_selection_set = true;
             }
             "--props-out" => props_output_path = Some(value.into()),
@@ -155,11 +166,15 @@ fn run() -> Result<(), String> {
         && collision_output_path.is_none()
         && entity_output_path.is_none()
         && physics_manifest_path.is_none()
+        && pak_output_path.is_none()
     {
         return Err(usage().to_owned());
     }
     if physics_manifest_path.is_some() != physics_binary_path.is_some() {
         return Err("--physics-manifest and --physics-binary must be supplied together".to_owned());
+    }
+    if pak_output_path.is_some() != pak_manifest_path.is_some() {
+        return Err("--pak-output and --pak-manifest must be supplied together".to_owned());
     }
     if output_path.is_none() && visibility_path.is_some() {
         return Err("--visibility-out requires --out because it references GLB chunks".to_owned());
@@ -181,6 +196,30 @@ fn run() -> Result<(), String> {
     }
     let bsp = fs::read(&bsp_path)
         .map_err(|error| format!("failed to read {}: {error}", bsp_path.display()))?;
+    let mut pak_stats = None;
+    if let (Some(output_path), Some(manifest_path)) = (&pak_output_path, &pak_manifest_path) {
+        fs::create_dir(output_path).map_err(|error| {
+            format!(
+                "failed to create new BSP PAK output directory {}: {error}",
+                output_path.display()
+            )
+        })?;
+        let archive = read_bsp_pak_archive(&bsp)?;
+        for entry in &archive.entries {
+            if entry.metadata.status != "handled" {
+                continue;
+            }
+            let entry_path = output_path.join(Path::new(&entry.metadata.path));
+            entry_path.strip_prefix(output_path).map_err(|_| {
+                format!("BSP PAK entry escaped output root: {}", entry.metadata.path)
+            })?;
+            write(&entry_path, &entry.data)?;
+        }
+        let manifest = serde_json::to_vec_pretty(&archive.manifest)
+            .map_err(|error| format!("failed to serialize BSP PAK manifest: {error}"))?;
+        write(manifest_path, &manifest)?;
+        pak_stats = Some(archive.manifest);
+    }
     let lightmaps = lightmap_path
         .as_ref()
         .map(|path| {
@@ -331,15 +370,18 @@ fn run() -> Result<(), String> {
         &entity_stats,
         &physics_stats,
     ) {
-        (Some(render), None, None, None) => serde_json::to_value(render),
-        (None, Some(collision), None, None) => serde_json::to_value(collision),
-        (None, None, Some(entities), None) => serde_json::to_value(entities),
-        (None, None, None, Some(physics)) => serde_json::to_value(physics),
+        (Some(render), None, None, None) if pak_stats.is_none() => serde_json::to_value(render),
+        (None, Some(collision), None, None) if pak_stats.is_none() => {
+            serde_json::to_value(collision)
+        }
+        (None, None, Some(entities), None) if pak_stats.is_none() => serde_json::to_value(entities),
+        (None, None, None, Some(physics)) if pak_stats.is_none() => serde_json::to_value(physics),
         _ => Ok(serde_json::json!({
             "render": render_stats,
             "collision": collision_stats,
             "entityGraph": entity_stats,
-            "staticPhysics": physics_stats
+            "staticPhysics": physics_stats,
+            "bspPak": pak_stats
         })),
     }
     .map_err(|error| format!("failed to serialize stats: {error}"))?;

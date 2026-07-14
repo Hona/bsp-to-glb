@@ -1,7 +1,7 @@
 use bsp_to_glb::{
     MaterialResolver, MaterialResourceProvenance, PakResource, PakResourceKind,
     ResolvedMaterialResource, TextureDecodeStatus, VtfErrorKind, VtfImageSelection,
-    build_source_material_package, decode_vtf, inspect_vtf,
+    build_source_material_package, decode_vtf, inspect_vtf, vtf_format_universe,
 };
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -17,6 +17,71 @@ const IMAGE_FORMAT_BGRA8888: u32 = 12;
 const IMAGE_FORMAT_DXT1: u32 = 13;
 const IMAGE_FORMAT_DXT3: u32 = 14;
 const IMAGE_FORMAT_DXT5: u32 = 15;
+
+#[test]
+fn inventories_the_complete_tf2_pc_image_format_universe() {
+    let formats = vtf_format_universe();
+    assert_eq!(formats.len(), 39);
+    assert_eq!(
+        formats
+            .iter()
+            .map(|format| format.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "RGBA8888",
+            "ABGR8888",
+            "RGB888",
+            "BGR888",
+            "RGB565",
+            "I8",
+            "IA88",
+            "P8",
+            "A8",
+            "RGB888_BLUESCREEN",
+            "BGR888_BLUESCREEN",
+            "ARGB8888",
+            "BGRA8888",
+            "DXT1",
+            "DXT3",
+            "DXT5",
+            "BGRX8888",
+            "BGR565",
+            "BGRX5551",
+            "BGRA4444",
+            "DXT1_ONEBITALPHA",
+            "BGRA5551",
+            "UV88",
+            "UVWQ8888",
+            "RGBA16161616F",
+            "RGBA16161616",
+            "UVLX8888",
+            "R32F",
+            "RGB323232F",
+            "RGBA32323232F",
+            "NV_DST16",
+            "NV_DST24",
+            "NV_INTZ",
+            "NV_RAWZ",
+            "ATI_DST16",
+            "ATI_DST24",
+            "NV_NULL",
+            "ATI2N",
+            "ATI1N",
+        ]
+    );
+    let supported = formats
+        .iter()
+        .filter(|format| format.supported)
+        .map(|format| format.code)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        supported,
+        [
+            0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 37, 38,
+        ]
+    );
+}
 
 fn put_u16(data: &mut [u8], offset: usize, value: u16) {
     data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -73,8 +138,64 @@ fn vtf_73(width: u16, height: u16, format: u32, high_resolution_data: &[u8]) -> 
     data
 }
 
+fn vtf_73_with_inline_resource(
+    width: u16,
+    height: u16,
+    format: u32,
+    tag: [u8; 3],
+    inline_data: u32,
+    high_resolution_data: &[u8],
+) -> Vec<u8> {
+    let header_size = 96_u32;
+    let mut data = vec![0; header_size as usize];
+    data[0..4].copy_from_slice(b"VTF\0");
+    put_u32(&mut data, 4, 7);
+    put_u32(&mut data, 8, 3);
+    put_u32(&mut data, 12, header_size);
+    put_u16(&mut data, 16, width);
+    put_u16(&mut data, 18, height);
+    put_u16(&mut data, 24, 1);
+    put_u32(&mut data, 52, format);
+    data[56] = 1;
+    put_u32(&mut data, 57, u32::MAX);
+    put_u16(&mut data, 63, 1);
+    put_u32(&mut data, 68, 2);
+    data[80..83].copy_from_slice(&[0x30, 0, 0]);
+    put_u32(&mut data, 84, header_size);
+    data[88..91].copy_from_slice(&tag);
+    data[91] = 0x02;
+    put_u32(&mut data, 92, inline_data);
+    data.extend_from_slice(high_resolution_data);
+    data
+}
+
 fn rgba_vtf(pixel: [u8; 4]) -> Vec<u8> {
     vtf_72(1, 1, IMAGE_FORMAT_RGBA8888, 1, 1, 0, &pixel)
+}
+
+#[test]
+fn accepts_tf2_vtf_versions_70_through_75_and_versioned_cubemap_faces() {
+    for minor in 0..=5 {
+        let mut texture = if minor >= 3 {
+            vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[1, 2, 3, 4])
+        } else {
+            vtf_72(1, 1, IMAGE_FORMAT_RGBA8888, 1, 1, 0, &[1, 2, 3, 4])
+        };
+        put_u32(&mut texture, 8, minor);
+        let metadata = inspect_vtf(&texture).unwrap();
+        assert_eq!((metadata.version_major, metadata.version_minor), (7, minor));
+    }
+
+    let mut legacy = vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[0; 6 * 4]);
+    put_u32(&mut legacy, 8, 0);
+    put_u32(&mut legacy, 20, 0x4000);
+    put_u16(&mut legacy, 26, u16::MAX);
+    assert_eq!(inspect_vtf(&legacy).unwrap().faces, 6);
+
+    let mut current = vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[0; 7 * 4]);
+    put_u32(&mut current, 8, 5);
+    put_u32(&mut current, 20, 0x4000);
+    assert_eq!(inspect_vtf(&current).unwrap().faces, 7);
 }
 
 #[test]
@@ -102,7 +223,7 @@ fn decodes_required_uncompressed_and_luminance_formats_to_rgba() {
         ),
         (IMAGE_FORMAT_I8, &[42], [42, 42, 42, 255], "I8"),
         (IMAGE_FORMAT_IA88, &[42, 9], [42, 42, 42, 9], "IA88"),
-        (IMAGE_FORMAT_A8, &[9], [255, 255, 255, 9], "A8"),
+        (IMAGE_FORMAT_A8, &[9], [9, 9, 9, 9], "A8"),
     ];
 
     for &(format, encoded, expected, name) in cases {
@@ -115,6 +236,110 @@ fn decodes_required_uncompressed_and_luminance_formats_to_rgba() {
         assert_eq!(decoded.metadata.format.name, name);
         assert!(decoded.metadata.format.supported);
     }
+}
+
+#[test]
+fn decodes_packed_color_and_data_map_formats_with_source_channel_semantics() {
+    let cases: &[(u32, &[u8], [u8; 4])] = &[
+        (9, &[0, 0, 255], [0, 0, 0, 0]),
+        (10, &[255, 0, 0], [0, 0, 0, 0]),
+        (11, &[4, 1, 2, 3], [1, 2, 3, 4]),
+        (4, &[0x1f, 0x00], [255, 0, 0, 255]),
+        (16, &[3, 2, 1, 99], [1, 2, 3, 255]),
+        (17, &[0x00, 0xf8], [255, 0, 0, 255]),
+        (18, &[0x00, 0x7c], [255, 0, 0, 255]),
+        (19, &[0x81, 0xff], [240, 128, 16, 240]),
+        (21, &[0x00, 0xfc], [255, 0, 0, 255]),
+        (22, &[1, 2], [1, 2, 0, 0]),
+        (23, &[1, 2, 3, 4], [1, 2, 3, 4]),
+        (
+            25,
+            &[0xf0, 0x0f, 0x00, 0x08, 0x00, 0x00, 0xff, 0xff],
+            [255, 128, 0, 255],
+        ),
+        (26, &[5, 6, 7, 8], [5, 6, 7, 8]),
+        (
+            24,
+            &[0x00, 0x3c, 0x00, 0x38, 0x00, 0x40, 0x00, 0x00],
+            [255, 128, 255, 0],
+        ),
+    ];
+    for &(format, encoded, expected) in cases {
+        let decoded = decode_vtf(
+            &vtf_72(1, 1, format, 1, 1, 0, encoded),
+            VtfImageSelection::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded.pixels, expected, "format {format}");
+    }
+}
+
+#[test]
+fn decodes_ati_normal_data_blocks_without_inventing_color_channels() {
+    let red = [10, 20, 0x3e, 0, 0, 0, 0, 0];
+    let green = [30, 40, 0, 0, 0, 0, 0, 0];
+    let mut ati2 = red.to_vec();
+    ati2.extend_from_slice(&green);
+
+    let decoded = decode_vtf(
+        &vtf_72(4, 4, 37, 1, 1, 0, &ati2),
+        VtfImageSelection::default(),
+    )
+    .unwrap();
+    assert_eq!(&decoded.pixels[0..8], &[0, 30, 0, 0, 255, 30, 0, 0]);
+
+    let decoded = decode_vtf(
+        &vtf_72(4, 4, 38, 1, 1, 0, &red),
+        VtfImageSelection::default(),
+    )
+    .unwrap();
+    assert_eq!(&decoded.pixels[0..8], &[0, 0, 0, 0, 255, 0, 0, 0]);
+}
+
+#[test]
+fn inventories_inline_resources_without_treating_their_values_as_offsets() {
+    let texture = vtf_73_with_inline_resource(
+        1,
+        1,
+        IMAGE_FORMAT_RGBA8888,
+        *b"CRC",
+        0xfedc_ba98,
+        &[1, 2, 3, 4],
+    );
+
+    let metadata = inspect_vtf(&texture).unwrap();
+
+    assert_eq!(metadata.resources.len(), 2);
+    assert_eq!(metadata.resources[0].tag, "0x300000");
+    assert!(!metadata.resources[0].is_inline);
+    assert_eq!(metadata.resources[1].tag, "CRC");
+    assert!(metadata.resources[1].is_inline);
+    assert_eq!(metadata.resources[1].inline_data, Some(0xfedc_ba98));
+}
+
+#[test]
+fn selects_individual_volume_slices_in_source_storage_order() {
+    let mut texture = vtf_72(
+        1,
+        1,
+        IMAGE_FORMAT_RGBA8888,
+        1,
+        1,
+        0,
+        &[1, 0, 0, 255, 2, 0, 0, 255],
+    );
+    put_u16(&mut texture, 63, 2);
+
+    let decoded = decode_vtf(
+        &texture,
+        VtfImageSelection {
+            slice: 1,
+            ..VtfImageSelection::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(decoded.pixels, [2, 0, 0, 255]);
 }
 
 #[test]
@@ -189,6 +414,7 @@ fn selects_mips_frames_and_cubemap_faces_in_source_storage_order() {
             mip: 0,
             frame: 1,
             face: 0,
+            slice: 0,
         },
     )
     .unwrap();
@@ -232,13 +458,13 @@ fn reads_v73_resource_offsets_and_rejects_invalid_or_unsupported_inputs() {
     assert_eq!(error.kind, VtfErrorKind::Invalid);
     assert!(error.message.contains("truncated"), "{error}");
 
-    let unsupported = vtf_72(1, 1, 24, 1, 1, 0, &[0; 8]);
+    let unsupported = vtf_72(1, 1, 7, 1, 1, 0, &[0; 1]);
     let metadata = inspect_vtf(&unsupported).unwrap();
-    assert_eq!(metadata.format.name, "RGBA16161616F");
+    assert_eq!(metadata.format.name, "P8");
     assert!(!metadata.format.supported);
     let error = decode_vtf(&unsupported, VtfImageSelection::default()).unwrap_err();
     assert_eq!(error.kind, VtfErrorKind::Unsupported);
-    assert!(error.message.contains("RGBA16161616F"), "{error}");
+    assert!(error.message.contains("P8"), "{error}");
 
     let impossible_mips = vtf_72(1, 1, IMAGE_FORMAT_RGBA8888, 1, 2, 0, &[0; 8]);
     let error = inspect_vtf(&impossible_mips).unwrap_err();
@@ -269,7 +495,7 @@ impl MaterialResolver for Resolver {
         self.requests.borrow_mut().push(lookup_path.to_owned());
         let data = match lookup_path {
             "materials/shared/external.vtf" => rgba_vtf([7, 8, 9, 255]),
-            "materials/shared/unsupported.vtf" => vtf_72(1, 1, 24, 1, 1, 0, &[0; 8]),
+            "materials/shared/unsupported.vtf" => vtf_72(1, 1, 7, 1, 1, 0, &[0; 1]),
             _ => return Ok(None),
         };
         Ok(Some(ResolvedMaterialResource {
@@ -356,13 +582,7 @@ fn material_package_is_pak_first_content_addressed_and_preserves_failures() {
         external.output.as_ref().unwrap().content_id
     );
     assert_eq!(unsupported.status, TextureDecodeStatus::Unsupported);
-    assert!(
-        unsupported
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("RGBA16161616F")
-    );
+    assert!(unsupported.error.as_deref().unwrap().contains("P8"));
     assert_eq!(package.material_manifest.schema_version, 3);
     assert_eq!(
         package.material_manifest.materials[0]
@@ -384,4 +604,122 @@ fn material_package_is_pak_first_content_addressed_and_preserves_failures() {
             "materials/shared/external.vtf"
         ]
     );
+}
+
+#[test]
+fn material_package_emits_every_animated_frame_from_the_canonical_decoder() {
+    let vmt = br#"LightmappedGeneric { "$basetexture" "shared/animated" }"#;
+    let texture = vtf_72(
+        1,
+        1,
+        IMAGE_FORMAT_RGBA8888,
+        2,
+        1,
+        0,
+        &[1, 2, 3, 255, 4, 5, 6, 255],
+    );
+    let resources = vec![
+        PakResource {
+            path: "materials/shared/test.vmt".to_owned(),
+            kind: PakResourceKind::Vmt,
+            data: vmt.to_vec(),
+        },
+        PakResource {
+            path: "materials/shared/animated.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: texture,
+        },
+    ];
+
+    let package = build_source_material_package(
+        &["shared/test".to_owned()],
+        &resources,
+        None,
+        VtfImageSelection::default(),
+    )
+    .unwrap();
+
+    assert_eq!(package.manifest.sources[0].frame_outputs.len(), 2);
+    assert_eq!(package.artifacts.len(), 2);
+    assert_eq!(
+        package.manifest.sources[0].output,
+        Some(package.manifest.sources[0].frame_outputs[0].clone())
+    );
+}
+
+#[test]
+fn material_package_reports_animation_budgets_without_partial_outputs() {
+    let vmt = br#"LightmappedGeneric { "$basetexture" "shared/too_many" }"#;
+    let texture = vtf_72(1, 1, IMAGE_FORMAT_RGBA8888, 257, 1, 0, &vec![0; 257 * 4]);
+    let resources = vec![
+        PakResource {
+            path: "materials/shared/test.vmt".to_owned(),
+            kind: PakResourceKind::Vmt,
+            data: vmt.to_vec(),
+        },
+        PakResource {
+            path: "materials/shared/too_many.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: texture,
+        },
+    ];
+
+    let package = build_source_material_package(
+        &["shared/test".to_owned()],
+        &resources,
+        None,
+        VtfImageSelection::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        package.manifest.sources[0].status,
+        TextureDecodeStatus::Unsupported
+    );
+    assert!(package.manifest.sources[0].frame_outputs.is_empty());
+    assert!(package.manifest.sources[0].output.is_none());
+    assert!(package.artifacts.is_empty());
+}
+
+#[test]
+fn material_package_rejects_an_invalid_selected_frame_without_partial_outputs() {
+    let resources = vec![
+        PakResource {
+            path: "materials/shared/test.vmt".to_owned(),
+            kind: PakResourceKind::Vmt,
+            data: br#"LightmappedGeneric { "$basetexture" "shared/animated" }"#.to_vec(),
+        },
+        PakResource {
+            path: "materials/shared/animated.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: vtf_72(
+                1,
+                1,
+                IMAGE_FORMAT_RGBA8888,
+                2,
+                1,
+                0,
+                &[1, 2, 3, 255, 4, 5, 6, 255],
+            ),
+        },
+    ];
+
+    let package = build_source_material_package(
+        &["shared/test".to_owned()],
+        &resources,
+        None,
+        VtfImageSelection {
+            frame: 2,
+            ..VtfImageSelection::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        package.manifest.sources[0].status,
+        TextureDecodeStatus::Invalid
+    );
+    assert!(package.manifest.sources[0].frame_outputs.is_empty());
+    assert!(package.manifest.outputs.is_empty());
+    assert!(package.artifacts.is_empty());
 }

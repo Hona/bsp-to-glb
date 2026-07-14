@@ -6,10 +6,11 @@ edition = "2024"
 [dependencies]
 base64 = "0.22"
 crc32fast = "1"
+half = "2"
 lzma-rs = "0.3"
 pathdiff = "0.2"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8.6", default-features = false, features = ["deflate", "lzma"] }

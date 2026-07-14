@@ -4,7 +4,7 @@ use std::fmt;
 const MAX_VTF_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_VTF_DIMENSION: u32 = 16_384;
-const MAX_RESOURCES: usize = 4_096;
+const MAX_RESOURCES: usize = 32;
 const TEXTUREFLAGS_ENVMAP: u32 = 0x0000_4000;
 const RESOURCE_NO_DATA_CHUNK: u8 = 0x02;
 const LOW_RES_IMAGE_RESOURCE: [u8; 3] = [0x01, 0, 0];
@@ -16,6 +16,7 @@ pub struct VtfImageSelection {
     pub mip: u8,
     pub frame: u16,
     pub face: u8,
+    pub slice: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -66,6 +67,21 @@ pub struct VtfFormatMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VtfResourceMetadata {
+    pub tag: String,
+    pub flags: u8,
+    #[serde(rename = "inline")]
+    pub is_inline: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_data: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_length: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VtfMetadata {
     pub version_major: u32,
     pub version_minor: u32,
@@ -73,9 +89,12 @@ pub struct VtfMetadata {
     pub height: u32,
     pub depth: u32,
     pub frames: u16,
+    pub start_frame: u16,
     pub faces: u8,
     pub mip_count: u8,
+    pub flags: u32,
     pub format: VtfFormatMetadata,
+    pub resources: Vec<VtfResourceMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +140,13 @@ enum ImageFormat {
     Rgba32323232F,
     Ati2N,
     Ati1N,
+    NvDst16,
+    NvDst24,
+    NvIntz,
+    NvRawz,
+    AtiDst16,
+    AtiDst24,
+    NvNull,
     Unknown(u32),
 }
 
@@ -157,6 +183,13 @@ impl ImageFormat {
             27 => Self::R32F,
             28 => Self::Rgb323232F,
             29 => Self::Rgba32323232F,
+            30 => Self::NvDst16,
+            31 => Self::NvDst24,
+            32 => Self::NvIntz,
+            33 => Self::NvRawz,
+            34 => Self::AtiDst16,
+            35 => Self::AtiDst24,
+            36 => Self::NvNull,
             37 => Self::Ati2N,
             38 => Self::Ati1N,
             _ => Self::Unknown(code),
@@ -195,6 +228,13 @@ impl ImageFormat {
             Self::R32F => "R32F",
             Self::Rgb323232F => "RGB323232F",
             Self::Rgba32323232F => "RGBA32323232F",
+            Self::NvDst16 => "NV_DST16",
+            Self::NvDst24 => "NV_DST24",
+            Self::NvIntz => "NV_INTZ",
+            Self::NvRawz => "NV_RAWZ",
+            Self::AtiDst16 => "ATI_DST16",
+            Self::AtiDst24 => "ATI_DST24",
+            Self::NvNull => "NV_NULL",
             Self::Ati2N => "ATI2N",
             Self::Ati1N => "ATI1N",
             Self::Unknown(code) => return format!("UNKNOWN_{code}"),
@@ -209,14 +249,33 @@ impl ImageFormat {
                 | Self::Abgr8888
                 | Self::Rgb888
                 | Self::Bgr888
+                | Self::Rgb565
                 | Self::I8
                 | Self::Ia88
                 | Self::A8
+                | Self::Rgb888BlueScreen
+                | Self::Bgr888BlueScreen
+                | Self::Argb8888
                 | Self::Bgra8888
                 | Self::Dxt1
                 | Self::Dxt3
                 | Self::Dxt5
                 | Self::Dxt1OneBitAlpha
+                | Self::Bgrx8888
+                | Self::Bgr565
+                | Self::Bgrx5551
+                | Self::Bgra4444
+                | Self::Bgra5551
+                | Self::Uv88
+                | Self::Uvwq8888
+                | Self::Rgba16161616F
+                | Self::Rgba16161616
+                | Self::Uvlx8888
+                | Self::R32F
+                | Self::Rgb323232F
+                | Self::Rgba32323232F
+                | Self::Ati2N
+                | Self::Ati1N
         )
     }
 
@@ -246,9 +305,26 @@ impl ImageFormat {
             Self::Rgba16161616F | Self::Rgba16161616 => Some(Storage::BytesPerPixel(8)),
             Self::Rgb323232F => Some(Storage::BytesPerPixel(12)),
             Self::Rgba32323232F => Some(Storage::BytesPerPixel(16)),
+            Self::NvDst16 | Self::AtiDst16 => Some(Storage::BytesPerPixel(2)),
+            Self::NvDst24 | Self::NvIntz | Self::NvRawz | Self::AtiDst24 | Self::NvNull => {
+                Some(Storage::BytesPerPixel(4))
+            }
             Self::Unknown(_) => None,
         }
     }
+}
+
+pub fn vtf_format_universe() -> Vec<VtfFormatMetadata> {
+    (0..=38)
+        .map(|code| {
+            let format = ImageFormat::from_code(code);
+            VtfFormatMetadata {
+                code,
+                name: format.name(),
+                supported: format.supported(),
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -358,6 +434,14 @@ fn validate_range(data: &[u8], offset: usize, length: usize, label: &str) -> Res
     Ok(())
 }
 
+fn resource_tag(tag: [u8; 3]) -> String {
+    if tag.iter().all(u8::is_ascii_graphic) {
+        String::from_utf8(tag.to_vec()).expect("ASCII VTF resource tag")
+    } else {
+        format!("0x{:02x}{:02x}{:02x}", tag[0], tag[1], tag[2])
+    }
+}
+
 fn parse_vtf(data: &[u8]) -> Result<ParsedVtf, VtfError> {
     if data.len() > MAX_VTF_BYTES {
         return Err(VtfError::invalid(format!(
@@ -398,6 +482,7 @@ fn parse_vtf(data: &[u8]) -> Result<ParsedVtf, VtfError> {
     }
     let flags = read_u32(data, 20, "flags")?;
     let frames = read_u16(data, 24, "frame count")?;
+    let start_frame = read_u16(data, 26, "start frame")?;
     if frames == 0 {
         return Err(VtfError::invalid("VTF frame count must not be zero"));
     }
@@ -423,24 +508,27 @@ fn parse_vtf(data: &[u8]) -> Result<ParsedVtf, VtfError> {
         )));
     }
     let faces = if flags & TEXTUREFLAGS_ENVMAP != 0 {
-        if version_minor < 5 { 7 } else { 6 }
+        if version_minor < 1 { 6 } else { 7 }
     } else {
         1
     };
-    let metadata = VtfMetadata {
+    let mut metadata = VtfMetadata {
         version_major,
         version_minor,
         width,
         height,
         depth,
         frames,
+        start_frame,
         faces,
         mip_count,
+        flags,
         format: VtfFormatMetadata {
             code: format_code,
             name: format.name(),
             supported: format.supported(),
         },
+        resources: Vec::new(),
     };
 
     let low_format_code = read_u32(data, 57, "low-resolution format")?;
@@ -495,13 +583,33 @@ fn parse_vtf(data: &[u8]) -> Result<ParsedVtf, VtfError> {
         }
         let mut high_offset = None;
         let mut low_offset = None;
+        let mut previous_type = None;
         for index in 0..resource_count {
             let entry = 80 + index * 8;
             let tag: [u8; 3] = data[entry..entry + 3].try_into().unwrap();
             let resource_flags = data[entry + 3];
-            let offset = usize::try_from(read_u32(data, entry + 4, "resource data offset")?)
-                .map_err(|_| VtfError::invalid("VTF resource offset does not fit this platform"))?;
-            if resource_flags & RESOURCE_NO_DATA_CHUNK == 0
+            if resource_flags & !RESOURCE_NO_DATA_CHUNK != 0 {
+                return Err(VtfError::invalid(format!(
+                    "VTF resource {index} has unknown flags {resource_flags:#04x}"
+                )));
+            }
+            let resource_type = u32::from_le_bytes([tag[0], tag[1], tag[2], 0]);
+            if previous_type.is_some_and(|previous| previous >= resource_type) {
+                return Err(VtfError::invalid(
+                    "VTF resource directory is not strictly sorted by resource type",
+                ));
+            }
+            previous_type = Some(resource_type);
+            let value = read_u32(data, entry + 4, "resource data offset")?;
+            let is_inline = resource_flags & RESOURCE_NO_DATA_CHUNK != 0;
+            let offset = (!is_inline)
+                .then(|| {
+                    usize::try_from(value).map_err(|_| {
+                        VtfError::invalid("VTF resource offset does not fit this platform")
+                    })
+                })
+                .transpose()?;
+            if let Some(offset) = offset
                 && (offset < header_size || offset > data.len())
             {
                 return Err(VtfError::invalid(format!(
@@ -509,29 +617,58 @@ fn parse_vtf(data: &[u8]) -> Result<ParsedVtf, VtfError> {
                     data.len()
                 )));
             }
+            let mut byte_length = None;
+            if let Some(offset) = offset
+                && tag != HIGH_RES_IMAGE_RESOURCE
+                && tag != LOW_RES_IMAGE_RESOURCE
+            {
+                let length = usize::try_from(read_u32(data, offset, "resource data length")?)
+                    .map_err(|_| {
+                        VtfError::invalid("VTF resource length does not fit this platform")
+                    })?;
+                let body = offset
+                    .checked_add(4)
+                    .ok_or_else(|| VtfError::invalid("VTF resource body offset overflows"))?;
+                validate_range(data, body, length, &format!("resource {index} data"))?;
+                byte_length = Some(length);
+            }
             if tag == HIGH_RES_IMAGE_RESOURCE {
-                if resource_flags & RESOURCE_NO_DATA_CHUNK != 0 {
+                if is_inline {
                     return Err(VtfError::invalid(
                         "VTF high-resolution image resource is marked as inline data",
                     ));
                 }
-                if high_offset.replace(offset).is_some() {
+                if high_offset
+                    .replace(offset.expect("non-inline image resource"))
+                    .is_some()
+                {
                     return Err(VtfError::invalid(
                         "VTF has duplicate high-resolution image resources",
                     ));
                 }
             } else if tag == LOW_RES_IMAGE_RESOURCE {
-                if resource_flags & RESOURCE_NO_DATA_CHUNK != 0 {
+                if is_inline {
                     return Err(VtfError::invalid(
                         "VTF low-resolution image resource is marked as inline data",
                     ));
                 }
-                if low_offset.replace(offset).is_some() {
+                if low_offset
+                    .replace(offset.expect("non-inline image resource"))
+                    .is_some()
+                {
                     return Err(VtfError::invalid(
                         "VTF has duplicate low-resolution image resources",
                     ));
                 }
             }
+            metadata.resources.push(VtfResourceMetadata {
+                tag: resource_tag(tag),
+                flags: resource_flags,
+                is_inline,
+                inline_data: is_inline.then_some(value),
+                offset,
+                byte_length,
+            });
         }
         if low_length > 0 {
             let offset = low_offset.ok_or_else(|| {
@@ -593,12 +730,6 @@ fn selected_image_range(
             selection.face, metadata.faces
         )));
     }
-    if metadata.depth != 1 {
-        return Err(VtfError::unsupported(format!(
-            "VTF volume textures are unsupported (depth {})",
-            metadata.depth
-        )));
-    }
     parsed.high_resolution_length.ok_or_else(|| {
         VtfError::unsupported(format!(
             "unsupported VTF image format {} ({})",
@@ -609,16 +740,29 @@ fn selected_image_range(
     for mip in (0..metadata.mip_count).rev() {
         let width = mip_dimension(metadata.width, mip);
         let height = mip_dimension(metadata.height, mip);
+        let depth = mip_dimension(metadata.depth, mip);
         let surface = checked_image_size(width, height, parsed.format)?
             .expect("known high-resolution storage");
         let level_length = surface
-            .checked_mul(usize::from(metadata.frames))
+            .checked_mul(
+                usize::try_from(depth)
+                    .map_err(|_| VtfError::invalid("VTF mip depth does not fit this platform"))?,
+            )
+            .and_then(|value| value.checked_mul(usize::from(metadata.frames)))
             .and_then(|value| value.checked_mul(usize::from(metadata.faces)))
             .ok_or_else(|| VtfError::invalid("VTF mip image range overflows"))?;
         if mip == selection.mip {
+            if u32::from(selection.slice) >= depth {
+                return Err(VtfError::invalid(format!(
+                    "VTF slice {} is out of range for mip {} depth {depth}",
+                    selection.slice, selection.mip
+                )));
+            }
             let image_index = usize::from(selection.frame)
                 .checked_mul(usize::from(metadata.faces))
                 .and_then(|value| value.checked_add(usize::from(selection.face)))
+                .and_then(|value| value.checked_mul(depth as usize))
+                .and_then(|value| value.checked_add(usize::from(selection.slice)))
                 .ok_or_else(|| VtfError::invalid("VTF selected image index overflows"))?;
             let selected_offset = offset
                 .checked_add(
@@ -654,7 +798,20 @@ fn rgba_length(width: u32, height: u32) -> Result<usize, VtfError> {
     Ok(length)
 }
 
-fn decode_uncompressed(format: ImageFormat, encoded: &[u8], pixels: &mut [u8]) {
+fn float_to_unorm8(value: f32) -> Result<u8, VtfError> {
+    if !value.is_finite() {
+        return Err(VtfError::invalid(
+            "VTF floating-point image contains a non-finite value",
+        ));
+    }
+    Ok((value.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn decode_uncompressed(
+    format: ImageFormat,
+    encoded: &[u8],
+    pixels: &mut [u8],
+) -> Result<(), VtfError> {
     match format {
         ImageFormat::Rgba8888 => pixels.copy_from_slice(encoded),
         ImageFormat::Abgr8888 => {
@@ -670,6 +827,39 @@ fn decode_uncompressed(format: ImageFormat, encoded: &[u8], pixels: &mut [u8]) {
         ImageFormat::Bgr888 => {
             for (source, output) in encoded.chunks_exact(3).zip(pixels.chunks_exact_mut(4)) {
                 output.copy_from_slice(&[source[2], source[1], source[0], 255]);
+            }
+        }
+        ImageFormat::Rgb565 => {
+            for (source, output) in encoded.chunks_exact(2).zip(pixels.chunks_exact_mut(4)) {
+                let value = u16::from_le_bytes([source[0], source[1]]);
+                let red = value & 0x1f;
+                let green = (value >> 5) & 0x3f;
+                let blue = (value >> 11) & 0x1f;
+                output.copy_from_slice(&[
+                    ((red << 3) | (red >> 2)) as u8,
+                    ((green << 2) | (green >> 4)) as u8,
+                    ((blue << 3) | (blue >> 2)) as u8,
+                    255,
+                ]);
+            }
+        }
+        ImageFormat::Rgb888BlueScreen | ImageFormat::Bgr888BlueScreen => {
+            for (source, output) in encoded.chunks_exact(3).zip(pixels.chunks_exact_mut(4)) {
+                let rgb = if format == ImageFormat::Rgb888BlueScreen {
+                    [source[0], source[1], source[2]]
+                } else {
+                    [source[2], source[1], source[0]]
+                };
+                if rgb == [0, 0, 255] {
+                    output.fill(0);
+                } else {
+                    output.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+            }
+        }
+        ImageFormat::Argb8888 => {
+            for (source, output) in encoded.chunks_exact(4).zip(pixels.chunks_exact_mut(4)) {
+                output.copy_from_slice(&[source[1], source[2], source[3], source[0]]);
             }
         }
         ImageFormat::Bgra8888 => {
@@ -689,10 +879,144 @@ fn decode_uncompressed(format: ImageFormat, encoded: &[u8], pixels: &mut [u8]) {
         }
         ImageFormat::A8 => {
             for (&alpha, output) in encoded.iter().zip(pixels.chunks_exact_mut(4)) {
-                output.copy_from_slice(&[255, 255, 255, alpha]);
+                output.fill(alpha);
+            }
+        }
+        ImageFormat::Bgrx8888 => {
+            for (source, output) in encoded.chunks_exact(4).zip(pixels.chunks_exact_mut(4)) {
+                output.copy_from_slice(&[source[2], source[1], source[0], 255]);
+            }
+        }
+        ImageFormat::Bgr565
+        | ImageFormat::Bgrx5551
+        | ImageFormat::Bgra5551
+        | ImageFormat::Bgra4444 => {
+            for (source, output) in encoded.chunks_exact(2).zip(pixels.chunks_exact_mut(4)) {
+                let value = u16::from_le_bytes([source[0], source[1]]);
+                let (red, green, blue, alpha) = match format {
+                    ImageFormat::Bgr565 => {
+                        ((value >> 11) & 0x1f, (value >> 5) & 0x3f, value & 0x1f, 255)
+                    }
+                    ImageFormat::Bgrx5551 => {
+                        ((value >> 10) & 0x1f, (value >> 5) & 0x1f, value & 0x1f, 255)
+                    }
+                    ImageFormat::Bgra5551 => (
+                        (value >> 10) & 0x1f,
+                        (value >> 5) & 0x1f,
+                        value & 0x1f,
+                        if value & 0x8000 != 0 { 255 } else { 0 },
+                    ),
+                    ImageFormat::Bgra4444 => {
+                        output.copy_from_slice(&[
+                            ((value >> 8) & 0x0f) as u8 * 16,
+                            ((value >> 4) & 0x0f) as u8 * 16,
+                            (value & 0x0f) as u8 * 16,
+                            ((value >> 12) & 0x0f) as u8 * 16,
+                        ]);
+                        continue;
+                    }
+                    _ => unreachable!(),
+                };
+                let expand_five = |channel: u16| ((channel << 3) | (channel >> 2)) as u8;
+                output.copy_from_slice(&[
+                    expand_five(red),
+                    if format == ImageFormat::Bgr565 {
+                        ((green << 2) | (green >> 4)) as u8
+                    } else {
+                        expand_five(green)
+                    },
+                    expand_five(blue),
+                    alpha as u8,
+                ]);
+            }
+        }
+        ImageFormat::Uv88 => {
+            for (source, output) in encoded.chunks_exact(2).zip(pixels.chunks_exact_mut(4)) {
+                output.copy_from_slice(&[source[0], source[1], 0, 0]);
+            }
+        }
+        ImageFormat::Uvwq8888 | ImageFormat::Uvlx8888 => {
+            pixels.copy_from_slice(encoded);
+        }
+        ImageFormat::Rgba16161616 => {
+            for (source, output) in encoded.chunks_exact(8).zip(pixels.chunks_exact_mut(4)) {
+                let channel = |offset| u16::from_le_bytes([source[offset], source[offset + 1]]);
+                output.copy_from_slice(&[
+                    (channel(0) >> 4).min(255) as u8,
+                    (channel(2) >> 4).min(255) as u8,
+                    (channel(4) >> 4).min(255) as u8,
+                    (channel(6) >> 8).min(255) as u8,
+                ]);
+            }
+        }
+        ImageFormat::Rgba16161616F => {
+            for (source, output) in encoded.chunks_exact(8).zip(pixels.chunks_exact_mut(4)) {
+                for channel in 0..4 {
+                    output[channel] = float_to_unorm8(
+                        half::f16::from_bits(u16::from_le_bytes([
+                            source[channel * 2],
+                            source[channel * 2 + 1],
+                        ]))
+                        .to_f32(),
+                    )?;
+                }
+            }
+        }
+        ImageFormat::R32F | ImageFormat::Rgb323232F | ImageFormat::Rgba32323232F => {
+            let channels = match format {
+                ImageFormat::R32F => 1,
+                ImageFormat::Rgb323232F => 3,
+                ImageFormat::Rgba32323232F => 4,
+                _ => unreachable!(),
+            };
+            for (source, output) in encoded
+                .chunks_exact(channels * 4)
+                .zip(pixels.chunks_exact_mut(4))
+            {
+                output.fill(0);
+                output[3] = 255;
+                for channel in 0..channels {
+                    output[channel] = float_to_unorm8(f32::from_le_bytes(
+                        source[channel * 4..channel * 4 + 4].try_into().unwrap(),
+                    ))?;
+                }
             }
         }
         _ => unreachable!("unsupported uncompressed VTF format"),
+    }
+    Ok(())
+}
+
+fn decode_bc_alpha_block(block: &[u8]) -> [u8; 16] {
+    let palette = alpha_palette_dxt5(block);
+    let bits = u64::from_le_bytes([
+        block[2], block[3], block[4], block[5], block[6], block[7], 0, 0,
+    ]);
+    std::array::from_fn(|index| palette[((bits >> (index * 3)) & 7) as usize])
+}
+
+fn decode_ati(format: ImageFormat, encoded: &[u8], width: u32, height: u32, pixels: &mut [u8]) {
+    let block_size = if format == ImageFormat::Ati2N { 16 } else { 8 };
+    let blocks_wide = width.div_ceil(4) as usize;
+    for (block_index, block) in encoded.chunks_exact(block_size).enumerate() {
+        let block_x = block_index % blocks_wide;
+        let block_y = block_index / blocks_wide;
+        let red = decode_bc_alpha_block(&block[0..8]);
+        let green = (format == ImageFormat::Ati2N).then(|| decode_bc_alpha_block(&block[8..16]));
+        for texel in 0..16 {
+            let x = block_x * 4 + texel % 4;
+            let y = block_y * 4 + texel / 4;
+            if x >= width as usize || y >= height as usize {
+                continue;
+            }
+            let output = (y * width as usize + x) * 4;
+            pixels[output..output + 4].copy_from_slice(&[
+                red[texel],
+                green.as_ref().map_or(0, |values| values[texel]),
+                0,
+                0,
+            ]);
+        }
     }
 }
 
@@ -827,7 +1151,10 @@ pub fn decode_vtf(data: &[u8], selection: VtfImageSelection) -> Result<DecodedVt
         | ImageFormat::Dxt1OneBitAlpha
         | ImageFormat::Dxt3
         | ImageFormat::Dxt5 => decode_dxt(parsed.format, encoded, width, height, &mut pixels),
-        _ => decode_uncompressed(parsed.format, encoded, &mut pixels),
+        ImageFormat::Ati2N | ImageFormat::Ati1N => {
+            decode_ati(parsed.format, encoded, width, height, &mut pixels)
+        }
+        _ => decode_uncompressed(parsed.format, encoded, &mut pixels)?,
     }
     Ok(DecodedVtf {
         metadata: parsed.metadata,

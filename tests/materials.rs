@@ -1,6 +1,7 @@
+use base64::Engine;
 use bsp_to_glb::{
     MaterialResolver, MaterialResourceProvenance, PakResourceKind, ResolvedMaterialResource,
-    build_source_material_manifest, parse_vmt, read_bsp_pak_resources,
+    build_source_material_manifest, parse_vmt, read_bsp_pak_archive, read_bsp_pak_resources,
 };
 use serde_json::to_value;
 use sha2::{Digest, Sha256};
@@ -16,23 +17,95 @@ fn put_i32(data: &mut [u8], offset: usize, value: i32) {
 }
 
 fn bsp_with_pak(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    bsp_with_pak_method(entries, CompressionMethod::Stored)
+}
+
+fn bsp_with_pak_method(entries: &[(&str, &[u8])], method: CompressionMethod) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(method);
     for (path, data) in entries {
         writer.start_file(path, options).unwrap();
         writer.write_all(data).unwrap();
     }
     let pak = writer.finish().unwrap().into_inner();
+    bsp_from_pak(&pak)
+}
 
+fn bsp_from_pak(pak: &[u8]) -> Vec<u8> {
     let mut bsp = vec![0; HEADER_SIZE];
     bsp[0..4].copy_from_slice(b"VBSP");
     put_i32(&mut bsp, 4, 20);
     let offset = bsp.len();
-    bsp.extend_from_slice(&pak);
+    bsp.extend_from_slice(pak);
     let header = 8 + 40 * 16;
     put_i32(&mut bsp, header, offset as i32);
     put_i32(&mut bsp, header + 4, pak.len() as i32);
     bsp
+}
+
+#[test]
+fn reads_source_lzma_compressed_pak_entries() {
+    let pak = base64::engine::general_purpose::STANDARD
+        .decode("UEsDBD8AAgAOAAMH71xvuBdAcAAAAEYnAAAZAAAAbWF0ZXJpYWxzL2N1c3RvbS9sem1hLnZtdBkBBQBdADAAAAAmGkjmqBbVLfh2yuGfXitYO9COqNLRK/C3u+EbJmR7Xr+n/6vBSM9/FLQWgfglB5lXQfM8r6/n64klaa97MblpoyYkZDloX98EqApmls6uKVFQzApT8y2Ix2ihKPjnGaH///qrTABQSwECPwA/AAIADgADB+9cb7gXQHAAAABGJwAAGQAkAAAAAAAAAIAAAAAAAAAAbWF0ZXJpYWxzL2N1c3RvbS9sem1hLnZtdAoAIAAAAAAAAQAYAApbmuWgE90BAAAAAAAAAAAAAAAAAAAAAFBLBQYAAAAAAQABAGsAAACnAAAAAAA=")
+        .unwrap();
+    let bsp = bsp_from_pak(&pak);
+
+    let resources = read_bsp_pak_resources(&bsp).unwrap();
+
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].path, "materials/custom/lzma.vmt");
+    assert!(resources[0].data.starts_with(b"LightmappedGeneric"));
+}
+
+#[test]
+fn rejects_zip_methods_outside_the_tf2_pak_contract() {
+    let bsp = bsp_with_pak_method(
+        &[("materials/custom/deflate.vmt", b"LightmappedGeneric {}")],
+        CompressionMethod::Deflated,
+    );
+
+    let error = read_bsp_pak_resources(&bsp).unwrap_err();
+
+    assert!(error.contains("method 8"), "unexpected error: {error}");
+    assert!(error.contains("unsupported"), "unexpected error: {error}");
+}
+
+#[test]
+fn rejects_case_ambiguous_paths_across_the_complete_pak() {
+    let bsp = bsp_with_pak(&[
+        ("models/props_test/crate.mdl", b"first"),
+        ("MODELS/PROPS_TEST/CRATE.MDL", b"second"),
+    ]);
+
+    let error = read_bsp_pak_archive(&bsp).unwrap_err();
+
+    assert!(error.contains("ambiguous"), "unexpected error: {error}");
+}
+
+#[test]
+fn rejects_truncated_and_crc_corrupt_pak_entries() {
+    let mut corrupt = bsp_with_pak(&[("materials/custom/crc.vmt", b"unique-payload")]);
+    let payload = corrupt
+        .windows(b"unique-payload".len())
+        .position(|window| window == b"unique-payload")
+        .unwrap();
+    corrupt[payload] ^= 0xff;
+    let error = read_bsp_pak_archive(&corrupt).unwrap_err();
+    assert!(
+        error.to_ascii_lowercase().contains("checksum")
+            || error.to_ascii_lowercase().contains("crc"),
+        "unexpected error: {error}"
+    );
+
+    let mut truncated = bsp_with_pak(&[("materials/custom/truncated.vmt", b"payload")]);
+    truncated.truncate(truncated.len() - 8);
+    let error = read_bsp_pak_archive(&truncated).unwrap_err();
+    assert!(
+        error.to_ascii_lowercase().contains("bounds")
+            || error.to_ascii_lowercase().contains("invalid")
+            || error.to_ascii_lowercase().contains("extends"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -94,8 +167,40 @@ fn parses_supported_vmt_shader_inputs_and_limitations() {
     assert!(!material.features.unlit);
     assert_eq!(material.surface_prop.as_deref(), Some("Concrete"));
     assert_eq!(material.unsupported.proxies, ["AnimatedTexture"]);
+    assert_eq!(material.proxy_definitions.len(), 1);
+    assert_eq!(material.proxy_definitions[0].name, "AnimatedTexture");
+    assert_eq!(
+        material.proxy_definitions[0].parameters[0].key,
+        "animatedtexturevar"
+    );
+    assert_eq!(
+        material.proxy_definitions[0].parameters[0].value,
+        "$basetexture"
+    );
     assert!(material.unsupported.animated);
     assert_eq!(material.shader.inputs["$basetexture"], "Brick\\Wall_A");
+}
+
+#[test]
+fn classifies_source_normalmap_as_the_bump_texture_role() {
+    let material = parse_vmt(
+        br#"Water {
+            "$normalmap" "water/tfwater001_normal"
+            "$bumpmap" "water/preferred_if_both_are_present"
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        material.textures.bump_map.as_deref(),
+        Some("water/preferred_if_both_are_present")
+    );
+
+    let material = parse_vmt(br#"Refract { "$normalmap" "effects/warp_normal" }"#).unwrap();
+    assert_eq!(
+        material.textures.bump_map.as_deref(),
+        Some("effects/warp_normal")
+    );
+    assert!(material.features.bump);
 }
 
 #[test]
@@ -273,13 +378,18 @@ fn exposes_only_embedded_material_resources_with_original_paths() {
 }
 
 #[test]
-fn rejects_parent_traversal_in_pak_paths() {
+fn preserves_unsafe_pak_paths_as_inert_without_exposing_them_as_resources() {
     let bsp = bsp_with_pak(&[("materials/safe/../../escape.vmt", b"LightmappedGeneric {}")]);
-    let error = read_bsp_pak_resources(&bsp).unwrap_err();
-    assert!(
-        error.contains("unsafe PAK path"),
-        "unexpected error: {error}"
+    let archive = read_bsp_pak_archive(&bsp).unwrap();
+
+    assert_eq!(archive.manifest.coverage.inert, 1);
+    assert_eq!(archive.manifest.coverage.handled, 0);
+    assert_eq!(archive.manifest.entries[0].status, "inert");
+    assert_eq!(
+        archive.manifest.entries[0].reason.as_deref(),
+        Some("unsafeArchivePath")
     );
+    assert!(read_bsp_pak_resources(&bsp).unwrap().is_empty());
 }
 
 struct FixtureResolver {

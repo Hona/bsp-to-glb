@@ -316,7 +316,7 @@ fn bsp_with_oriented_side_one_face() -> Vec<u8> {
 
 fn append_pak(bsp: &mut Vec<u8>, entries: &[(&str, &[u8])]) {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     for (path, data) in entries {
         writer.start_file(path, options).unwrap();
         writer.write_all(data).unwrap();

@@ -3,9 +3,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Cursor, Read};
 
-const MAX_PAK_ENTRIES: usize = 65_535;
 const MAX_VMT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_VMT_TOKENS: usize = 262_144;
 const MAX_VMT_NESTING: usize = 64;
@@ -14,7 +12,9 @@ const MAX_VTF_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_MATERIAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub const MATERIAL_MANIFEST_VERSION: u32 = 3;
-pub const MATERIAL_TEXTURE_MANIFEST_VERSION: u32 = 1;
+pub const MATERIAL_TEXTURE_MANIFEST_VERSION: u32 = 2;
+const MAX_PACKAGED_VTF_FRAMES: u16 = 256;
+const MAX_PACKAGED_VTF_DECODED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,6 +99,20 @@ pub struct UnsupportedMaterialFeatures {
     pub animated: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmtProxyParameter {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmtProxyDefinition {
+    pub name: String,
+    pub parameters: Vec<VmtProxyParameter>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmtMaterial {
@@ -107,6 +121,7 @@ pub struct VmtMaterial {
     pub features: VmtFeatures,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface_prop: Option<String>,
+    pub proxy_definitions: Vec<VmtProxyDefinition>,
     pub unsupported: UnsupportedMaterialFeatures,
 }
 
@@ -230,6 +245,8 @@ pub struct MaterialTextureSource {
     pub metadata: Option<VtfMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<MaterialTextureOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub frame_outputs: Vec<MaterialTextureOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -579,22 +596,44 @@ fn material_from_document(document: ParsedVmt) -> Result<VmtMaterial, String> {
                 .or_insert_with(|| value.clone());
         }
     }
-    let proxies = values
+    let proxy_definitions = values
         .iter()
         .filter(|(key, _)| key.eq_ignore_ascii_case("Proxies"))
         .filter_map(|(_, value)| match value {
             KvValue::Object(values) => Some(values),
             KvValue::String(_) => None,
         })
-        .flat_map(|values| values.iter().map(|(name, _)| name.clone()))
+        .flat_map(|values| {
+            values.iter().map(|(name, value)| VmtProxyDefinition {
+                name: name.clone(),
+                parameters: match value {
+                    KvValue::Object(parameters) => parameters
+                        .iter()
+                        .filter_map(|(key, value)| match value {
+                            KvValue::String(value) => Some(VmtProxyParameter {
+                                key: key.clone(),
+                                value: value.clone(),
+                            }),
+                            KvValue::Object(_) => None,
+                        })
+                        .collect(),
+                    KvValue::String(_) => Vec::new(),
+                },
+            })
+        })
         .collect::<Vec<_>>();
-    let animated = proxies.iter().any(|proxy| {
-        let proxy = proxy.to_ascii_lowercase();
+    let proxies = proxy_definitions
+        .iter()
+        .map(|definition| definition.name.clone())
+        .collect::<Vec<_>>();
+    let animated = proxy_definitions.iter().any(|definition| {
+        let proxy = definition.name.to_ascii_lowercase();
         proxy.contains("animated") || proxy.contains("texturetoggle")
     });
     let textures = VmtTextureInputs {
         base_texture: texture_input(&values, "$basetexture"),
-        bump_map: texture_input(&values, "$bumpmap"),
+        bump_map: texture_input(&values, "$bumpmap")
+            .or_else(|| texture_input(&values, "$normalmap")),
         detail: texture_input(&values, "$detail"),
         env_map: texture_input(&values, "$envmap"),
     };
@@ -622,6 +661,7 @@ fn material_from_document(document: ParsedVmt) -> Result<VmtMaterial, String> {
         textures,
         features,
         surface_prop: string_input(&values, "$surfaceprop").map(str::to_owned),
+        proxy_definitions,
         unsupported: UnsupportedMaterialFeatures { proxies, animated },
     })
 }
@@ -631,23 +671,7 @@ pub fn parse_vmt(data: &[u8]) -> Result<VmtMaterial, String> {
 }
 
 fn normalize_archive_path(path: &str) -> Result<String, String> {
-    if path.contains('\0') || path.starts_with('/') || path.starts_with('\\') {
-        return Err(format!("unsafe PAK path {path:?}"));
-    }
-    let path = path.replace('\\', "/");
-    let mut output = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => return Err(format!("unsafe PAK path {path:?}")),
-            part if part.contains(':') => return Err(format!("unsafe PAK path {path:?}")),
-            part => output.push(part),
-        }
-    }
-    if output.is_empty() {
-        return Err(format!("unsafe PAK path {path:?}"));
-    }
-    Ok(output.join("/"))
+    crate::bsp_pak::normalize_archive_path(path)
 }
 
 fn resource_kind(path: &str) -> Option<PakResourceKind> {
@@ -665,28 +689,14 @@ fn resource_kind(path: &str) -> Option<PakResourceKind> {
 }
 
 fn parse_pak(data: &[u8]) -> Result<Vec<PakResource>, String> {
-    if data.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut archive = zip::ZipArchive::new(Cursor::new(data))
-        .map_err(|error| format!("invalid BSP PAK ZIP: {error}"))?;
-    if archive.len() > MAX_PAK_ENTRIES {
-        return Err(format!(
-            "BSP PAK has {} entries; limit is {MAX_PAK_ENTRIES}",
-            archive.len()
-        ));
-    }
+    let archive = crate::bsp_pak::read_pak_archive(data)?;
     let mut resources = Vec::new();
-    let mut paths = HashMap::new();
     let mut total_size = 0_u64;
-    for index in 0..archive.len() {
-        let mut file = archive
-            .by_index(index)
-            .map_err(|error| format!("failed to read BSP PAK entry {index}: {error}"))?;
-        if file.is_dir() {
+    for entry in archive.entries {
+        if entry.metadata.status != "handled" {
             continue;
         }
-        let path = normalize_archive_path(file.name())?;
+        let path = entry.metadata.path;
         let Some(kind) = resource_kind(&path) else {
             continue;
         };
@@ -694,44 +704,24 @@ fn parse_pak(data: &[u8]) -> Result<Vec<PakResource>, String> {
             PakResourceKind::Vmt => MAX_VMT_BYTES,
             PakResourceKind::Vtf => MAX_VTF_BYTES,
         };
-        if file.size() > size_limit {
+        if entry.data.len() as u64 > size_limit {
             return Err(format!(
                 "BSP PAK resource {path:?} declares {} bytes; limit is {size_limit}",
-                file.size()
+                entry.data.len()
             ));
         }
         total_size = total_size
-            .checked_add(file.size())
+            .checked_add(entry.data.len() as u64)
             .ok_or_else(|| "BSP PAK material resource size overflows".to_owned())?;
         if total_size > MAX_TOTAL_MATERIAL_BYTES {
             return Err(format!(
                 "BSP PAK material resources exceed the {MAX_TOTAL_MATERIAL_BYTES}-byte limit"
             ));
         }
-        let lookup_key = path.to_ascii_lowercase();
-        if let Some(existing) = paths.insert(lookup_key, path.clone()) {
-            return Err(format!(
-                "BSP PAK has ambiguous duplicate material paths {existing:?} and {path:?}"
-            ));
-        }
-        let capacity = usize::try_from(file.size())
-            .map_err(|_| format!("BSP PAK resource {path:?} is too large for this platform"))?;
-        let mut output = Vec::with_capacity(capacity);
-        file.by_ref()
-            .take(size_limit + 1)
-            .read_to_end(&mut output)
-            .map_err(|error| format!("failed to decompress BSP PAK resource {path:?}: {error}"))?;
-        if output.len() as u64 != file.size() {
-            return Err(format!(
-                "BSP PAK resource {path:?} decoded to {} bytes, expected {}",
-                output.len(),
-                file.size()
-            ));
-        }
         resources.push(PakResource {
             path,
             kind,
-            data: output,
+            data: entry.data,
         });
     }
     Ok(resources)
@@ -744,6 +734,7 @@ pub fn read_bsp_pak_resources(data: &[u8]) -> Result<Vec<PakResource>, String> {
 
 fn source_lookup_path(reference: &str, extension: &str) -> Result<String, String> {
     let mut reference = reference.trim().replace('\\', "/");
+    reference = reference.trim_start_matches('/').to_owned();
     if reference
         .get(..10)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("materials/"))
@@ -1011,51 +1002,117 @@ impl TexturePackageBuilder {
         provenance: ResourceProvenance,
         data: &[u8],
     ) -> Result<usize, String> {
-        let (status, metadata, output, error) = match decode_vtf(data, self.selection) {
-            Ok(decoded) => {
-                let pixel_key = rgba_pixel_key(decoded.width, decoded.height, &decoded.pixels);
-                let output = if let Some(index) = self.artifact_by_pixels.get(&pixel_key) {
-                    self.outputs[*index].clone()
+        let metadata = inspect_vtf(data);
+        let (status, metadata, output, frame_outputs, error) = match metadata {
+            Ok(metadata) if metadata.frames > MAX_PACKAGED_VTF_FRAMES => (
+                TextureDecodeStatus::Unsupported,
+                Some(metadata.clone()),
+                None,
+                Vec::new(),
+                Some(format!(
+                    "VTF has {} frames; package limit is {MAX_PACKAGED_VTF_FRAMES}",
+                    metadata.frames
+                )),
+            ),
+            Ok(metadata) if self.selection.frame >= metadata.frames => (
+                TextureDecodeStatus::Invalid,
+                Some(metadata),
+                None,
+                Vec::new(),
+                Some(format!(
+                    "VTF frame {} is out of range",
+                    self.selection.frame
+                )),
+            ),
+            Ok(metadata) => {
+                let width = metadata
+                    .width
+                    .checked_shr(u32::from(self.selection.mip))
+                    .unwrap_or(0)
+                    .max(1) as usize;
+                let height = metadata
+                    .height
+                    .checked_shr(u32::from(self.selection.mip))
+                    .unwrap_or(0)
+                    .max(1) as usize;
+                let decoded_bytes = width
+                    .checked_mul(height)
+                    .and_then(|value| value.checked_mul(4))
+                    .and_then(|value| value.checked_mul(usize::from(metadata.frames)));
+                if decoded_bytes.is_none_or(|value| value > MAX_PACKAGED_VTF_DECODED_BYTES) {
+                    (
+                        TextureDecodeStatus::Unsupported,
+                        Some(metadata),
+                        None,
+                        Vec::new(),
+                        Some(format!(
+                            "VTF animated RGBA output exceeds the {MAX_PACKAGED_VTF_DECODED_BYTES}-byte package limit"
+                        )),
+                    )
                 } else {
-                    let png = encode_rgba_png(decoded.width, decoded.height, &decoded.pixels)?;
-                    let content_id = sha256_content_id(&png);
-                    let digest = content_id
-                        .strip_prefix("sha256:")
-                        .expect("RGBA content IDs use SHA-256");
-                    let file_name = format!("sha256-{digest}.png");
-                    let output = MaterialTextureOutput {
-                        content_id: content_id.clone(),
-                        file_name: file_name.clone(),
-                        width: decoded.width,
-                        height: decoded.height,
-                        byte_length: png.len(),
-                    };
-                    let index = self.artifacts.len();
-                    self.artifact_by_pixels.insert(pixel_key, index);
-                    self.outputs.push(output.clone());
-                    self.artifacts.push(MaterialTextureArtifact {
-                        content_id,
-                        file_name,
-                        width: decoded.width,
-                        height: decoded.height,
-                        png,
-                    });
-                    output
-                };
-                (
-                    TextureDecodeStatus::Decoded,
-                    Some(decoded.metadata),
-                    Some(output),
-                    None,
-                )
+                    let decoded = (0..metadata.frames)
+                        .map(|frame| {
+                            decode_vtf(
+                                data,
+                                VtfImageSelection {
+                                    frame,
+                                    ..self.selection
+                                },
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>();
+                    match decoded {
+                        Ok(decoded) => {
+                            let frame_outputs = decoded
+                                .into_iter()
+                                .map(|decoded| self.add_decoded_output(decoded))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let output = frame_outputs
+                                .get(usize::from(self.selection.frame))
+                                .cloned();
+                            if output.is_none() {
+                                (
+                                    TextureDecodeStatus::Invalid,
+                                    Some(metadata),
+                                    None,
+                                    Vec::new(),
+                                    Some(format!(
+                                        "VTF frame {} is out of range",
+                                        self.selection.frame
+                                    )),
+                                )
+                            } else {
+                                (
+                                    TextureDecodeStatus::Decoded,
+                                    Some(metadata),
+                                    output,
+                                    frame_outputs,
+                                    None,
+                                )
+                            }
+                        }
+                        Err(decode_error) => {
+                            let status = match decode_error.kind {
+                                VtfErrorKind::Invalid => TextureDecodeStatus::Invalid,
+                                VtfErrorKind::Unsupported => TextureDecodeStatus::Unsupported,
+                            };
+                            (
+                                status,
+                                Some(metadata),
+                                None,
+                                Vec::new(),
+                                Some(decode_error.message),
+                            )
+                        }
+                    }
+                }
             }
             Err(decode_error) => {
-                let metadata = inspect_vtf(data).ok();
                 let status = match decode_error.kind {
                     VtfErrorKind::Invalid => TextureDecodeStatus::Invalid,
                     VtfErrorKind::Unsupported => TextureDecodeStatus::Unsupported,
                 };
-                (status, metadata, None, Some(decode_error.message))
+                (status, None, None, Vec::new(), Some(decode_error.message))
             }
         };
         let index = self.sources.len();
@@ -1067,9 +1124,44 @@ impl TexturePackageBuilder {
             status,
             metadata,
             output,
+            frame_outputs,
             error,
         });
         Ok(index)
+    }
+
+    fn add_decoded_output(
+        &mut self,
+        decoded: crate::vtf::DecodedVtf,
+    ) -> Result<MaterialTextureOutput, String> {
+        let pixel_key = rgba_pixel_key(decoded.width, decoded.height, &decoded.pixels);
+        if let Some(index) = self.artifact_by_pixels.get(&pixel_key) {
+            return Ok(self.outputs[*index].clone());
+        }
+        let png = encode_rgba_png(decoded.width, decoded.height, &decoded.pixels)?;
+        let content_id = sha256_content_id(&png);
+        let digest = content_id
+            .strip_prefix("sha256:")
+            .expect("RGBA content IDs use SHA-256");
+        let file_name = format!("sha256-{digest}.png");
+        let output = MaterialTextureOutput {
+            content_id: content_id.clone(),
+            file_name: file_name.clone(),
+            width: decoded.width,
+            height: decoded.height,
+            byte_length: png.len(),
+        };
+        let index = self.artifacts.len();
+        self.artifact_by_pixels.insert(pixel_key, index);
+        self.outputs.push(output.clone());
+        self.artifacts.push(MaterialTextureArtifact {
+            content_id,
+            file_name,
+            width: decoded.width,
+            height: decoded.height,
+            png,
+        });
+        Ok(output)
     }
 
     fn finish(self) -> (MaterialTextureManifest, Vec<MaterialTextureArtifact>) {

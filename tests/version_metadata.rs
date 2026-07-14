@@ -54,6 +54,7 @@ fn version_json_is_stable_machine_readable_build_metadata() {
     assert_eq!(metadata["capabilities"]["displacements"], "supported");
     assert_eq!(metadata["capabilities"]["directLightmaps"], "supported");
     assert_eq!(metadata["capabilities"]["materialResolution"], "supported");
+    assert_eq!(metadata["capabilities"]["bspPakArchive"], "supported");
     assert_eq!(metadata["capabilities"]["vtfPixelConversion"], "supported");
     assert_eq!(metadata["capabilities"]["visibility"], "supported");
     assert_eq!(metadata["capabilities"]["entityGraph"], "supported");
@@ -63,7 +64,8 @@ fn version_json_is_stable_machine_readable_build_metadata() {
     );
     assert_eq!(metadata["components"]["materialManifest"], 3);
     assert_eq!(metadata["components"]["materialMountPlan"], 1);
-    assert_eq!(metadata["components"]["materialTextures"], 1);
+    assert_eq!(metadata["components"]["materialTextures"], 2);
+    assert_eq!(metadata["components"]["bspPak"], 1);
     assert_eq!(metadata["components"]["visibilitySidecar"], 2);
     assert_eq!(metadata["components"]["entityGraph"], 1);
     assert_eq!(metadata["components"]["staticPhysics"], 1);

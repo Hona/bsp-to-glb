@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 
+mod bsp_pak;
 mod collision;
 mod entities;
 mod material_resolver;
@@ -11,6 +12,10 @@ pub mod phy;
 pub mod static_physics;
 mod vtf;
 
+pub use bsp_pak::{
+    BSP_PAK_MANIFEST_VERSION, BspPakArchive, BspPakCoverage, BspPakEntry, BspPakEntryMetadata,
+    BspPakManifest, BspPakMethodInventory, read_bsp_pak_archive, read_pak_archive,
+};
 pub use collision::{
     CollisionExportInput, CollisionExportResult, CollisionStats, StaticPropCollisionInput,
     export_collision_sidecar,
@@ -31,12 +36,13 @@ pub use materials::{
     MaterialTextureOutput, MaterialTextureSource, PakResource, PakResourceKind,
     ResolvedMaterialResource, ResourceProvenance, SourceMaterialEntry, SourceMaterialManifest,
     SourceMaterialPackage, TextureDecodeStatus, UnresolvedAsset, UnsupportedMaterialFeatures,
-    VmtFeatures, VmtMaterial, VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
-    build_source_material_package, parse_vmt, read_bsp_pak_resources,
+    VmtFeatures, VmtMaterial, VmtProxyDefinition, VmtProxyParameter, VmtShaderMetadata,
+    VmtTextureInputs, build_source_material_manifest, build_source_material_package, parse_vmt,
+    read_bsp_pak_resources,
 };
 pub use vtf::{
     DecodedVtf, VtfError, VtfErrorKind, VtfFormatMetadata, VtfImageSelection, VtfMetadata,
-    decode_vtf, inspect_vtf,
+    VtfResourceMetadata, decode_vtf, inspect_vtf, vtf_format_universe,
 };
 
 pub const BUILD_METADATA_SCHEMA_VERSION: u32 = 2;
@@ -58,6 +64,7 @@ pub struct BuildCapabilities {
     pub direct_lightmaps: BuildCapabilityStatus,
     pub material_metadata: BuildCapabilityStatus,
     pub material_resolution: BuildCapabilityStatus,
+    pub bsp_pak_archive: BuildCapabilityStatus,
     pub vtf_pixel_conversion: BuildCapabilityStatus,
     pub prop_metadata: BuildCapabilityStatus,
     pub prop_geometry: BuildCapabilityStatus,
@@ -76,6 +83,7 @@ pub struct BuildComponentVersions {
     pub material_manifest: u32,
     pub material_mount_plan: u32,
     pub material_textures: u32,
+    pub bsp_pak: u32,
     pub visibility_sidecar: u32,
     pub entity_graph: u32,
     pub static_physics: u32,
@@ -111,6 +119,7 @@ pub fn build_metadata() -> BuildMetadata {
             direct_lightmaps: BuildCapabilityStatus::Supported,
             material_metadata: BuildCapabilityStatus::Supported,
             material_resolution: BuildCapabilityStatus::Supported,
+            bsp_pak_archive: BuildCapabilityStatus::Supported,
             vtf_pixel_conversion: BuildCapabilityStatus::Supported,
             prop_metadata: BuildCapabilityStatus::Supported,
             prop_geometry: BuildCapabilityStatus::Unsupported,
@@ -126,6 +135,7 @@ pub fn build_metadata() -> BuildMetadata {
             material_manifest: MATERIAL_MANIFEST_VERSION,
             material_mount_plan: MATERIAL_MOUNT_PLAN_VERSION,
             material_textures: MATERIAL_TEXTURE_MANIFEST_VERSION,
+            bsp_pak: BSP_PAK_MANIFEST_VERSION,
             visibility_sidecar: VISIBILITY_SIDECAR_VERSION,
             entity_graph: ENTITY_GRAPH_VERSION,
             static_physics: static_physics::STATIC_PHYSICS_SCHEMA_VERSION,
