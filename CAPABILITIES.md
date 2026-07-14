@@ -12,6 +12,7 @@ as `build-metadata.json` in every archive.
 | Material and prop metadata | Supported |
 | Brush collision sidecars | Supported |
 | BSP plane/node traversal, leaf, cluster, and PVS visibility sidecars | Supported |
+| Ordered compiled entity graph and I/O connection sidecars | Supported |
 | Overlay, water-overlay, and cubemap detection | Detected only |
 | Static and dynamic prop model geometry | Unsupported |
 | VTF pixel conversion and content-addressed PNG packages | Supported |
@@ -27,6 +28,7 @@ as `build-metadata.json` in every archive.
 | Material mount plan | 1 |
 | Material texture manifest | 1 |
 | Visibility sidecar | 2 |
+| Entity graph sidecar | 1 |
 
 `detectedOnly` means the input is reported but no corresponding render geometry or texture output
 is produced. `unsupported` means callers must provide another implementation for that domain.

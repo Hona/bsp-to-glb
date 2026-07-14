@@ -4,7 +4,7 @@ use bsp_to_glb::{
     export_bsp_with_material_resolver_and_visibility,
     export_bsp_with_options_and_material_resolver,
     export_bsp_with_options_and_material_resolver_and_visibility, export_collision_sidecar,
-    static_prop_collision_inputs,
+    export_entity_graph, static_prop_collision_inputs,
 };
 use std::env;
 use std::fs;
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--collision-out <map.collision.json>] [--entities-out <map.entities.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -57,6 +57,7 @@ fn run() -> Result<(), String> {
     let mut bsp_path: Option<PathBuf> = None;
     let mut output_path: Option<PathBuf> = None;
     let mut collision_output_path: Option<PathBuf> = None;
+    let mut entity_output_path: Option<PathBuf> = None;
     let mut lightmap_path: Option<PathBuf> = None;
     let mut material_manifest_path: Option<PathBuf> = None;
     let mut material_mount_plan_path: Option<PathBuf> = None;
@@ -92,6 +93,7 @@ fn run() -> Result<(), String> {
             "--bsp" => bsp_path = Some(value.into()),
             "--out" => output_path = Some(value.into()),
             "--collision-out" => collision_output_path = Some(value.into()),
+            "--entities-out" => entity_output_path = Some(value.into()),
             "--lightmaps" => lightmap_path = Some(value.into()),
             "--material-manifest" => material_manifest_path = Some(value.into()),
             "--material-mount-plan" => material_mount_plan_path = Some(value.into()),
@@ -144,7 +146,7 @@ fn run() -> Result<(), String> {
         index += 2;
     }
     let bsp_path = bsp_path.ok_or_else(|| usage().to_owned())?;
-    if output_path.is_none() && collision_output_path.is_none() {
+    if output_path.is_none() && collision_output_path.is_none() && entity_output_path.is_none() {
         return Err(usage().to_owned());
     }
     if output_path.is_none() && visibility_path.is_some() {
@@ -182,6 +184,7 @@ fn run() -> Result<(), String> {
         .map(|resolver| resolver as &dyn MaterialResolver);
     let mut render_stats = None;
     let mut collision_stats = None;
+    let mut entity_stats = None;
     if let Some(output_path) = output_path {
         let mut result = if lightmaps.is_some() {
             if atlas_path.is_some() || manifest_path.is_some() {
@@ -298,12 +301,19 @@ fn run() -> Result<(), String> {
         write(&output_path, &result.json)?;
         collision_stats = Some(result.stats);
     }
-    let stats = match (&render_stats, &collision_stats) {
-        (Some(render), None) => serde_json::to_value(render),
-        (None, Some(collision)) => serde_json::to_value(collision),
+    if let Some(output_path) = entity_output_path {
+        let graph = export_entity_graph(&bsp)?;
+        write(&output_path, &graph.to_json()?)?;
+        entity_stats = Some(graph.inventory);
+    }
+    let stats = match (&render_stats, &collision_stats, &entity_stats) {
+        (Some(render), None, None) => serde_json::to_value(render),
+        (None, Some(collision), None) => serde_json::to_value(collision),
+        (None, None, Some(entities)) => serde_json::to_value(entities),
         _ => Ok(serde_json::json!({
             "render": render_stats,
-            "collision": collision_stats
+            "collision": collision_stats,
+            "entityGraph": entity_stats
         })),
     }
     .map_err(|error| format!("failed to serialize stats: {error}"))?;

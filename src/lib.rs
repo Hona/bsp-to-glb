@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 
 mod collision;
+mod entities;
 mod material_resolver;
 mod materials;
 mod vtf;
@@ -11,6 +12,12 @@ mod vtf;
 pub use collision::{
     CollisionExportInput, CollisionExportResult, CollisionStats, StaticPropCollisionInput,
     export_collision_sidecar,
+};
+pub use entities::{
+    CompiledEntity, ENTITY_GRAPH_VERSION, EntityConnection, EntityConnectionError, EntityGraph,
+    EntityGraphInventory, EntityKeyValue, MAX_ENTITIES, MAX_ENTITY_CONNECTIONS,
+    MAX_ENTITY_KEY_VALUES, MAX_ENTITY_KEY_VALUES_PER_ENTITY, MAX_ENTITY_LUMP_BYTES,
+    MAX_ENTITY_STRING_BYTES,
 };
 pub use material_resolver::{
     MATERIAL_MOUNT_PLAN_VERSION, MaterialResolverLimits, MountedMaterialResolver,
@@ -55,6 +62,7 @@ pub struct BuildCapabilities {
     pub brush_collision: BuildCapabilityStatus,
     pub decoded_physics_collision: BuildCapabilityStatus,
     pub visibility: BuildCapabilityStatus,
+    pub entity_graph: BuildCapabilityStatus,
     pub overlays: BuildCapabilityStatus,
     pub water_overlays: BuildCapabilityStatus,
     pub cubemaps: BuildCapabilityStatus,
@@ -67,6 +75,7 @@ pub struct BuildComponentVersions {
     pub material_mount_plan: u32,
     pub material_textures: u32,
     pub visibility_sidecar: u32,
+    pub entity_graph: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -105,6 +114,7 @@ pub fn build_metadata() -> BuildMetadata {
             brush_collision: BuildCapabilityStatus::Supported,
             decoded_physics_collision: BuildCapabilityStatus::Unsupported,
             visibility: BuildCapabilityStatus::Supported,
+            entity_graph: BuildCapabilityStatus::Supported,
             overlays: BuildCapabilityStatus::DetectedOnly,
             water_overlays: BuildCapabilityStatus::DetectedOnly,
             cubemaps: BuildCapabilityStatus::DetectedOnly,
@@ -114,6 +124,7 @@ pub fn build_metadata() -> BuildMetadata {
             material_mount_plan: MATERIAL_MOUNT_PLAN_VERSION,
             material_textures: MATERIAL_TEXTURE_MANIFEST_VERSION,
             visibility_sidecar: VISIBILITY_SIDECAR_VERSION,
+            entity_graph: ENTITY_GRAPH_VERSION,
         },
     }
 }
@@ -1911,7 +1922,13 @@ fn parse_material_names(
         .collect()
 }
 
-fn tokenize_entities(text: &str) -> Result<Vec<String>, String> {
+enum EntityToken {
+    Open,
+    Close,
+    Text(String),
+}
+
+fn tokenize_entities(text: &str) -> Result<Vec<EntityToken>, String> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -1928,7 +1945,11 @@ fn tokenize_entities(text: &str) -> Result<Vec<String>, String> {
             continue;
         }
         if bytes[index] == b'{' || bytes[index] == b'}' {
-            tokens.push((bytes[index] as char).to_string());
+            tokens.push(if bytes[index] == b'{' {
+                EntityToken::Open
+            } else {
+                EntityToken::Close
+            });
             index += 1;
             continue;
         }
@@ -1936,64 +1957,91 @@ fn tokenize_entities(text: &str) -> Result<Vec<String>, String> {
             return Err(format!("unexpected entity byte at offset {index}"));
         }
         index += 1;
-        let mut value = String::new();
-        let mut closed = false;
+        let start = index;
         while index < bytes.len() {
             match bytes[index] {
                 b'"' => {
-                    index += 1;
-                    closed = true;
                     break;
                 }
-                b'\\' if index + 1 < bytes.len() => {
-                    index += 1;
-                    value.push(bytes[index] as char);
-                    index += 1;
-                }
-                byte => {
-                    value.push(byte as char);
-                    index += 1;
-                }
+                0 => return Err(format!("entity string contains NUL at offset {index}")),
+                _ => index += 1,
             }
         }
-        if !closed {
+        if index == bytes.len() {
             return Err("unterminated entity string".to_owned());
         }
-        tokens.push(value);
+        let length = index - start;
+        if length > MAX_ENTITY_STRING_BYTES {
+            return Err(format!(
+                "entity string length {length} exceeds {MAX_ENTITY_STRING_BYTES} bytes"
+            ));
+        }
+        tokens.push(EntityToken::Text(text[start..index].to_owned()));
+        index += 1;
     }
     Ok(tokens)
 }
 
 fn parse_entities(data: &[u8]) -> Result<Vec<Entity>, String> {
-    let text = String::from_utf8_lossy(data);
-    let tokens = tokenize_entities(&text)?;
+    if data.len() > MAX_ENTITY_LUMP_BYTES {
+        return Err(format!(
+            "entity lump length {} exceeds {MAX_ENTITY_LUMP_BYTES} bytes",
+            data.len()
+        ));
+    }
+    let text = std::str::from_utf8(data)
+        .map_err(|error| format!("entity lump is not valid UTF-8: {error}"))?;
+    let tokens = tokenize_entities(text)?;
     let mut entities = Vec::new();
     let mut index = 0;
+    let mut key_value_count = 0;
     while index < tokens.len() {
-        if tokens[index] != "{" {
+        if !matches!(tokens[index], EntityToken::Open) {
             return Err(format!("expected entity opening brace at token {index}"));
         }
         index += 1;
         let mut entity = Vec::new();
-        while index < tokens.len() && tokens[index] != "}" {
-            let key = tokens[index].clone();
-            let value = tokens
-                .get(index + 1)
-                .ok_or_else(|| "entity key has no value".to_owned())?
-                .clone();
-            if value == "{" || value == "}" {
-                return Err("entity key has an invalid value".to_owned());
+        while index < tokens.len() && !matches!(tokens[index], EntityToken::Close) {
+            let EntityToken::Text(key) = &tokens[index] else {
+                return Err("entity key is not a quoted string".to_owned());
+            };
+            let Some(EntityToken::Text(value)) = tokens.get(index + 1) else {
+                return Err("entity key has no quoted value".to_owned());
+            };
+            key_value_count += 1;
+            if key_value_count > MAX_ENTITY_KEY_VALUES {
+                return Err(format!(
+                    "entity key/value count exceeds {MAX_ENTITY_KEY_VALUES}"
+                ));
             }
-            entity.push(EntityProperty { key, value });
+            if entity.len() == MAX_ENTITY_KEY_VALUES_PER_ENTITY {
+                return Err(format!(
+                    "entity {} key/value count exceeds {MAX_ENTITY_KEY_VALUES_PER_ENTITY}",
+                    entities.len()
+                ));
+            }
+            entity.push(EntityProperty {
+                key: key.clone(),
+                value: value.clone(),
+            });
             index += 2;
         }
-        if tokens.get(index).map(String::as_str) != Some("}") {
+        if !matches!(tokens.get(index), Some(EntityToken::Close)) {
             return Err("entity is missing its closing brace".to_owned());
         }
         index += 1;
         entities.push(entity);
+        if entities.len() > MAX_ENTITIES {
+            return Err(format!("entity count exceeds {MAX_ENTITIES}"));
+        }
     }
     Ok(entities)
+}
+
+pub fn export_entity_graph(data: &[u8]) -> Result<EntityGraph, String> {
+    let bsp = parse_bsp(data)?;
+    let entities = parse_entities(&bsp.lumps[LUMP_ENTITIES])?;
+    entities::build_entity_graph(bsp.version, &entities)
 }
 
 fn parse_game_lump_entries(bsp: &Bsp) -> Result<Vec<GameLumpEntry>, String> {

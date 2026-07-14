@@ -56,10 +56,12 @@ fn version_json_is_stable_machine_readable_build_metadata() {
     assert_eq!(metadata["capabilities"]["materialResolution"], "supported");
     assert_eq!(metadata["capabilities"]["vtfPixelConversion"], "supported");
     assert_eq!(metadata["capabilities"]["visibility"], "supported");
+    assert_eq!(metadata["capabilities"]["entityGraph"], "supported");
     assert_eq!(metadata["components"]["materialManifest"], 3);
     assert_eq!(metadata["components"]["materialMountPlan"], 1);
     assert_eq!(metadata["components"]["materialTextures"], 1);
     assert_eq!(metadata["components"]["visibilitySidecar"], 2);
+    assert_eq!(metadata["components"]["entityGraph"], 1);
     assert_eq!(metadata["capabilities"]["overlays"], "detectedOnly");
     assert_eq!(metadata["capabilities"]["propGeometry"], "unsupported");
     assert!(output.stderr.is_empty());

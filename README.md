@@ -64,6 +64,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - raw per-model PHYSCOLLIDE blocks and metadata (opaque, explicitly not decoded)
 - LZMA-compressed BSP lumps
 - exact BSP-tree leaf/cluster/PVS visibility sidecars with GLB chunk ownership
+- versioned compiled entity graphs with ordered raw key/value pairs and parsed I/O connections
 
 Unsupported domains are detected or reported explicitly:
 
@@ -162,7 +163,7 @@ bsp-to-glb --version-json
 Build-metadata schema version 2 includes package version, build target/profile, release source
 commit, supported/detected-only/unsupported capability states, and serialized component versions.
 The current component versions are material manifest 3, material mount plan 1, material textures 1,
-and visibility sidecar 2.
+visibility sidecar 2, and entity graph 1.
 
 ```bash
 bsp-to-glb \
@@ -176,6 +177,7 @@ bsp-to-glb \
   --texture-output path/to/textures \
   --texture-manifest path/to/textures/manifest.json \
   --collision-out path/to/map.collision.json \
+  --entities-out path/to/map.entities.json \
   --props-out path/to/props.json \
   --visibility-out path/to/map.visibility.json
 ```
@@ -260,9 +262,10 @@ case-insensitive duplicate paths, oversized entries and malformed ZIP data, and 
 entry and decompression limits. VTF files, encoded image ranges and decoded RGBA output are each
 bounded to 256 MiB; dimensions are bounded to 16,384 and resource dictionaries to 4,096 entries.
 
-`--out` and `--collision-out` are independently optional, but at least one is required. A
-collision-only export does not parse or triangulate render faces. Material, prop, lightmap and
-visibility outputs require `--out`; visibility references the emitted GLB chunk indices.
+`--out`, `--collision-out`, and `--entities-out` are independently optional, but at least one is
+required. Collision-only and entity-only exports do not parse or triangulate render faces.
+Material, prop, lightmap and visibility outputs require `--out`; visibility references the emitted
+GLB chunk indices.
 
 ## Collision Sidecar
 
@@ -304,6 +307,43 @@ plane distance and otherwise selects child 0. Export is bounded to 65,536 planes
 and 4,096 tree levels, and rejects non-finite planes, inverted leaf bounds, invalid references,
 cycles, and unsupported relevant lump versions.
 
+## Entity Graph Sidecar
+
+`--entities-out` writes `bsp-to-glb.entity-graph` version 1 directly from the compiled entity lump.
+It is independent of GLB output. The top-level `entities` array retains original BSP order and each
+record contains its original `index` and ordered `keyValues` array, including duplicate keys. The
+raw `classname`, `model`, `targetname`, `parentname`, and `spawnflags` summaries use the first
+case-insensitive matching pair; `keyValues` remains authoritative when duplicates exist.
+
+Brush model strings are never folded into worldspawn. A valid `*N` model also emits
+`bspModelIndex: N`, and worldspawn emits index zero, so consumers can join entities to GLB nodes by
+the existing `extras.bspModelIndex`. Non-brush model paths and unsupported-class values remain raw.
+
+Each entity's `connections` array follows source property order. `order` is the zero-based index of
+the originating pair in `keyValues`, and `outputName` preserves that pair's key. A parsed record
+contains independent `target`, `input`, `parameter`, finite `delay` (`f32`), and `maxFires` (`i32`)
+fields. ASCII ESC (`0x1b`) is selected as the delimiter when present, allowing literal commas in a
+parameter; otherwise comma is used. This follows the public Source SDK I/O delimiter contract.
+
+Connections must have exactly five fields, non-empty target/input, a finite delay, and an integer
+max-fires value. Invalid records are retained with `status: "malformed"`, their source `order`, and
+a stable `error` code; their untouched value remains in `keyValues[order]`. The exporter does not
+invent defaults or normalize malformed values. Without an FGD, candidates are recognized by an ESC
+delimiter, conventional `On*`/`Out*` names, or a complete five-field numeric connection shape.
+Consequently, a malformed comma-delimited output with a nonconventional name remains only in raw
+key/value data rather than being guessed.
+
+The sidecar inventory reports entity, key/value, parsed/malformed connection, class, and output
+counts. Export fails closed above 16 MiB of entity text, 16,384 entities, 262,144 total key/value
+pairs, 4,096 pairs per entity, 16,384 bytes per key or value, or 262,144 connection records. Invalid
+UTF-8 is rejected rather than replaced.
+
+Runtime consumers must validate schema/version before use, retain entity indices as stable package
+identity, keep duplicate target names as one-to-many lookups, and join brush entities to render and
+collision models without flattening them into worldspawn. Parent resolution, class-specific initial
+state, I/O dispatch, delay/max-fire scheduling, and dynamic brush visibility/collision changes must
+share one authoritative entity state. Malformed connections must be reported and never executed.
+
 The CLI statistics include a `capabilities` object. Displacements report `exported`; overlays,
 water overlays and cubemaps report `detectedOnly`. Unknown optional-feature lump versions report
 `unsupportedVersion` rather than implying support.
@@ -332,6 +372,8 @@ TF2_GAME_DIR=/path/to/Team\ Fortress\ 2/tf \
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_props -- --nocapture
 BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
+  cargo test --release --test hydrogen_entities -- --nocapture
+BSP_TO_GLB_HYDROGEN_BSP=/path/to/jump_hydrogen_rc1_bmv.bsp \
   cargo test --release --test hydrogen_visibility -- --ignored
 ```
 
@@ -343,6 +385,9 @@ It verifies 3,511 brushes, 31,092 brush sides, 2,575 world-model brushes, 259 pl
 and solidity. The direct lightmap gate additionally requires exactly 9,135 lit faces and 4,529
 bumped lit faces. Visibility preserves all 450 PVS rows, 16,244 planes, 6,096 nodes, and 6,248
 leaves; all 435 clusters owning world render faces are represented by static GLB chunks.
+The compiled entity graph contains 366 entities, 6,927 ordered key/value pairs, 196 parsed output
+connections, zero malformed connections, 24 classes, and 17 output names. The checked inventory
+includes 100 `func_brush` entities and 68 `OnTrigger` connections.
 
 ## Design Principles
 
@@ -373,6 +418,10 @@ leaves; all 435 clusters owning world render faces are represented by static GLB
   and [`bspflags.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/bspflags.h).
 - Public SDK VTF concepts and image-format identifiers from
   [`vtf.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/vtf/vtf.h).
+- Public SDK entity-map and I/O contracts from
+  [`mapentities_shared.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/game/shared/mapentities_shared.h),
+  [`entitydefs.h`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/public/fgdlib/entitydefs.h),
+  and [`cbase.cpp`](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/game/server/cbase.cpp).
 - [BSPSource](https://github.com/ata4/bspsrc) for extensive Source BSP tooling and research.
 - [Plumber](https://github.com/lasa01/Plumber) for Source model, map, material and texture import
   tooling used by the pipeline this project is incrementally replacing.
