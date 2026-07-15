@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--decal-overlays-out <map.decal-overlays.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -59,6 +59,7 @@ fn run() -> Result<(), String> {
     let mut output_path: Option<PathBuf> = None;
     let mut collision_output_path: Option<PathBuf> = None;
     let mut entity_output_path: Option<PathBuf> = None;
+    let mut decal_overlay_output_path: Option<PathBuf> = None;
     let mut physics_manifest_path: Option<PathBuf> = None;
     let mut physics_binary_path: Option<PathBuf> = None;
     let mut lightmap_path: Option<PathBuf> = None;
@@ -99,6 +100,7 @@ fn run() -> Result<(), String> {
             "--out" => output_path = Some(value.into()),
             "--collision-out" => collision_output_path = Some(value.into()),
             "--entities-out" => entity_output_path = Some(value.into()),
+            "--decal-overlays-out" => decal_overlay_output_path = Some(value.into()),
             "--physics-manifest" => physics_manifest_path = Some(value.into()),
             "--physics-binary" => physics_binary_path = Some(value.into()),
             "--lightmaps" => lightmap_path = Some(value.into()),
@@ -165,6 +167,7 @@ fn run() -> Result<(), String> {
     if output_path.is_none()
         && collision_output_path.is_none()
         && entity_output_path.is_none()
+        && decal_overlay_output_path.is_none()
         && physics_manifest_path.is_none()
         && pak_output_path.is_none()
     {
@@ -178,6 +181,9 @@ fn run() -> Result<(), String> {
     }
     if output_path.is_none() && visibility_path.is_some() {
         return Err("--visibility-out requires --out because it references GLB chunks".to_owned());
+    }
+    if output_path.is_none() && decal_overlay_output_path.is_some() {
+        return Err("--decal-overlays-out requires --out".to_owned());
     }
     if texture_output_path.is_none() && texture_manifest_path.is_some() {
         return Err("--texture-manifest requires --texture-output".to_owned());
@@ -339,6 +345,11 @@ fn run() -> Result<(), String> {
                 .as_ref()
                 .ok_or_else(|| "visibility sidecar was not generated".to_owned())?;
             write(path, &sidecar.to_json()?)?;
+        }
+        if let Some(path) = &decal_overlay_output_path {
+            let sidecar = serde_json::to_vec_pretty(&result.decal_overlays)
+                .map_err(|error| format!("failed to serialize decal/overlay sidecar: {error}"))?;
+            write(path, &sidecar)?;
         }
         render_stats = Some(result.stats);
     }

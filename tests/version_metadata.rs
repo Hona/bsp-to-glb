@@ -69,7 +69,10 @@ fn version_json_is_stable_machine_readable_build_metadata() {
     assert_eq!(metadata["components"]["visibilitySidecar"], 2);
     assert_eq!(metadata["components"]["entityGraph"], 1);
     assert_eq!(metadata["components"]["staticPhysics"], 1);
+    assert_eq!(metadata["capabilities"]["decalOverlays"], "supported");
     assert_eq!(metadata["capabilities"]["overlays"], "detectedOnly");
+    assert_eq!(metadata["capabilities"]["waterOverlays"], "detectedOnly");
+    assert_eq!(metadata["components"]["decalOverlays"], 1);
     assert_eq!(metadata["capabilities"]["propGeometry"], "unsupported");
     assert!(output.stderr.is_empty());
 }

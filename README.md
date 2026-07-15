@@ -66,6 +66,7 @@ pipeline. It is currently accurate for the supported compiled brush-rendering do
 - LZMA-compressed BSP lumps
 - exact BSP-tree leaf/cluster/PVS visibility sidecars with GLB chunk ownership
 - versioned compiled entity graphs with ordered raw key/value pairs and parsed I/O connections
+- versioned decal/overlay sidecars with material, face/model, clipped geometry, UV, order, and fade data
 
 Unsupported domains are detected or reported explicitly:
 
@@ -74,7 +75,7 @@ Unsupported domains are detected or reported explicitly:
 - full Source shader execution and material proxy evaluation
 - material proxies and animated materials (identified as metadata only)
 - MOPP, ball, virtual, swapped-endian, and unknown VPhysics shape decoding
-- overlays and water overlays (presence and lump versions are reported, geometry is not exported)
+- compiled overlay fragments on displacement faces (records remain explicit and unsupported)
 - cubemap samples (presence and lump versions are reported, textures are not exported)
 - particles
 
@@ -163,8 +164,8 @@ bsp-to-glb --version-json
 
 Build-metadata schema version 2 includes package version, build target/profile, release source
 commit, supported/detected-only/unsupported capability states, and serialized component versions.
-The current component versions are material manifest 3, material mount plan 1, material textures 1,
-visibility sidecar 2, entity graph 1, and static physics 1.
+The current component versions are material manifest 3, material mount plan 1, material textures 2,
+visibility sidecar 2, entity graph 1, decal/overlay sidecar 1, and static physics 1.
 
 ```bash
 bsp-to-glb \
@@ -181,6 +182,7 @@ bsp-to-glb \
   --physics-manifest path/to/map.physics.json \
   --physics-binary path/to/map.physics.bin \
   --entities-out path/to/map.entities.json \
+  --decal-overlays-out path/to/map.decal-overlays.json \
   --props-out path/to/props.json \
   --visibility-out path/to/map.visibility.json
 ```
@@ -247,7 +249,7 @@ parity.
 
 `--texture-output` opts into VTF decoding and writes one PNG per unique decoded image. Output names
 are `sha256-<PNG digest>.png`; textures with identical dimensions and RGBA pixels share one output.
-`--texture-manifest` optionally writes the `bsp-to-glb/material-textures` version 1 manifest beside
+`--texture-manifest` optionally writes the `bsp-to-glb/material-textures` version 2 manifest beside
 that package. `--texture-mip`, `--texture-frame`, and `--texture-face` select the image, defaulting
 to zero. VTF mip zero is the full-resolution image. Material texture conversion is also available
 through `VtfImageSelection`, `decode_vtf`, `inspect_vtf`, `build_source_material_package`, and
@@ -267,7 +269,7 @@ bounded to 256 MiB; dimensions are bounded to 16,384 and resource dictionaries t
 
 `--out`, `--collision-out`, `--entities-out`, and the paired static-physics outputs are independently
 optional, but at least one output is required. Collision-only, entity-only, and physics-only exports
-do not parse or triangulate render faces. Material, prop, lightmap and visibility outputs require
+do not parse or triangulate render faces. Material, prop, lightmap, decal/overlay, and visibility outputs require
 `--out`; visibility references the emitted GLB chunk indices.
 
 ## Collision Sidecar
@@ -370,8 +372,16 @@ collision models without flattening them into worldspawn. Parent resolution, cla
 state, I/O dispatch, delay/max-fire scheduling, and dynamic brush visibility/collision changes must
 share one authoritative entity state. Malformed connections must be reported and never executed.
 
-The CLI statistics include a `capabilities` object. Displacements report `exported`; overlays,
-water overlays and cubemaps report `detectedOnly`. Unknown optional-feature lump versions report
+`--decal-overlays-out` writes `bsp-to-glb.decal-overlays` version 1. It retains compiled overlay and
+water-overlay records plus `infodecal` entities, adds decal-only VMT/VTF resources to the material
+package, and emits face-clipped Source-space fragments without moving vertices away from target
+planes. Records preserve BSP face/model identity, UV0, lightmap UVs, render order, fade data, initial
+activation state, ordered entity properties, and unknown lump bytes. Unsupported materials and
+malformed or unknown records remain distinct states and never receive fabricated geometry or pixels.
+Geometry is bounded to 16,384 records, 65,536 fragments, and 1,000,000 vertices.
+
+The CLI statistics include a `capabilities` object. Displacements, overlays, and water overlays
+report `exported`; cubemaps report `detectedOnly`. Unknown optional-feature lump versions report
 `unsupportedVersion` rather than implying support.
 
 Compiled displacement export supports version 0 displacement lumps, powers 2 through 4,

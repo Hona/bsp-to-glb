@@ -5,6 +5,7 @@ use std::io::Cursor;
 
 mod bsp_pak;
 mod collision;
+mod decal_overlays;
 mod entities;
 mod material_resolver;
 mod materials;
@@ -19,6 +20,11 @@ pub use bsp_pak::{
 pub use collision::{
     CollisionExportInput, CollisionExportResult, CollisionStats, StaticPropCollisionInput,
     export_collision_sidecar,
+};
+pub use decal_overlays::{
+    DECAL_OVERLAY_SIDECAR_VERSION, DecalOverlayCoverage, DecalOverlayFragment,
+    DecalOverlayInitialState, DecalOverlayInventory, DecalOverlayRecord, DecalOverlaySidecar,
+    DecalOverlayStatus,
 };
 pub use entities::{
     CompiledEntity, ENTITY_GRAPH_VERSION, EntityConnection, EntityConnectionError, EntityGraph,
@@ -72,6 +78,7 @@ pub struct BuildCapabilities {
     pub decoded_physics_collision: BuildCapabilityStatus,
     pub visibility: BuildCapabilityStatus,
     pub entity_graph: BuildCapabilityStatus,
+    pub decal_overlays: BuildCapabilityStatus,
     pub overlays: BuildCapabilityStatus,
     pub water_overlays: BuildCapabilityStatus,
     pub cubemaps: BuildCapabilityStatus,
@@ -87,6 +94,7 @@ pub struct BuildComponentVersions {
     pub visibility_sidecar: u32,
     pub entity_graph: u32,
     pub static_physics: u32,
+    pub decal_overlays: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -127,6 +135,7 @@ pub fn build_metadata() -> BuildMetadata {
             decoded_physics_collision: BuildCapabilityStatus::Supported,
             visibility: BuildCapabilityStatus::Supported,
             entity_graph: BuildCapabilityStatus::Supported,
+            decal_overlays: BuildCapabilityStatus::Supported,
             overlays: BuildCapabilityStatus::DetectedOnly,
             water_overlays: BuildCapabilityStatus::DetectedOnly,
             cubemaps: BuildCapabilityStatus::DetectedOnly,
@@ -139,6 +148,7 @@ pub fn build_metadata() -> BuildMetadata {
             visibility_sidecar: VISIBILITY_SIDECAR_VERSION,
             entity_graph: ENTITY_GRAPH_VERSION,
             static_physics: static_physics::STATIC_PHYSICS_SCHEMA_VERSION,
+            decal_overlays: DECAL_OVERLAY_SIDECAR_VERSION,
         },
     }
 }
@@ -170,6 +180,7 @@ const LUMP_CUBEMAPS: usize = 42;
 const LUMP_OVERLAYS: usize = 45;
 const LUMP_DISP_TRIS: usize = 48;
 const LUMP_WATEROVERLAYS: usize = 50;
+const LUMP_OVERLAY_FADES: usize = 60;
 const LUMP_TEXDATA_STRING_DATA: usize = 43;
 const LUMP_TEXDATA_STRING_TABLE: usize = 44;
 const LUMP_LIGHTING_HDR: usize = 53;
@@ -319,6 +330,7 @@ pub struct ExportResult {
     pub props: Value,
     pub lightmaps: Option<LightmapArtifacts>,
     pub visibility: Option<VisibilitySidecar>,
+    pub decal_overlays: DecalOverlaySidecar,
 }
 
 #[derive(Debug)]
@@ -1273,7 +1285,7 @@ fn overlay_capability(data: &[u8], version: i32, water: bool) -> FeatureCapabili
     } else {
         ("OVERLAYS", OVERLAY_SIZE, 64_usize)
     };
-    metadata_capability(data, version, name, record_size, |record, offset| {
+    let mut capability = metadata_capability(data, version, name, record_size, |record, offset| {
         read_i32(record, offset, name)?;
         read_i16(record, offset + 4, name)?;
         let face_count = (read_u16(record, offset + 6, name)? & 0x3fff) as usize;
@@ -1288,7 +1300,11 @@ fn overlay_capability(data: &[u8], version: i32, water: bool) -> FeatureCapabili
             read_f32(record, component, name)?;
         }
         Ok(())
-    })
+    });
+    if matches!(capability.status, CapabilityStatus::DetectedOnly) {
+        capability.status = CapabilityStatus::Exported;
+    }
+    capability
 }
 
 fn cubemap_capability(data: &[u8], version: i32) -> FeatureCapability {
@@ -3624,11 +3640,22 @@ fn export_bsp_internal(
         .collect();
     let texinfos = parse_texinfo(&bsp.lumps[LUMP_TEXINFO])?;
     let texdata = parse_texdata(&bsp.lumps[LUMP_TEXDATA])?;
-    let material_names = parse_material_names(
+    let entities = parse_entities(&bsp.lumps[LUMP_ENTITIES])?;
+    let mut material_names = parse_material_names(
         &texdata,
         &bsp.lumps[LUMP_TEXDATA_STRING_DATA],
         &bsp.lumps[LUMP_TEXDATA_STRING_TABLE],
     )?;
+    let decal_material_names = decal_overlays::collect_additional_material_names(
+        &entities,
+        &bsp.lumps[LUMP_OVERLAYS],
+        bsp.lump_versions[LUMP_OVERLAYS],
+        &bsp.lumps[LUMP_WATEROVERLAYS],
+        bsp.lump_versions[LUMP_WATEROVERLAYS],
+        &texinfos,
+        &material_names,
+    );
+    material_names.extend(decal_material_names);
     let embedded_resources = materials::parse_embedded_resources(&bsp.lumps[LUMP_PAKFILE])?;
     let material_textures = options
         .material_texture_selection
@@ -3647,7 +3674,6 @@ fn export_bsp_internal(
         build_source_material_manifest(&material_names, &embedded_resources, material_resolver)?
     };
     let models = parse_models(&bsp.lumps[LUMP_MODELS])?;
-    let entities = parse_entities(&bsp.lumps[LUMP_ENTITIES])?;
     let static_props = find_static_props(&bsp, data)?;
     let external_lightmaps = lightmap_json
         .map(ExternalLightmapLookup::parse)
@@ -3741,6 +3767,26 @@ fn export_bsp_internal(
     let mut visibility = include_visibility
         .then(|| build_visibility(&bsp, &planes, &faces, &models, &face_owner))
         .transpose()?;
+    let decal_overlays = decal_overlays::build(decal_overlays::BuildInput {
+        bsp_version: bsp.version,
+        entities: &entities,
+        overlay_data: &bsp.lumps[LUMP_OVERLAYS],
+        overlay_version: bsp.lump_versions[LUMP_OVERLAYS],
+        water_overlay_data: &bsp.lumps[LUMP_WATEROVERLAYS],
+        water_overlay_version: bsp.lump_versions[LUMP_WATEROVERLAYS],
+        overlay_fades: &bsp.lumps[LUMP_OVERLAY_FADES],
+        planes: &planes,
+        faces: &faces,
+        face_owner: &face_owner,
+        texinfos: &texinfos,
+        material_names: &material_names,
+        material_manifest: &material_manifest,
+        material_textures: material_textures.as_ref(),
+        surfedges: &surfedges,
+        edges: &edges,
+        vertices: &vertices,
+        lightmaps: direct_lightmaps.as_ref(),
+    })?;
 
     let mut entity_by_model: HashMap<usize, (usize, &Entity)> = HashMap::new();
     for (entity_index, entity) in entities.iter().enumerate() {
@@ -4489,5 +4535,6 @@ fn export_bsp_internal(
         props: props_metadata,
         lightmaps: direct_lightmaps.map(|extracted| extracted.artifacts),
         visibility,
+        decal_overlays,
     })
 }

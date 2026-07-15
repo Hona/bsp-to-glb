@@ -32,6 +32,23 @@ fn put_f32(data: &mut [u8], offset: usize, value: f32) {
     data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn decal_vtf(width: u16, height: u16) -> Vec<u8> {
+    let mut data = vec![0; 65];
+    data[0..4].copy_from_slice(b"VTF\0");
+    put_u32(&mut data, 4, 7);
+    put_u32(&mut data, 8, 2);
+    put_u32(&mut data, 12, 65);
+    put_u16(&mut data, 16, width);
+    put_u16(&mut data, 18, height);
+    put_u16(&mut data, 24, 1);
+    put_u32(&mut data, 52, 0);
+    data[56] = 1;
+    put_u32(&mut data, 57, u32::MAX);
+    put_u16(&mut data, 63, 1);
+    data.extend(vec![255; usize::from(width) * usize::from(height) * 4]);
+    data
+}
+
 fn synthetic_bsp(displacement: bool) -> Vec<u8> {
     let mut lumps = vec![Vec::<u8>::new(); 64];
     lumps[0] = br#"
@@ -263,6 +280,10 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         put_i16(&mut overlay, 4, 0);
         put_u16(&mut overlay, 6, 1);
         put_i32(&mut overlay, 8, 0);
+        put_f32(&mut overlay, 264 + 4, 1.0);
+        put_f32(&mut overlay, 264 + 12, 1.0);
+        put_f32(&mut overlay, 264 + 16 + 8, 1.0);
+        put_f32(&mut overlay, 264 + 76 + 8, 1.0);
         lumps[45] = overlay;
 
         let mut water_overlay = vec![0; 1120];
@@ -270,6 +291,10 @@ fn synthetic_bsp(displacement: bool) -> Vec<u8> {
         put_i16(&mut water_overlay, 4, 0);
         put_u16(&mut water_overlay, 6, 1);
         put_i32(&mut water_overlay, 8, 0);
+        put_f32(&mut water_overlay, 1032 + 4, 1.0);
+        put_f32(&mut water_overlay, 1032 + 12, 1.0);
+        put_f32(&mut water_overlay, 1032 + 16 + 8, 1.0);
+        put_f32(&mut water_overlay, 1032 + 76 + 8, 1.0);
         lumps[50] = water_overlay;
     }
 
@@ -1486,19 +1511,166 @@ fn omits_removed_displacement_triangles_but_retains_their_source_tags() {
 fn reports_optional_feature_capabilities_without_claiming_export_support() {
     let result = export_bsp(&synthetic_bsp(true), None).unwrap();
     let stats = serde_json::to_value(&result.stats).unwrap();
+    let decals = serde_json::to_value(&result.decal_overlays).unwrap();
 
     assert_eq!(stats["capabilities"]["displacements"]["present"], true);
     assert_eq!(stats["capabilities"]["displacements"]["count"], 1);
     assert_eq!(stats["capabilities"]["displacements"]["status"], "exported");
     assert_eq!(stats["capabilities"]["overlays"]["count"], 1);
-    assert_eq!(stats["capabilities"]["overlays"]["status"], "detectedOnly");
+    assert_eq!(stats["capabilities"]["overlays"]["status"], "exported");
     assert_eq!(stats["capabilities"]["waterOverlays"]["count"], 1);
-    assert_eq!(
-        stats["capabilities"]["waterOverlays"]["status"],
-        "detectedOnly"
-    );
+    assert_eq!(stats["capabilities"]["waterOverlays"]["status"], "exported");
+    assert_eq!(decals["schema"], "bsp-to-glb.decal-overlays");
+    assert_eq!(decals["schemaVersion"], 1);
+    assert_eq!(decals["inventory"]["compiledOverlays"], 1);
+    assert_eq!(decals["inventory"]["waterOverlays"], 1);
+    assert_eq!(decals["records"][0]["renderOrder"], 0);
+    assert_eq!(decals["records"][0]["target"]["bspFaceIndices"], json!([0]));
     assert_eq!(stats["capabilities"]["cubemaps"]["count"], 1);
     assert_eq!(stats["capabilities"]["cubemaps"]["status"], "detectedOnly");
+}
+
+#[test]
+fn malformed_overlay_faces_never_retain_partial_geometry() {
+    let mut overlay = vec![0; 352];
+    put_i32(&mut overlay, 0, 7);
+    put_i16(&mut overlay, 4, 0);
+    put_u16(&mut overlay, 6, 2);
+    put_i32(&mut overlay, 8, 0);
+    put_i32(&mut overlay, 12, 999);
+    put_f32(&mut overlay, 264 + 4, 1.0);
+    put_f32(&mut overlay, 264 + 12, 1.0);
+    put_f32(&mut overlay, 264 + 16 + 8, 1.0);
+    put_f32(&mut overlay, 264 + 76 + 8, 1.0);
+    let bsp = replace_lump(&synthetic_bsp(false), 45, &overlay);
+
+    let result = export_bsp(&bsp, None).unwrap();
+    let record = &result.decal_overlays.records[0];
+
+    assert_eq!(record.status, bsp_to_glb::DecalOverlayStatus::Malformed);
+    assert_eq!(record.reason, "target-face-malformed");
+    assert!(record.fragments.is_empty());
+}
+
+#[test]
+fn rejects_decal_record_counts_above_the_public_bound() {
+    let mut overlay = vec![0; 352];
+    put_i32(&mut overlay, 0, 7);
+    put_i16(&mut overlay, 4, 0);
+    put_u16(&mut overlay, 6, 1);
+    put_i32(&mut overlay, 8, 0);
+    put_f32(&mut overlay, 264 + 4, 1.0);
+    put_f32(&mut overlay, 264 + 12, 1.0);
+    put_f32(&mut overlay, 264 + 16 + 8, 1.0);
+    put_f32(&mut overlay, 264 + 76 + 8, 1.0);
+    let overlays = overlay.repeat(16_385);
+    let bsp = replace_lump(&synthetic_bsp(false), 45, &overlays);
+
+    let error = export_bsp(&bsp, None).unwrap_err();
+    assert!(error.contains("decal/overlay record limit"), "{error}");
+}
+
+#[test]
+fn preserves_unresolved_infodecals_without_fabricating_geometry() {
+    let entity_lump = br#"
+{
+"classname" "worldspawn"
+}
+
+{
+"classname" "func_brush"
+"targetname" "moving_door"
+"model" "*1"
+"origin" "128 32 16"
+}
+{
+"classname" "infodecal"
+"origin" "32 32 0"
+"texture" "signs/missing"
+"hammerid" "42"
+}
+"#;
+    let bsp = replace_lump(&synthetic_bsp(false), 0, entity_lump);
+    let result = export_bsp(&bsp, None).unwrap();
+    let decals = serde_json::to_value(&result.decal_overlays).unwrap();
+
+    assert_eq!(decals["inventory"]["infodecals"], 1);
+    assert_eq!(decals["coverage"]["unsupported"], 1);
+    assert_eq!(decals["records"][0]["kind"], "infodecal");
+    assert_eq!(decals["records"][0]["status"], "unsupported");
+    assert_eq!(decals["records"][0]["reason"], "material-unresolved");
+    assert_eq!(decals["records"][0]["raw"]["hammerid"], "42");
+    assert_eq!(decals["records"][0]["fragments"], json!([]));
+}
+
+#[test]
+fn projects_and_clips_a_resolved_infodecal_without_geometric_depth_offset() {
+    let entity_lump = br#"
+{
+"classname" "worldspawn"
+}
+{
+"classname" "func_brush"
+"targetname" "moving_door"
+"model" "*1"
+"origin" "128 32 16"
+}
+{
+"classname" "infodecal"
+"origin" "32 32 0"
+"texture" "signs/test"
+}
+"#;
+    let mut bsp = replace_lump(&synthetic_bsp(false), 0, entity_lump);
+    let texture = decal_vtf(32, 32);
+    append_pak(
+        &mut bsp,
+        &[
+            (
+                "materials/signs/test.vmt",
+                br#"LightmappedGeneric {
+                    "$basetexture" "signs/test"
+                    "$decal" 1
+                    "$decalscale" 1
+                    "$translucent" 1
+                    "$vertexcolor" 1
+                    "$vertexalpha" 1
+                }"# as &[u8],
+            ),
+            ("materials/signs/test.vtf", texture.as_slice()),
+        ],
+    );
+    let result = bsp_to_glb::export_bsp_with_options(
+        &bsp,
+        &ExportOptions {
+            material_texture_selection: Some(Default::default()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let record = result
+        .decal_overlays
+        .records
+        .iter()
+        .find(|record| record.entity_index == Some(2))
+        .unwrap();
+
+    assert_eq!(record.status, bsp_to_glb::DecalOverlayStatus::Handled);
+    assert_eq!(record.target.as_ref().unwrap().bsp_model_index, 0);
+    assert_eq!(record.target.as_ref().unwrap().bsp_face_indices, [0]);
+    assert_eq!(record.fragments.len(), 1);
+    assert_eq!(record.fragments[0].positions.len(), 4);
+    assert!(
+        record.fragments[0]
+            .positions
+            .iter()
+            .all(|position| position[2] == 0.0)
+    );
+    assert_eq!(
+        record.fragments[0].uvs,
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+    );
+    assert_eq!(record.fragments[0].indices, [0, 1, 2, 0, 2, 3]);
 }
 
 #[test]
@@ -1508,6 +1680,7 @@ fn reports_unsupported_optional_metadata_versions_without_claiming_support() {
 
     let result = export_bsp(&bsp, None).unwrap();
     let stats = serde_json::to_value(&result.stats).unwrap();
+    let decals = serde_json::to_value(&result.decal_overlays).unwrap();
 
     assert_eq!(
         stats["capabilities"]["overlays"]["lumpVersions"]["OVERLAYS"],
@@ -1518,6 +1691,16 @@ fn reports_unsupported_optional_metadata_versions_without_claiming_support() {
         "unsupportedVersion"
     );
     assert_eq!(stats["capabilities"]["overlays"]["count"], Value::Null);
+    assert_eq!(decals["coverage"]["unknown"], 1);
+    assert_eq!(decals["unknownLumps"][0]["name"], "OVERLAYS");
+    assert_eq!(decals["unknownLumps"][0]["version"], 7);
+    assert!(
+        decals["unknownLumps"][0]["bytesBase64"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 100
+    );
 }
 
 #[test]
@@ -1669,6 +1852,44 @@ fn cli_writes_requested_versioned_material_sidecar() {
         "materials/brick/test.vmt"
     );
     assert!(glb_path.is_file());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cli_rejects_a_decal_sidecar_without_render_output() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "bsp-to-glb-decal-output-test-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let bsp_path = directory.join("fixture.bsp");
+    let collision_path = directory.join("fixture.collision.json");
+    let decals_path = directory.join("fixture.decal-overlays.json");
+    fs::write(&bsp_path, synthetic_bsp(false)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
+        .args([
+            "--bsp",
+            bsp_path.to_str().unwrap(),
+            "--collision-out",
+            collision_path.to_str().unwrap(),
+            "--decal-overlays-out",
+            decals_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--decal-overlays-out requires --out")
+    );
+    assert!(!collision_path.exists());
+    assert!(!decals_path.exists());
 
     fs::remove_dir_all(directory).unwrap();
 }
