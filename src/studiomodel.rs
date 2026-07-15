@@ -3,9 +3,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const STUDIO_MODEL_PACKAGE_VERSION: u32 = 1;
+pub const STUDIO_MODEL_PACKAGE_VERSION: u32 = 2;
 pub const STUDIO_MODEL_MDL_VERSION: i32 = 48;
-pub const STUDIO_MODEL_MDL_VERSIONS: [i32; 3] = [44, 45, 48];
+pub const STUDIO_MODEL_MDL_VERSIONS: [i32; 4] = [44, 45, 46, 48];
 pub const STUDIO_MODEL_VVD_VERSION: i32 = 4;
 pub const STUDIO_MODEL_VTX_VERSION: i32 = 7;
 
@@ -145,6 +145,29 @@ pub struct StudioSequence {
     pub group_size: [usize; 2],
     pub animation_indices: Vec<i16>,
     pub event_count: usize,
+    pub auto_layers: Vec<StudioSequenceLayer>,
+    pub ik_locks: Vec<StudioSequenceIkLock>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioSequenceLayer {
+    pub sequence: i16,
+    pub pose: i16,
+    pub flags: i32,
+    pub start: f32,
+    pub peak: f32,
+    pub tail: f32,
+    pub end: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioSequenceIkLock {
+    pub chain: i32,
+    pub position_weight: f32,
+    pub local_rotation_weight: f32,
+    pub flags: i32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -657,7 +680,7 @@ fn parse_mdl(data: &[u8]) -> Result<ParsedMdl, String> {
     let version = i32_at(data, 4, "MDL version")?;
     if !STUDIO_MODEL_MDL_VERSIONS.contains(&version) {
         return Err(format!(
-            "unsupported MDL version {version}; TF2 contract accepts observed versions {STUDIO_MODEL_MDL_VERSIONS:?}"
+            "unsupported MDL version {version}; TF2 contract accepts Source-compatible versions {STUDIO_MODEL_MDL_VERSIONS:?}"
         ));
     }
     checked_range(data, 0, MDL_HEADER_BYTES, "MDL header")?;
@@ -793,8 +816,11 @@ fn parse_mdl(data: &[u8]) -> Result<ParsedMdl, String> {
                     offset + 72,
                     "MDL animation local hierarchy count",
                 )?,
-                zero_frame_count: u16_at(data, offset + 90, "MDL animation zero frame count")?
-                    as usize,
+                zero_frame_count: if version < 47 {
+                    0
+                } else {
+                    u16_at(data, offset + 90, "MDL animation zero frame count")? as usize
+                },
                 decode_status: StudioFeatureStatus::DetectedOnly,
                 gltf_animation: None,
                 sample_count: 0,
@@ -874,6 +900,67 @@ fn parse_mdl(data: &[u8]) -> Result<ParsedMdl, String> {
                 "MDL sequence events",
             )?;
         }
+        let auto_layer_count = usize_i32(data, offset + 148, "MDL sequence layer count")?;
+        let auto_layer_offset = relative_table_offset(
+            offset,
+            i32_at(data, offset + 152, "MDL sequence layer offset")?,
+            "MDL sequence layer table",
+        )?;
+        table_range(
+            data,
+            auto_layer_offset,
+            auto_layer_count,
+            24,
+            MAX_SEQUENCES,
+            "MDL sequence layers",
+        )?;
+        let auto_layers = (0..auto_layer_count)
+            .map(|layer| {
+                let layer_offset = auto_layer_offset + layer * 24;
+                Ok(StudioSequenceLayer {
+                    sequence: i16_at(data, layer_offset, "MDL sequence layer sequence")?,
+                    pose: i16_at(data, layer_offset + 2, "MDL sequence layer pose")?,
+                    flags: i32_at(data, layer_offset + 4, "MDL sequence layer flags")?,
+                    start: f32_at(data, layer_offset + 8, "MDL sequence layer start")?,
+                    peak: f32_at(data, layer_offset + 12, "MDL sequence layer peak")?,
+                    tail: f32_at(data, layer_offset + 16, "MDL sequence layer tail")?,
+                    end: f32_at(data, layer_offset + 20, "MDL sequence layer end")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let ik_lock_count = usize_i32(data, offset + 164, "MDL sequence IK lock count")?;
+        let ik_lock_offset = relative_table_offset(
+            offset,
+            i32_at(data, offset + 168, "MDL sequence IK lock offset")?,
+            "MDL sequence IK lock table",
+        )?;
+        table_range(
+            data,
+            ik_lock_offset,
+            ik_lock_count,
+            32,
+            MAX_SEQUENCES,
+            "MDL sequence IK locks",
+        )?;
+        let ik_locks = (0..ik_lock_count)
+            .map(|lock| {
+                let lock_offset = ik_lock_offset + lock * 32;
+                Ok(StudioSequenceIkLock {
+                    chain: i32_at(data, lock_offset, "MDL sequence IK lock chain")?,
+                    position_weight: f32_at(
+                        data,
+                        lock_offset + 4,
+                        "MDL sequence IK lock position weight",
+                    )?,
+                    local_rotation_weight: f32_at(
+                        data,
+                        lock_offset + 8,
+                        "MDL sequence IK lock local rotation weight",
+                    )?,
+                    flags: i32_at(data, lock_offset + 12, "MDL sequence IK lock flags")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         sequences.push(StudioSequence {
             index,
             name: relative_string(
@@ -894,6 +981,8 @@ fn parse_mdl(data: &[u8]) -> Result<ParsedMdl, String> {
             group_size: [group_x, group_y],
             animation_indices,
             event_count,
+            auto_layers,
+            ik_locks,
         });
     }
 
@@ -2474,6 +2563,18 @@ fn package_content_hash(input: &StudioModelInput<'_>) -> String {
     format!("{:x}", hash.finalize())
 }
 
+fn metadata_package_content_hash(source_path: &str, mdl: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(STUDIO_MODEL_PACKAGE_VERSION.to_le_bytes());
+    hash.update(source_path.as_bytes());
+    hash.update([0]);
+    hash.update(0_u64.to_le_bytes());
+    hash.update(b"mdl");
+    hash.update((mdl.len() as u64).to_le_bytes());
+    hash.update(mdl);
+    format!("{:x}", hash.finalize())
+}
+
 fn pose_to_bone_matrix(matrix: [f32; 12]) -> [f32; 16] {
     [
         matrix[0], matrix[4], matrix[8], 0.0, matrix[1], matrix[5], matrix[9], 0.0, matrix[2],
@@ -2576,6 +2677,91 @@ pub fn export_studio_model(input: &StudioModelInput<'_>) -> Result<StudioModelEx
         parse_vvd(input.vvd, mdl.checksum).map_err(|error| format!("{source_path}: {error}"))?;
     let vtx =
         parse_vtx(input.vtx, mdl.checksum).map_err(|error| format!("{source_path}: {error}"))?;
+    let source_files = {
+        let mut files = vec![
+            source_file("header", ".mdl", input.mdl, Some(mdl.checksum)),
+            source_file("vertices", ".vvd", input.vvd, Some(vvd.checksum)),
+            source_file("topology", ".dx90.vtx", input.vtx, Some(vtx.checksum)),
+        ];
+        if let Some(ani) = input.ani {
+            files.push(source_file("externalAnimations", ".ani", ani, None));
+        }
+        if let Some(phy) = input.phy {
+            files.push(source_file("physics", ".phy", phy, None));
+        }
+        files
+    };
+    export_studio_model_parts(
+        input,
+        source_path,
+        mdl,
+        vvd,
+        vtx,
+        source_files,
+        package_content_hash(input),
+        true,
+    )
+}
+
+pub fn export_studio_metadata_model(
+    source_path: &str,
+    mdl_bytes: &[u8],
+) -> Result<StudioModelExport, String> {
+    let source_path = normalized_model_path(source_path)?;
+    let mdl = parse_mdl(mdl_bytes).map_err(|error| format!("{source_path}: {error}"))?;
+    if !mdl.body_parts.is_empty() {
+        return Err(format!(
+            "{source_path}: metadata-only export requires a model with no body parts"
+        ));
+    }
+    if mdl.animation_block_count > 0 {
+        return Err(format!(
+            "{source_path}: metadata-only export cannot consume external animation blocks"
+        ));
+    }
+    let checksum = mdl.checksum;
+    let input = StudioModelInput {
+        source_path: &source_path,
+        mdl: mdl_bytes,
+        vvd: &[],
+        vtx: &[],
+        ani: None,
+        phy: None,
+        skin: 0,
+    };
+    export_studio_model_parts(
+        &input,
+        source_path.clone(),
+        mdl,
+        ParsedVvd {
+            checksum,
+            lod_vertex_counts: vec![0],
+            source_vertices: Vec::new(),
+            fixups: Vec::new(),
+        },
+        ParsedVtx {
+            checksum,
+            lod_count: 1,
+            body_parts: Vec::new(),
+            material_replacements: vec![BTreeMap::new()],
+        },
+        vec![source_file("header", ".mdl", mdl_bytes, Some(checksum))],
+        metadata_package_content_hash(&source_path, mdl_bytes),
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_studio_model_parts(
+    input: &StudioModelInput<'_>,
+    source_path: String,
+    mdl: ParsedMdl,
+    vvd: ParsedVvd,
+    vtx: ParsedVtx,
+    source_files: Vec<StudioSourceFile>,
+    package_content_hash: String,
+    has_geometry_companions: bool,
+) -> Result<StudioModelExport, String> {
     if vvd.checksum != mdl.checksum || vtx.checksum != mdl.checksum {
         return Err(format!(
             "{source_path}: StudioModel companion checksums disagree"
@@ -3019,20 +3205,6 @@ pub fn export_studio_model(input: &StudioModelInput<'_>) -> Result<StudioModelEx
     }
     nodes[0]["children"] = json!(root_children);
 
-    let source_files = {
-        let mut files = vec![
-            source_file("header", ".mdl", input.mdl, Some(mdl.checksum)),
-            source_file("vertices", ".vvd", input.vvd, Some(vvd.checksum)),
-            source_file("topology", ".dx90.vtx", input.vtx, Some(vtx.checksum)),
-        ];
-        if let Some(ani) = input.ani {
-            files.push(source_file("externalAnimations", ".ani", ani, None));
-        }
-        if let Some(phy) = input.phy {
-            files.push(source_file("physics", ".phy", phy, None));
-        }
-        files
-    };
     let geometry_status = if geometry_index_count > 0 {
         StudioFeatureStatus::Supported
     } else {
@@ -3051,8 +3223,24 @@ pub fn export_studio_model(input: &StudioModelInput<'_>) -> Result<StudioModelEx
     };
     let formats = StudioModelFormatMatrix {
         mdl: domain(StudioFeatureStatus::Supported, 1, None),
-        vvd: domain(StudioFeatureStatus::Supported, 1, None),
-        vtx: domain(StudioFeatureStatus::Supported, 1, None),
+        vvd: domain(
+            if has_geometry_companions {
+                StudioFeatureStatus::Supported
+            } else {
+                StudioFeatureStatus::NotPresent
+            },
+            usize::from(has_geometry_companions),
+            None,
+        ),
+        vtx: domain(
+            if has_geometry_companions {
+                StudioFeatureStatus::Supported
+            } else {
+                StudioFeatureStatus::NotPresent
+            },
+            usize::from(has_geometry_companions),
+            None,
+        ),
         ani: domain(
             if input.ani.is_some() {
                 StudioFeatureStatus::DetectedOnly
@@ -3079,7 +3267,19 @@ pub fn export_studio_model(input: &StudioModelInput<'_>) -> Result<StudioModelEx
         geometry: domain(geometry_status, geometry_index_count / 3, None),
         skins: domain(StudioFeatureStatus::Supported, mdl.skins.len(), None),
         bodygroups: domain(StudioFeatureStatus::Supported, mdl.body_parts.len(), None),
-        lods: domain(StudioFeatureStatus::Supported, vtx.lod_count, None),
+        lods: domain(
+            if has_geometry_companions {
+                StudioFeatureStatus::Supported
+            } else {
+                StudioFeatureStatus::NotPresent
+            },
+            if has_geometry_companions {
+                vtx.lod_count
+            } else {
+                0
+            },
+            None,
+        ),
         skeleton: domain(
             if mdl.bones.is_empty() {
                 StudioFeatureStatus::NotPresent
@@ -3149,7 +3349,7 @@ pub fn export_studio_model(input: &StudioModelInput<'_>) -> Result<StudioModelEx
         schema: "bsp-to-glb/studio-model-package",
         schema_version: STUDIO_MODEL_PACKAGE_VERSION,
         source_path,
-        package_content_hash: package_content_hash(input),
+        package_content_hash,
         selected_skin,
         checksum: mdl.checksum,
         mdl_version: mdl.version,
@@ -3215,9 +3415,9 @@ pub fn export_studio_model(input: &StudioModelInput<'_>) -> Result<StudioModelEx
 #[cfg(test)]
 mod tests {
     use super::{
-        MDL_BONE_BYTES, MDL_HEADER_BYTES, ParsedVvd, SOURCE_TO_GLTF_ROTATION, StudioModelInput,
-        VvdFixup, VvdVertex, animation_value, compressed_quaternion, package_content_hash,
-        parse_mdl,
+        MDL_BONE_BYTES, MDL_HEADER_BYTES, ParsedVvd, SOURCE_TO_GLTF_ROTATION, StudioFeatureStatus,
+        StudioModelInput, VvdFixup, VvdVertex, animation_value, compressed_quaternion,
+        export_studio_metadata_model, package_content_hash, parse_mdl,
     };
 
     fn write_i32(data: &mut [u8], offset: usize, value: i32) {
@@ -3251,8 +3451,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_observed_tf2_mdl_versions() {
-        for version in [44, 45, 48] {
+    fn accepts_only_source_compatible_tf2_mdl_versions() {
+        for version in [44, 45, 46, 48] {
             let mut mdl = vec![0_u8; MDL_HEADER_BYTES];
             mdl[0..4].copy_from_slice(b"IDST");
             write_i32(&mut mdl, 4, version);
@@ -3270,6 +3470,119 @@ mod tests {
                 .unwrap()
                 .contains("unsupported MDL version 49")
         );
+    }
+
+    #[test]
+    fn clears_pre_v47_zero_frame_cache_metadata() {
+        let animation_offset = MDL_HEADER_BYTES;
+        let animation_name_offset = animation_offset + 100;
+        let mut mdl = vec![0_u8; animation_name_offset + 5];
+        mdl[0..4].copy_from_slice(b"IDST");
+        write_i32(&mut mdl, 4, 46);
+        let mdl_length = mdl.len() as i32;
+        write_i32(&mut mdl, 76, mdl_length);
+        write_i32(&mut mdl, 180, 1);
+        write_i32(&mut mdl, 184, animation_offset as i32);
+        write_i32(
+            &mut mdl,
+            animation_offset + 4,
+            (animation_name_offset - animation_offset) as i32,
+        );
+        write_f32(&mut mdl, animation_offset + 8, 30.0);
+        write_i32(&mut mdl, animation_offset + 16, 1);
+        mdl[animation_offset + 88..animation_offset + 90].copy_from_slice(&7_i16.to_le_bytes());
+        mdl[animation_offset + 90..animation_offset + 92].copy_from_slice(&9_i16.to_le_bytes());
+        write_i32(&mut mdl, animation_offset + 92, 1234);
+        mdl[animation_name_offset..].copy_from_slice(b"idle\0");
+
+        let parsed = parse_mdl(&mdl).expect("v46 metadata must be converted before use");
+        assert_eq!(parsed.animations[0].metadata.zero_frame_count, 0);
+    }
+
+    #[test]
+    fn exports_animation_library_mdl_without_invented_geometry_companions() {
+        let mut mdl = vec![0_u8; MDL_HEADER_BYTES];
+        mdl[0..4].copy_from_slice(b"IDST");
+        write_i32(&mut mdl, 4, 48);
+        write_i32(&mut mdl, 8, 1234);
+        write_i32(&mut mdl, 76, MDL_HEADER_BYTES as i32);
+
+        let export = export_studio_metadata_model("models/test/animations.mdl", &mdl)
+            .expect("metadata-only StudioModel must export");
+        assert_eq!(export.manifest.source_files.len(), 1);
+        assert_eq!(export.manifest.source_files[0].role, "header");
+        assert_eq!(
+            export.manifest.formats.geometry.status,
+            StudioFeatureStatus::NotPresent
+        );
+        assert_eq!(
+            export.manifest.formats.vvd.status,
+            StudioFeatureStatus::NotPresent
+        );
+        assert_eq!(
+            export.manifest.formats.vtx.status,
+            StudioFeatureStatus::NotPresent
+        );
+    }
+
+    #[test]
+    fn retains_sequence_layer_and_ik_lock_contracts() {
+        let sequence_offset = MDL_HEADER_BYTES;
+        let layer_offset = sequence_offset + 212;
+        let lock_offset = layer_offset + 24;
+        let label_offset = lock_offset + 32;
+        let activity_offset = label_offset + 5;
+        let mut mdl = vec![0_u8; activity_offset + 9];
+        mdl[0..4].copy_from_slice(b"IDST");
+        write_i32(&mut mdl, 4, 48);
+        let mdl_length = mdl.len() as i32;
+        write_i32(&mut mdl, 76, mdl_length);
+        write_i32(&mut mdl, 188, 1);
+        write_i32(&mut mdl, 192, sequence_offset as i32);
+        write_i32(
+            &mut mdl,
+            sequence_offset + 4,
+            (label_offset - sequence_offset) as i32,
+        );
+        write_i32(
+            &mut mdl,
+            sequence_offset + 8,
+            (activity_offset - sequence_offset) as i32,
+        );
+        write_i32(&mut mdl, sequence_offset + 148, 1);
+        write_i32(
+            &mut mdl,
+            sequence_offset + 152,
+            (layer_offset - sequence_offset) as i32,
+        );
+        mdl[layer_offset..layer_offset + 2].copy_from_slice(&3_i16.to_le_bytes());
+        mdl[layer_offset + 2..layer_offset + 4].copy_from_slice(&(-1_i16).to_le_bytes());
+        write_i32(&mut mdl, layer_offset + 4, 0x1040);
+        write_f32(&mut mdl, layer_offset + 8, 0.1);
+        write_f32(&mut mdl, layer_offset + 12, 0.2);
+        write_f32(&mut mdl, layer_offset + 16, 0.8);
+        write_f32(&mut mdl, layer_offset + 20, 0.9);
+        write_i32(&mut mdl, sequence_offset + 164, 1);
+        write_i32(
+            &mut mdl,
+            sequence_offset + 168,
+            (lock_offset - sequence_offset) as i32,
+        );
+        write_i32(&mut mdl, lock_offset, 2);
+        write_f32(&mut mdl, lock_offset + 4, 0.75);
+        write_f32(&mut mdl, lock_offset + 8, 0.5);
+        write_i32(&mut mdl, lock_offset + 12, 7);
+        mdl[label_offset..label_offset + 5].copy_from_slice(b"idle\0");
+        mdl[activity_offset..activity_offset + 9].copy_from_slice(b"ACT_IDLE\0");
+
+        let sequence = &parse_mdl(&mdl).unwrap().sequences[0];
+        assert_eq!(sequence.auto_layers[0].sequence, 3);
+        assert_eq!(sequence.auto_layers[0].pose, -1);
+        assert_eq!(sequence.auto_layers[0].flags, 0x1040);
+        assert_eq!(sequence.ik_locks[0].chain, 2);
+        assert_eq!(sequence.ik_locks[0].position_weight, 0.75);
+        assert_eq!(sequence.ik_locks[0].local_rotation_weight, 0.5);
+        assert_eq!(sequence.ik_locks[0].flags, 7);
     }
 
     fn vertex(position_x: f32) -> VvdVertex {

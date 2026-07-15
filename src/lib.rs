@@ -49,7 +49,7 @@ pub use materials::{
 };
 pub use studiomodel::{
     STUDIO_MODEL_MDL_VERSIONS, STUDIO_MODEL_PACKAGE_VERSION, StudioModelExport, StudioModelInput,
-    StudioModelManifest, export_studio_model,
+    StudioModelManifest, export_studio_metadata_model, export_studio_model,
 };
 pub use vtf::{
     DecodedVtf, VtfColorSpace, VtfError, VtfErrorKind, VtfFormatMetadata, VtfImageSelection,

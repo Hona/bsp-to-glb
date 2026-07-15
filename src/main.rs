@@ -5,7 +5,8 @@ use bsp_to_glb::{
     export_bsp_with_material_resolver, export_bsp_with_material_resolver_and_visibility,
     export_bsp_with_options_and_material_resolver,
     export_bsp_with_options_and_material_resolver_and_visibility, export_collision_sidecar,
-    export_entity_graph, export_studio_model, read_bsp_pak_archive, static_prop_collision_inputs,
+    export_entity_graph, export_studio_metadata_model, export_studio_model, read_bsp_pak_archive,
+    static_prop_collision_inputs,
 };
 use std::env;
 use std::ffi::OsString;
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--decal-overlays-out <map.decal-overlays.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --studio-source-path <models/model.mdl> --studio-mdl <model.mdl> --studio-vvd <model.vvd> --studio-vtx <model.dx90.vtx> [--studio-ani <model.ani>] [--studio-phy <model.phy>] [--studio-skin <index>] --studio-out <model.glb> --studio-manifest <model.json>\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--decal-overlays-out <map.decal-overlays.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --studio-source-path <models/model.mdl> --studio-mdl <model.mdl> [--studio-vvd <model.vvd> --studio-vtx <model.dx90.vtx>] [--studio-ani <model.ani>] [--studio-phy <model.phy>] [--studio-skin <index>] --studio-out <model.glb> --studio-manifest <model.json>\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -96,8 +97,11 @@ fn run_studio_model(args: &[OsString]) -> Result<(), String> {
         .into_string()
         .map_err(|_| "StudioModel source path is not valid UTF-8".to_owned())?;
     let mdl_path = PathBuf::from(required("--studio-mdl")?);
-    let vvd_path = PathBuf::from(required("--studio-vvd")?);
-    let vtx_path = PathBuf::from(required("--studio-vtx")?);
+    let vvd_path = values.get("--studio-vvd").map(PathBuf::from);
+    let vtx_path = values.get("--studio-vtx").map(PathBuf::from);
+    if vvd_path.is_some() != vtx_path.is_some() {
+        return Err("StudioModel VVD and VTX companions must be supplied together".to_owned());
+    }
     let output_path = PathBuf::from(required("--studio-out")?);
     let manifest_path = PathBuf::from(required("--studio-manifest")?);
     let mut source_total = 0_u64;
@@ -117,8 +121,14 @@ fn run_studio_model(args: &[OsString]) -> Result<(), String> {
         fs::read(path).map_err(|error| format!("failed to read {role} {}: {error}", path.display()))
     };
     let mdl = read(&mdl_path, "MDL")?;
-    let vvd = read(&vvd_path, "VVD")?;
-    let vtx = read(&vtx_path, "VTX")?;
+    let vvd = vvd_path
+        .as_deref()
+        .map(|path| read(path, "VVD"))
+        .transpose()?;
+    let vtx = vtx_path
+        .as_deref()
+        .map(|path| read(path, "VTX"))
+        .transpose()?;
     let ani = values
         .get("--studio-ani")
         .map(PathBuf::from)
@@ -140,15 +150,27 @@ fn run_studio_model(args: &[OsString]) -> Result<(), String> {
         })
         .transpose()?
         .unwrap_or(0);
-    let exported = export_studio_model(&StudioModelInput {
-        source_path: &source_path,
-        mdl: &mdl,
-        vvd: &vvd,
-        vtx: &vtx,
-        ani: ani.as_deref(),
-        phy: phy.as_deref(),
-        skin,
-    })?;
+    let exported = match (vvd.as_deref(), vtx.as_deref()) {
+        (Some(vvd), Some(vtx)) => export_studio_model(&StudioModelInput {
+            source_path: &source_path,
+            mdl: &mdl,
+            vvd,
+            vtx,
+            ani: ani.as_deref(),
+            phy: phy.as_deref(),
+            skin,
+        })?,
+        (None, None) => {
+            if ani.is_some() || phy.is_some() || skin != 0 {
+                return Err(
+                    "metadata-only StudioModel export does not accept ANI, PHY, or skin options"
+                        .to_owned(),
+                );
+            }
+            export_studio_metadata_model(&source_path, &mdl)?
+        }
+        _ => unreachable!("companion pair validated"),
+    };
     let mut manifest = serde_json::to_vec_pretty(&exported.manifest)
         .map_err(|error| format!("failed to serialize StudioModel manifest: {error}"))?;
     manifest.push(b'\n');

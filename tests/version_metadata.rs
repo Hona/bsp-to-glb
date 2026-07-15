@@ -74,7 +74,7 @@ fn version_json_is_stable_machine_readable_build_metadata() {
     assert_eq!(metadata["capabilities"]["waterOverlays"], "detectedOnly");
     assert_eq!(metadata["components"]["decalOverlays"], 1);
     assert_eq!(metadata["capabilities"]["propGeometry"], "supported");
-    assert_eq!(metadata["components"]["studioModel"], 1);
+    assert_eq!(metadata["components"]["studioModel"], 2);
     assert!(output.stderr.is_empty());
 }
 
