@@ -19,6 +19,8 @@ const SURF_HINT: i32 = 0x0100;
 const SURF_SKIP: i32 = 0x0200;
 const NON_DECAL_SURFACES: i32 =
     SURF_SKY2D | SURF_SKY | SURF_TRIGGER | SURF_NODRAW | SURF_HINT | SURF_SKIP | SURF_NODECALS;
+const DECAL_PLANE_DISTANCE: f32 = 4.0;
+const INFODECAL_TRACE_EXTENT: f32 = 5.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,6 +190,79 @@ struct OverlaySource {
 struct ClipVertex {
     position: [f32; 3],
     uv: [f32; 2],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FaceDecalEligibility {
+    Accepts,
+    Rejects,
+    Unknown,
+}
+
+struct InfodecalProjection {
+    basis: Option<DecalOverlayBasis>,
+    target: Option<(usize, usize)>,
+    fragments: Vec<DecalOverlayFragment>,
+    unknown_receiver: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ModelTransform {
+    origin: [f32; 3],
+    rotation: [[f32; 3]; 3],
+}
+
+impl ModelTransform {
+    fn identity() -> Self {
+        Self {
+            origin: [0.0; 3],
+            rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
+
+    fn from_entity(entity: &Entity) -> Self {
+        let [pitch, yaw, roll] = entity_vector(entity, "angles")
+            .unwrap_or([0.0; 3])
+            .map(f32::to_radians);
+        let (sp, cp) = pitch.sin_cos();
+        let (sy, cy) = yaw.sin_cos();
+        let (sr, cr) = roll.sin_cos();
+        Self {
+            origin: entity_vector(entity, "origin").unwrap_or([0.0; 3]),
+            rotation: [
+                [cp * cy, sr * sp * cy - cr * sy, cr * sp * cy + sr * sy],
+                [cp * sy, sr * sp * sy + cr * cy, cr * sp * sy - sr * cy],
+                [-sp, sr * cp, cr * cp],
+            ],
+        }
+    }
+
+    fn vector_to_world(self, value: [f32; 3]) -> [f32; 3] {
+        [
+            dot(self.rotation[0], value),
+            dot(self.rotation[1], value),
+            dot(self.rotation[2], value),
+        ]
+    }
+
+    fn point_to_world(self, value: [f32; 3]) -> [f32; 3] {
+        add(self.origin, self.vector_to_world(value))
+    }
+
+    fn point_to_local(self, value: [f32; 3]) -> [f32; 3] {
+        let value = sub(value, self.origin);
+        [
+            value[0] * self.rotation[0][0]
+                + value[1] * self.rotation[1][0]
+                + value[2] * self.rotation[2][0],
+            value[0] * self.rotation[0][1]
+                + value[1] * self.rotation[1][1]
+                + value[2] * self.rotation[2][1],
+            value[0] * self.rotation[0][2]
+                + value[1] * self.rotation[1][2]
+                + value[2] * self.rotation[2][2],
+        ]
+    }
 }
 
 pub(crate) struct BuildInput<'a> {
@@ -482,6 +557,11 @@ fn material_index(manifest: &SourceMaterialManifest, name: &str) -> Option<usize
         .map(|entry| entry.material_index)
 }
 
+fn decal_world_dimension(pixels: u32, scale: f32) -> Option<f32> {
+    let world = pixels as f32 * scale;
+    (world >= 1.0 && world <= i32::MAX as f32).then(|| world.trunc())
+}
+
 fn decal_material_dimensions(
     manifest: &SourceMaterialManifest,
     package: Option<&SourceMaterialPackage>,
@@ -508,7 +588,10 @@ fn decal_material_dimensions(
         .package_source_index?;
     let source = package?.manifest.sources.get(source_index)?;
     let texture = source.metadata.as_ref()?;
-    Some((texture.width as f32 * scale, texture.height as f32 * scale))
+    Some((
+        decal_world_dimension(texture.width, scale)?,
+        decal_world_dimension(texture.height, scale)?,
+    ))
 }
 
 fn decal_basis(normal: [f32; 3]) -> Option<DecalOverlayBasis> {
@@ -525,6 +608,162 @@ fn decal_basis(normal: [f32; 3]) -> Option<DecalOverlayBasis> {
 
 fn plane_for_face(planes: &[Plane], face: Face) -> Option<Plane> {
     planes.get(face.plane).copied()
+}
+
+fn model_entity_index(input: &BuildInput<'_>, model_index: usize) -> Option<usize> {
+    input
+        .entities
+        .iter()
+        .enumerate()
+        .find(|(_, entity)| {
+            entity_property(entity, "model")
+                .and_then(|value| value.strip_prefix('*'))
+                .and_then(|value| value.parse::<usize>().ok())
+                == Some(model_index)
+        })
+        .map(|(index, _)| index)
+}
+
+fn model_transform(input: &BuildInput<'_>, model_index: usize) -> ModelTransform {
+    if model_index == 0 {
+        ModelTransform::identity()
+    } else {
+        model_entity_index(input, model_index)
+            .map(|index| ModelTransform::from_entity(&input.entities[index]))
+            .unwrap_or_else(ModelTransform::identity)
+    }
+}
+
+fn model_is_traceable(input: &BuildInput<'_>, model_index: usize) -> bool {
+    if model_index == 0 {
+        return true;
+    }
+    let Some(entity_index) = model_entity_index(input, model_index) else {
+        return true;
+    };
+    let entity = &input.entities[entity_index];
+    if entity_property(entity, "effects")
+        .and_then(|value| value.parse::<i32>().ok())
+        .is_some_and(|effects| effects & 0x20 != 0)
+    {
+        return false;
+    }
+    let classname = entity_property(entity, "classname")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !(classname.starts_with("weapon_")
+        || classname.starts_with("item_")
+        || matches!(
+            classname.as_str(),
+            "prop_ragdoll" | "prop_dynamic" | "prop_static" | "prop_physics" | "npc_bullseye"
+        ))
+}
+
+fn segment_face_intersection(
+    start: [f32; 3],
+    end: [f32; 3],
+    polygon: &[[f32; 3]],
+    normal: [f32; 3],
+) -> Option<f32> {
+    let direction = sub(end, start);
+    let denominator = dot(direction, normal);
+    if denominator.abs() <= 1e-6 {
+        return None;
+    }
+    let amount = dot(sub(polygon.first().copied()?, start), normal) / denominator;
+    if !(0.0..=1.0).contains(&amount) {
+        return None;
+    }
+    point_in_polygon(add(start, scale(direction, amount)), polygon, normal).then_some(amount)
+}
+
+fn infodecal_target(
+    input: &BuildInput<'_>,
+    origin: [f32; 3],
+) -> Option<(usize, usize, ModelTransform)> {
+    let extent = [INFODECAL_TRACE_EXTENT; 3];
+    let start = sub(origin, extent);
+    let end = add(origin, extent);
+    let mut targets = Vec::new();
+    for (face_index, face) in input.faces.iter().copied().enumerate() {
+        // Exact displacement collision requires its compiled displaced triangles, not its base face.
+        if face.dispinfo >= 0 {
+            continue;
+        }
+        let Some(model_index) = input.face_owner.get(face_index).copied().flatten() else {
+            continue;
+        };
+        if !model_is_traceable(input, model_index) {
+            continue;
+        }
+        let Some(plane) = plane_for_face(input.planes, face) else {
+            continue;
+        };
+        let Ok(local_polygon) = face_positions(
+            face,
+            input.surfedges,
+            input.edges,
+            input.vertices,
+            face_index,
+        ) else {
+            continue;
+        };
+        let transform = model_transform(input, model_index);
+        let polygon: Vec<_> = local_polygon
+            .into_iter()
+            .map(|point| transform.point_to_world(point))
+            .collect();
+        let normal = transform.vector_to_world(plane.normal);
+        let Some(amount) = segment_face_intersection(start, end, &polygon, normal) else {
+            continue;
+        };
+        targets.push((amount, model_index, face_index, transform));
+    }
+    targets
+        .into_iter()
+        .min_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| (left.1 != 0).cmp(&(right.1 != 0)))
+                .then(left.1.cmp(&right.1))
+                .then(left.2.cmp(&right.2))
+        })
+        .map(|(_, model, face, transform)| (model, face, transform))
+}
+
+fn face_decal_eligibility(
+    input: &BuildInput<'_>,
+    face: Face,
+    texinfo: &TexInfo,
+) -> FaceDecalEligibility {
+    if texinfo.flags & NON_DECAL_SURFACES != 0 || face.dispinfo >= 0 {
+        return FaceDecalEligibility::Rejects;
+    }
+    let Some(material_index) = usize::try_from(texinfo.texdata).ok() else {
+        return FaceDecalEligibility::Unknown;
+    };
+    let Some(material) = input
+        .material_manifest
+        .materials
+        .iter()
+        .find(|entry| entry.material_index == material_index)
+    else {
+        return FaceDecalEligibility::Unknown;
+    };
+    let Some(metadata) = &material.metadata else {
+        return FaceDecalEligibility::Unknown;
+    };
+    if metadata.features.alpha_test
+        || metadata
+            .shader
+            .inputs
+            .get("$nodecal")
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"))
+    {
+        FaceDecalEligibility::Rejects
+    } else {
+        FaceDecalEligibility::Accepts
+    }
 }
 
 fn projected_point(point: [f32; 3], plane: Plane) -> [f32; 3] {
@@ -619,6 +858,21 @@ fn fragment(
     for index in 1..polygon.len() - 1 {
         indices.extend_from_slice(&[0, index as u32, index as u32 + 1]);
     }
+    if indices
+        .chunks_exact(3)
+        .find_map(|triangle| {
+            let a = polygon[triangle[0] as usize].position;
+            let b = polygon[triangle[1] as usize].position;
+            let c = polygon[triangle[2] as usize].position;
+            let facing = dot(cross(sub(b, a), sub(c, a)), plane.normal);
+            (facing.abs() > 1e-8).then_some(facing)
+        })
+        .is_some_and(|facing| facing < 0.0)
+    {
+        for triangle in indices.chunks_exact_mut(3) {
+            triangle.swap(1, 2);
+        }
+    }
     let lightmap_uvs = polygon
         .iter()
         .map(|vertex| {
@@ -654,33 +908,48 @@ fn infodecal_fragments(
     origin: [f32; 3],
     width: f32,
     height: f32,
-) -> (Option<DecalOverlayBasis>, Vec<DecalOverlayFragment>) {
-    let query_radius = width.max(height) * 0.5;
-    let mut candidates = Vec::new();
+) -> InfodecalProjection {
+    let Some((target_model, target_face, transform)) = infodecal_target(input, origin) else {
+        return InfodecalProjection {
+            basis: None,
+            target: None,
+            fragments: Vec::new(),
+            unknown_receiver: false,
+        };
+    };
+    let local_origin = transform.point_to_local(origin);
+    let target_basis = input
+        .faces
+        .get(target_face)
+        .copied()
+        .and_then(|face| plane_for_face(input.planes, face))
+        .and_then(|plane| decal_basis(plane.normal));
+    let mut fragments = Vec::new();
+    let mut unknown_receiver = false;
     for (face_index, face) in input.faces.iter().copied().enumerate() {
         let Some(model_index) = input.face_owner.get(face_index).copied().flatten() else {
             continue;
         };
+        if model_index != target_model {
+            continue;
+        }
         let Some(texinfo) = usize::try_from(face.texinfo)
             .ok()
             .and_then(|index| input.texinfos.get(index))
         else {
             continue;
         };
-        if texinfo.flags & NON_DECAL_SURFACES != 0 || face.dispinfo >= 0 {
-            continue;
-        }
         let Some(plane) = plane_for_face(input.planes, face) else {
             continue;
         };
-        let distance = dot(origin, plane.normal) - plane.distance;
-        if distance.abs() >= query_radius {
+        let distance = dot(local_origin, plane.normal) - plane.distance;
+        if distance.abs() >= DECAL_PLANE_DISTANCE {
             continue;
         }
         let Some(basis) = decal_basis(plane.normal) else {
             continue;
         };
-        let center = projected_point(origin, plane);
+        let center = projected_point(local_origin, plane);
         let half_u = scale(basis.u, width * 0.5);
         let half_v = scale(basis.v, height * 0.5);
         let subject = vec![
@@ -710,22 +979,18 @@ fn infodecal_fragments(
         ) else {
             continue;
         };
-        let intersects_query = (0..3).all(|axis| {
-            let minimum = face_polygon
-                .iter()
-                .map(|point| point[axis])
-                .fold(f32::INFINITY, f32::min);
-            let maximum = face_polygon
-                .iter()
-                .map(|point| point[axis])
-                .fold(f32::NEG_INFINITY, f32::max);
-            origin[axis] + query_radius >= minimum && origin[axis] - query_radius <= maximum
-        });
-        if !intersects_query {
+        let polygon = clip_polygon(subject, &face_polygon, plane.normal);
+        if polygon.len() < 3 {
             continue;
         }
-        let contains_origin = point_in_polygon(center, &face_polygon, plane.normal);
-        let polygon = clip_polygon(subject, &face_polygon, plane.normal);
+        match face_decal_eligibility(input, face, texinfo) {
+            FaceDecalEligibility::Accepts => {}
+            FaceDecalEligibility::Rejects => continue,
+            FaceDecalEligibility::Unknown => {
+                unknown_receiver = true;
+                continue;
+            }
+        }
         if let Some(item) = fragment(
             face_index,
             model_index,
@@ -735,32 +1000,18 @@ fn infodecal_fragments(
             texinfo,
             input.lightmaps,
         ) {
-            candidates.push((model_index, contains_origin, distance.abs(), basis, item));
+            fragments.push(item);
         }
     }
-    let Some(chosen_model) = candidates
-        .iter()
-        .map(|(model, contains, distance, _, _)| (*model, *contains, *distance))
-        .min_by(|left, right| {
-            right
-                .1
-                .cmp(&left.1)
-                .then(left.2.total_cmp(&right.2))
-                .then(left.0.cmp(&right.0))
-        })
-        .map(|candidate| candidate.0)
-    else {
-        return (None, Vec::new());
-    };
-    let basis = candidates
-        .iter()
-        .find(|candidate| candidate.0 == chosen_model)
-        .map(|candidate| candidate.3.clone());
-    let fragments = candidates
-        .into_iter()
-        .filter_map(|candidate| (candidate.0 == chosen_model).then_some(candidate.4))
-        .collect();
-    (basis, fragments)
+    if unknown_receiver {
+        fragments.clear();
+    }
+    InfodecalProjection {
+        basis: target_basis,
+        target: Some((target_model, target_face)),
+        fragments,
+        unknown_receiver,
+    }
 }
 
 fn overlay_fragments(input: &BuildInput<'_>, source: &OverlaySource) -> Vec<DecalOverlayFragment> {
@@ -892,11 +1143,21 @@ pub(crate) fn build(input: BuildInput<'_>) -> Result<DecalOverlaySidecar, String
                 material_index,
             )
         });
-        let (basis, fragments) = match (origin, dimensions) {
+        let InfodecalProjection {
+            basis,
+            target: traced_target,
+            fragments,
+            unknown_receiver,
+        } = match (origin, dimensions) {
             (Some(origin), Some((width, height))) => {
                 infodecal_fragments(&input, origin, width, height)
             }
-            _ => (None, Vec::new()),
+            _ => InfodecalProjection {
+                basis: None,
+                target: None,
+                fragments: Vec::new(),
+                unknown_receiver: false,
+            },
         };
         let (status, reason) = if origin.is_none() || material_name.is_none() {
             (DecalOverlayStatus::Malformed, "entity-fields-malformed")
@@ -917,12 +1178,22 @@ pub(crate) fn build(input: BuildInput<'_>) -> Result<DecalOverlaySidecar, String
                 DecalOverlayStatus::Unsupported,
                 "material-dimensions-unavailable",
             )
+        } else if unknown_receiver {
+            (
+                DecalOverlayStatus::Unsupported,
+                "target-material-eligibility-unresolved",
+            )
+        } else if fragments.is_empty() && traced_target.is_some() {
+            (
+                DecalOverlayStatus::Inert,
+                "target-surface-does-not-accept-decals",
+            )
         } else if fragments.is_empty() {
             (DecalOverlayStatus::Unsupported, "target-face-unresolved")
         } else {
             (DecalOverlayStatus::Handled, "projected-to-compiled-faces")
         };
-        let target_model = fragments.first().map(|fragment| fragment.bsp_model_index);
+        let target_model = traced_target.map(|(model, _)| model);
         records.push(DecalOverlayRecord {
             kind: "infodecal".to_owned(),
             source_index: entity_index,
@@ -946,9 +1217,13 @@ pub(crate) fn build(input: BuildInput<'_>) -> Result<DecalOverlaySidecar, String
                 low_priority: entity_property(entity, "LowPriority")
                     .is_some_and(|value| value == "1"),
             },
-            target: target_model.map(|bsp_model_index| DecalOverlayTarget {
+            target: traced_target.map(|(bsp_model_index, traced_face)| DecalOverlayTarget {
                 bsp_model_index,
-                bsp_face_indices: fragments.iter().map(|item| item.bsp_face_index).collect(),
+                bsp_face_indices: if fragments.is_empty() {
+                    vec![traced_face]
+                } else {
+                    fragments.iter().map(|item| item.bsp_face_index).collect()
+                },
             }),
             parent_entity_index: target_model.and_then(|model| parent_entity_index(&input, model)),
             raw,
@@ -1096,4 +1371,533 @@ pub(crate) fn build(input: BuildInput<'_>) -> Result<DecalOverlaySidecar, String
         records,
         unknown_lumps,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        EntityProperty, Face, ManifestResource, MaterialLimitations, Plane, ResourceProvenance,
+        SourceMaterialEntry, SourceMaterialManifest, TexInfo, UnsupportedMaterialFeatures,
+        VmtFeatures, VmtMaterial, VmtShaderMetadata, VmtTextureInputs,
+    };
+
+    #[derive(Default)]
+    struct GeometryFixture {
+        planes: Vec<Plane>,
+        faces: Vec<Face>,
+        face_owner: Vec<Option<usize>>,
+        texinfos: Vec<TexInfo>,
+        surfedges: Vec<i32>,
+        edges: Vec<[u16; 2]>,
+        vertices: Vec<[f32; 3]>,
+        entities: Vec<Entity>,
+    }
+
+    impl GeometryFixture {
+        fn add_face(
+            &mut self,
+            model: usize,
+            normal: [f32; 3],
+            distance: f32,
+            positions: [[f32; 3]; 4],
+            flags: i32,
+            displacement: bool,
+        ) {
+            let plane = self.planes.len();
+            self.planes.push(Plane {
+                normal,
+                distance,
+                plane_type: 0,
+            });
+            let first_edge = self.surfedges.len() as i32;
+            let first_vertex = self.vertices.len();
+            self.vertices.extend(positions);
+            for index in 0..4 {
+                let edge = self.edges.len();
+                self.edges.push([
+                    (first_vertex + index) as u16,
+                    (first_vertex + (index + 1) % 4) as u16,
+                ]);
+                self.surfedges.push(edge as i32);
+            }
+            let texinfo = self.texinfos.len() as i16;
+            self.texinfos.push(TexInfo {
+                texture_vecs: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                lightmap_vecs: [[0.0; 4]; 2],
+                flags,
+                texdata: 0,
+            });
+            self.faces.push(Face {
+                plane,
+                _side: false,
+                first_edge,
+                num_edges: 4,
+                texinfo,
+                dispinfo: if displacement { 0 } else { -1 },
+                styles: [255; 4],
+                light_offset: -1,
+                lightmap_mins: [0; 2],
+                lightmap_size: [0; 2],
+                num_primitives: 0,
+                first_primitive: 0,
+            });
+            self.face_owner.push(Some(model));
+        }
+
+        fn add_model_entity(&mut self, model: usize, origin: &str, angles: &str) {
+            self.entities.push(vec![
+                EntityProperty {
+                    key: "classname".to_owned(),
+                    value: "func_button".to_owned(),
+                },
+                EntityProperty {
+                    key: "model".to_owned(),
+                    value: format!("*{model}"),
+                },
+                EntityProperty {
+                    key: "origin".to_owned(),
+                    value: origin.to_owned(),
+                },
+                EntityProperty {
+                    key: "angles".to_owned(),
+                    value: angles.to_owned(),
+                },
+            ]);
+        }
+
+        fn input<'a>(&'a self, manifest: &'a SourceMaterialManifest) -> BuildInput<'a> {
+            BuildInput {
+                bsp_version: 20,
+                entities: &self.entities,
+                overlay_data: &[],
+                overlay_version: 0,
+                water_overlay_data: &[],
+                water_overlay_version: 0,
+                overlay_fades: &[],
+                planes: &self.planes,
+                faces: &self.faces,
+                face_owner: &self.face_owner,
+                texinfos: &self.texinfos,
+                material_names: &[],
+                material_manifest: manifest,
+                material_textures: None,
+                surfedges: &self.surfedges,
+                edges: &self.edges,
+                vertices: &self.vertices,
+                lightmaps: None,
+            }
+        }
+    }
+
+    fn empty_manifest() -> SourceMaterialManifest {
+        SourceMaterialManifest {
+            schema_version: 1,
+            lookup_policy: String::new(),
+            materials: Vec::new(),
+            embedded_resources: Vec::new(),
+            unresolved_assets: Vec::new(),
+            limitations: MaterialLimitations {
+                vtf_pixel_conversion: String::new(),
+                proxies: String::new(),
+                animated_materials: String::new(),
+            },
+        }
+    }
+
+    fn receiving_material_manifest(alpha_test: bool, nodecal: bool) -> SourceMaterialManifest {
+        let mut manifest = empty_manifest();
+        manifest.materials.push(SourceMaterialEntry {
+            material_index: 0,
+            name: "fixture/receiving".to_owned(),
+            vmt: ManifestResource {
+                lookup_path: "materials/fixture/receiving.vmt".to_owned(),
+                provenance: ResourceProvenance::BuiltIn,
+            },
+            dependencies: Vec::new(),
+            metadata: Some(VmtMaterial {
+                shader: VmtShaderMetadata {
+                    name: "LightmappedGeneric".to_owned(),
+                    family: "lightmappedGeneric".to_owned(),
+                    inputs: if nodecal {
+                        [("$nodecal".to_owned(), "1".to_owned())].into()
+                    } else {
+                        BTreeMap::new()
+                    },
+                },
+                textures: VmtTextureInputs::default(),
+                features: VmtFeatures {
+                    alpha_test,
+                    ..VmtFeatures::default()
+                },
+                surface_prop: None,
+                proxy_definitions: Vec::new(),
+                unsupported: UnsupportedMaterialFeatures::default(),
+            }),
+            textures: Vec::new(),
+        });
+        manifest
+    }
+
+    fn triangle_faces_compiled_normal(fragment: &DecalOverlayFragment) -> bool {
+        fragment.indices.chunks_exact(3).all(|triangle| {
+            let a = fragment.positions[triangle[0] as usize];
+            let b = fragment.positions[triangle[1] as usize];
+            let c = fragment.positions[triangle[2] as usize];
+            dot(
+                cross(sub(b, a), sub(c, a)),
+                fragment.normals[triangle[0] as usize],
+            ) > 0.0
+        })
+    }
+
+    #[test]
+    fn infodecal_dimensions_use_source_integer_world_units() {
+        assert_eq!(decal_world_dimension(127, 0.3), Some(38.0));
+        assert_eq!(decal_world_dimension(255, 0.3), Some(76.0));
+        assert_eq!(decal_world_dimension(1, 0.5), None);
+    }
+
+    #[test]
+    fn infodecal_uses_the_first_short_diagonal_trace_surface_to_choose_its_model() {
+        let mut fixture = GeometryFixture::default();
+        fixture.add_face(
+            0,
+            [0.0, 0.0, 1.0],
+            -2.0,
+            [
+                [-16.0, -16.0, -2.0],
+                [16.0, -16.0, -2.0],
+                [16.0, 16.0, -2.0],
+                [-16.0, 16.0, -2.0],
+            ],
+            0,
+            false,
+        );
+        fixture.add_face(
+            1,
+            [-1.0, 0.0, 0.0],
+            0.0,
+            [
+                [0.0, -16.0, -16.0],
+                [0.0, -16.0, 16.0],
+                [0.0, 16.0, 16.0],
+                [0.0, 16.0, -16.0],
+            ],
+            0,
+            false,
+        );
+
+        let manifest = receiving_material_manifest(false, false);
+        let InfodecalProjection {
+            basis,
+            target,
+            fragments,
+            unknown_receiver,
+        } = infodecal_fragments(&fixture.input(&manifest), [0.0; 3], 16.0, 16.0);
+
+        assert_eq!(basis.unwrap().normal, [0.0, 0.0, 1.0]);
+        assert_eq!(target, Some((0, 0)));
+        assert!(!unknown_receiver);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| (fragment.bsp_model_index, fragment.bsp_face_index))
+                .collect::<Vec<_>>(),
+            [(0, 0)]
+        );
+        assert!(fragments.iter().all(triangle_faces_compiled_normal));
+    }
+
+    #[test]
+    fn infodecal_applies_only_within_source_plane_distance_and_face_eligibility() {
+        let mut fixture = GeometryFixture::default();
+        let wall = [
+            [0.0, -16.0, -16.0],
+            [0.0, -16.0, 16.0],
+            [0.0, 16.0, 16.0],
+            [0.0, 16.0, -16.0],
+        ];
+        fixture.add_face(0, [-1.0, 0.0, 0.0], 0.0, wall, 0, false);
+        fixture.add_face(
+            0,
+            [-1.0, 0.0, 0.0],
+            -8.0,
+            wall.map(|point| [8.0, point[1], point[2]]),
+            0,
+            false,
+        );
+        fixture.add_face(0, [-1.0, 0.0, 0.0], 0.0, wall, 0, true);
+        fixture.add_face(0, [-1.0, 0.0, 0.0], 0.0, wall, SURF_NODECALS, false);
+
+        let manifest = receiving_material_manifest(false, false);
+        let InfodecalProjection {
+            basis,
+            target,
+            fragments,
+            unknown_receiver,
+        } = infodecal_fragments(&fixture.input(&manifest), [0.0; 3], 16.0, 16.0);
+
+        assert_eq!(basis.unwrap().normal, [-1.0, 0.0, 0.0]);
+        assert_eq!(target, Some((0, 0)));
+        assert!(!unknown_receiver);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.bsp_face_index)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert!(fragments.iter().all(triangle_faces_compiled_normal));
+    }
+
+    #[test]
+    fn infodecal_brush_target_is_traced_in_world_and_emitted_in_model_space() {
+        let mut fixture = GeometryFixture::default();
+        fixture.add_model_entity(1, "100 20 30", "0 90 0");
+        fixture.add_face(
+            1,
+            [-1.0, 0.0, 0.0],
+            0.0,
+            [
+                [0.0, -16.0, -16.0],
+                [0.0, -16.0, 16.0],
+                [0.0, 16.0, 16.0],
+                [0.0, 16.0, -16.0],
+            ],
+            0,
+            false,
+        );
+        let manifest = receiving_material_manifest(false, false);
+
+        let InfodecalProjection {
+            basis,
+            target,
+            fragments,
+            unknown_receiver,
+        } = infodecal_fragments(&fixture.input(&manifest), [100.0, 20.0, 30.0], 16.0, 16.0);
+
+        assert_eq!(basis.unwrap().normal, [-1.0, 0.0, 0.0]);
+        assert_eq!(target, Some((1, 0)));
+        assert!(!unknown_receiver);
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].bsp_model_index, 1);
+        assert!(
+            fragments[0]
+                .positions
+                .iter()
+                .all(|position| position[0].abs() <= f32::EPSILON)
+        );
+        assert!(fragments.iter().all(triangle_faces_compiled_normal));
+    }
+
+    #[test]
+    fn infodecal_retains_a_traced_target_when_the_surface_rejects_decals() {
+        let mut fixture = GeometryFixture::default();
+        fixture.add_face(
+            0,
+            [-1.0, 0.0, 0.0],
+            0.0,
+            [
+                [0.0, -16.0, -16.0],
+                [0.0, -16.0, 16.0],
+                [0.0, 16.0, 16.0],
+                [0.0, 16.0, -16.0],
+            ],
+            SURF_NODECALS,
+            false,
+        );
+        let manifest = receiving_material_manifest(false, false);
+
+        let InfodecalProjection {
+            basis,
+            target,
+            fragments,
+            unknown_receiver,
+        } = infodecal_fragments(&fixture.input(&manifest), [0.0; 3], 16.0, 16.0);
+
+        assert_eq!(basis.unwrap().normal, [-1.0, 0.0, 0.0]);
+        assert_eq!(target, Some((0, 0)));
+        assert!(!unknown_receiver);
+        assert!(fragments.is_empty());
+    }
+
+    #[test]
+    fn infodecal_rejects_alpha_tested_and_material_suppressed_receivers() {
+        for manifest in [
+            receiving_material_manifest(true, false),
+            receiving_material_manifest(false, true),
+        ] {
+            let mut fixture = GeometryFixture::default();
+            fixture.add_face(
+                0,
+                [-1.0, 0.0, 0.0],
+                0.0,
+                [
+                    [0.0, -16.0, -16.0],
+                    [0.0, -16.0, 16.0],
+                    [0.0, 16.0, 16.0],
+                    [0.0, 16.0, -16.0],
+                ],
+                0,
+                false,
+            );
+
+            let InfodecalProjection {
+                target,
+                fragments,
+                unknown_receiver,
+                ..
+            } = infodecal_fragments(&fixture.input(&manifest), [0.0; 3], 16.0, 16.0);
+
+            assert_eq!(target, Some((0, 0)));
+            assert!(!unknown_receiver);
+            assert!(fragments.is_empty());
+        }
+    }
+
+    #[test]
+    fn infodecal_fails_closed_when_receiver_material_eligibility_is_unknown() {
+        let mut fixture = GeometryFixture::default();
+        fixture.add_face(
+            0,
+            [-1.0, 0.0, 0.0],
+            0.0,
+            [
+                [0.0, -16.0, -16.0],
+                [0.0, -16.0, 16.0],
+                [0.0, 16.0, 16.0],
+                [0.0, 16.0, -16.0],
+            ],
+            0,
+            false,
+        );
+        let manifest = empty_manifest();
+
+        let InfodecalProjection {
+            target,
+            fragments,
+            unknown_receiver,
+            ..
+        } = infodecal_fragments(&fixture.input(&manifest), [0.0; 3], 16.0, 16.0);
+
+        assert_eq!(target, Some((0, 0)));
+        assert!(unknown_receiver);
+        assert!(fragments.is_empty());
+    }
+
+    #[test]
+    fn infodecal_displacement_target_fails_closed_without_compiled_triangles() {
+        let mut fixture = GeometryFixture::default();
+        fixture.add_face(
+            0,
+            [0.0, 0.0, 1.0],
+            0.0,
+            [
+                [-16.0, -16.0, 0.0],
+                [16.0, -16.0, 0.0],
+                [16.0, 16.0, 0.0],
+                [-16.0, 16.0, 0.0],
+            ],
+            0,
+            true,
+        );
+        let manifest = receiving_material_manifest(false, false);
+
+        let InfodecalProjection {
+            basis,
+            target,
+            fragments,
+            unknown_receiver,
+        } = infodecal_fragments(&fixture.input(&manifest), [0.0; 3], 16.0, 16.0);
+
+        assert!(basis.is_none());
+        assert!(target.is_none());
+        assert!(!unknown_receiver);
+        assert!(fragments.is_empty());
+    }
+
+    #[test]
+    fn infodecal_clips_across_coplanar_adjacent_faces_at_exact_world_dimensions() {
+        let mut fixture = GeometryFixture::default();
+        fixture.add_face(
+            0,
+            [-1.0, 0.0, 0.0],
+            0.0,
+            [
+                [0.0, -96.0, -160.0],
+                [0.0, -96.0, 160.0],
+                [0.0, 0.0, 160.0],
+                [0.0, 0.0, -160.0],
+            ],
+            0,
+            false,
+        );
+        fixture.add_face(
+            0,
+            [-1.0, 0.0, 0.0],
+            0.0,
+            [
+                [0.0, 0.0, -160.0],
+                [0.0, 0.0, 160.0],
+                [0.0, 96.0, 160.0],
+                [0.0, 96.0, -160.0],
+            ],
+            0,
+            false,
+        );
+
+        let manifest = receiving_material_manifest(false, false);
+        let InfodecalProjection {
+            basis,
+            target,
+            fragments,
+            unknown_receiver,
+        } = infodecal_fragments(&fixture.input(&manifest), [0.0; 3], 128.0, 256.0);
+
+        assert_eq!(basis.as_ref().unwrap().u, [0.0, -1.0, 0.0]);
+        assert_eq!(basis.as_ref().unwrap().v, [0.0, 0.0, -1.0]);
+        assert_eq!(target, Some((0, 0)));
+        assert!(!unknown_receiver);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.bsp_face_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let positions: Vec<_> = fragments
+            .iter()
+            .flat_map(|fragment| fragment.positions.iter())
+            .collect();
+        assert_eq!(
+            positions
+                .iter()
+                .map(|position| position[1])
+                .fold(f32::INFINITY, f32::min),
+            -64.0
+        );
+        assert_eq!(
+            positions
+                .iter()
+                .map(|position| position[1])
+                .fold(f32::NEG_INFINITY, f32::max),
+            64.0
+        );
+        assert_eq!(
+            positions
+                .iter()
+                .map(|position| position[2])
+                .fold(f32::INFINITY, f32::min),
+            -128.0
+        );
+        assert_eq!(
+            positions
+                .iter()
+                .map(|position| position[2])
+                .fold(f32::NEG_INFINITY, f32::max),
+            128.0
+        );
+        assert!(fragments.iter().all(triangle_faces_compiled_normal));
+    }
 }

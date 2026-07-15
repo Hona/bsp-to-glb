@@ -1627,6 +1627,10 @@ fn projects_and_clips_a_resolved_infodecal_without_geometric_depth_offset() {
         &mut bsp,
         &[
             (
+                "materials/brick/test.vmt",
+                br#"LightmappedGeneric {}"# as &[u8],
+            ),
+            (
                 "materials/signs/test.vmt",
                 br#"LightmappedGeneric {
                     "$basetexture" "signs/test"
@@ -1670,7 +1674,7 @@ fn projects_and_clips_a_resolved_infodecal_without_geometric_depth_offset() {
         record.fragments[0].uvs,
         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
     );
-    assert_eq!(record.fragments[0].indices, [0, 1, 2, 0, 2, 3]);
+    assert_eq!(record.fragments[0].indices, [0, 2, 1, 0, 3, 2]);
 }
 
 #[test]
