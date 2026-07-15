@@ -14,6 +14,7 @@ const MAX_TOTAL_MATERIAL_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MATERIAL_MANIFEST_VERSION: u32 = 3;
 pub const MATERIAL_TEXTURE_MANIFEST_VERSION: u32 = 2;
 const MAX_PACKAGED_VTF_FRAMES: u16 = 256;
+const MAX_PACKAGED_VTF_SUBRESOURCES: usize = 16_384;
 const MAX_PACKAGED_VTF_DECODED_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -69,11 +70,25 @@ pub struct VmtTextureInputs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_texture2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bump_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bump_map2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blend_modulate_texture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_map: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_map_mask: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_illum_mask: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_map: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -159,12 +174,34 @@ pub struct ManifestResource {
 #[serde(rename_all = "camelCase")]
 pub struct ManifestTexture {
     pub role: String,
+    pub parameter: String,
+    pub semantic: TextureSemantic,
     pub reference: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lookup_path: Option<String>,
     pub provenance: ResourceProvenance,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_in_binding: Option<BuiltInTextureBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub package_source_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BuiltInTextureBinding {
+    EnvironmentLookup,
+    RenderTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextureSemantic {
+    Color,
+    Detail,
+    Environment,
+    Flow,
+    Mask,
+    Normal,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -173,6 +210,8 @@ pub struct SourceMaterialEntry {
     pub material_index: usize,
     pub name: String,
     pub vmt: ManifestResource,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<ManifestResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<VmtMaterial>,
     pub textures: Vec<ManifestTexture>,
@@ -247,8 +286,20 @@ pub struct MaterialTextureSource {
     pub output: Option<MaterialTextureOutput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub frame_outputs: Vec<MaterialTextureOutput>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub strict_subresource_outputs: Vec<MaterialTextureSubresourceOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialTextureSubresourceOutput {
+    pub frame: u16,
+    pub mip: u8,
+    pub face: u8,
+    pub slice: u16,
+    pub output: MaterialTextureOutput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -632,10 +683,18 @@ fn material_from_document(document: ParsedVmt) -> Result<VmtMaterial, String> {
     });
     let textures = VmtTextureInputs {
         base_texture: texture_input(&values, "$basetexture"),
+        base_texture2: texture_input(&values, "$basetexture2"),
         bump_map: texture_input(&values, "$bumpmap")
             .or_else(|| texture_input(&values, "$normalmap")),
+        normal_map: texture_input(&values, "$bumpmap")
+            .and_then(|_| texture_input(&values, "$normalmap")),
+        bump_map2: texture_input(&values, "$bumpmap2"),
+        blend_modulate_texture: texture_input(&values, "$blendmodulatetexture"),
         detail: texture_input(&values, "$detail"),
         env_map: texture_input(&values, "$envmap"),
+        env_map_mask: texture_input(&values, "$envmapmask"),
+        self_illum_mask: texture_input(&values, "$selfillummask"),
+        flow_map: texture_input(&values, "$flowmap"),
     };
     let family = shader_family(&document.shader).to_owned();
     let features = VmtFeatures {
@@ -918,18 +977,24 @@ fn accumulate_patch(document: &ParsedVmt, changes: &mut PatchChanges) -> Result<
     Ok(include.to_owned())
 }
 
+struct ResolvedVmt {
+    material: VmtMaterial,
+    dependencies: Vec<ManifestResource>,
+}
+
 fn resolve_effective_vmt(
     root_data: &[u8],
     root_path: &str,
     embedded_resources: &[PakResource],
     by_path: &HashMap<String, usize>,
     resolver: Option<&dyn MaterialResolver>,
-) -> Result<VmtMaterial, String> {
+) -> Result<ResolvedVmt, String> {
     let mut document = parse_vmt_document(root_data)
         .map_err(|error| format!("failed to parse {root_path}: {error}"))?;
     let mut current_path = root_path.to_owned();
     let mut visited = HashSet::from([root_path.to_ascii_lowercase()]);
     let mut changes = PatchChanges::default();
+    let mut dependencies = Vec::new();
     let mut patch_depth = 0;
 
     while document.shader.eq_ignore_ascii_case("Patch") {
@@ -947,17 +1012,28 @@ fn resolve_effective_vmt(
             ));
         }
 
-        let data = if let Some(resource) = lookup_pak(embedded_resources, by_path, &include_path) {
-            Cow::Borrowed(resource.data.as_slice())
-        } else if let Some(resource) =
-            resolve_external(resolver, &include_path, PakResourceKind::Vmt)?
-        {
-            Cow::Owned(resource.data)
-        } else {
-            return Err(format!(
-                "Patch VMT {current_path} includes unavailable dependency {include_path}"
-            ));
-        };
+        let (data, provenance) =
+            if let Some(resource) = lookup_pak(embedded_resources, by_path, &include_path) {
+                (
+                    Cow::Borrowed(resource.data.as_slice()),
+                    pak_provenance(&include_path, &resource.data),
+                )
+            } else if let Some(resource) =
+                resolve_external(resolver, &include_path, PakResourceKind::Vmt)?
+            {
+                (
+                    Cow::Owned(resource.data),
+                    external_provenance(resource.provenance),
+                )
+            } else {
+                return Err(format!(
+                    "Patch VMT {current_path} includes unavailable dependency {include_path}"
+                ));
+            };
+        dependencies.push(ManifestResource {
+            lookup_path: include_path.clone(),
+            provenance,
+        });
         document = parse_vmt_document(&data)
             .map_err(|error| format!("failed to parse Patch dependency {include_path}: {error}"))?;
         current_path = include_path;
@@ -966,7 +1042,10 @@ fn resolve_effective_vmt(
 
     apply_patch_entries(&mut document.values, &changes.insert, false, 1)?;
     apply_patch_entries(&mut document.values, &changes.replace, true, 1)?;
-    material_from_document(document)
+    Ok(ResolvedVmt {
+        material: material_from_document(document)?,
+        dependencies,
+    })
 }
 
 struct TexturePackageBuilder {
@@ -976,6 +1055,55 @@ struct TexturePackageBuilder {
     outputs: Vec<MaterialTextureOutput>,
     artifacts: Vec<MaterialTextureArtifact>,
     artifact_by_pixels: HashMap<String, usize>,
+}
+
+fn strict_texture_selections(metadata: &VtfMetadata) -> Result<Vec<VtfImageSelection>, ()> {
+    let mut selections = Vec::new();
+    for frame in 0..metadata.frames {
+        for face in 0..metadata.faces {
+            for mip in 0..metadata.mip_count {
+                let depth = metadata
+                    .depth
+                    .checked_shr(u32::from(mip))
+                    .unwrap_or(0)
+                    .max(1);
+                for slice in 0..depth {
+                    selections.push(VtfImageSelection {
+                        mip,
+                        frame,
+                        face,
+                        slice: u16::try_from(slice).map_err(|_| ())?,
+                    });
+                    if selections.len() > MAX_PACKAGED_VTF_SUBRESOURCES {
+                        return Err(());
+                    }
+                }
+            }
+        }
+    }
+    Ok(selections)
+}
+
+fn strict_texture_decoded_bytes(
+    metadata: &VtfMetadata,
+    selections: &[VtfImageSelection],
+) -> Option<usize> {
+    selections.iter().try_fold(0_usize, |total, selection| {
+        let width = metadata
+            .width
+            .checked_shr(u32::from(selection.mip))
+            .unwrap_or(0)
+            .max(1) as usize;
+        let height = metadata
+            .height
+            .checked_shr(u32::from(selection.mip))
+            .unwrap_or(0)
+            .max(1) as usize;
+        width
+            .checked_mul(height)
+            .and_then(|value| value.checked_mul(4))
+            .and_then(|value| total.checked_add(value))
+    })
 }
 
 impl TexturePackageBuilder {
@@ -1003,118 +1131,143 @@ impl TexturePackageBuilder {
         data: &[u8],
     ) -> Result<usize, String> {
         let metadata = inspect_vtf(data);
-        let (status, metadata, output, frame_outputs, error) = match metadata {
-            Ok(metadata) if metadata.frames > MAX_PACKAGED_VTF_FRAMES => (
-                TextureDecodeStatus::Unsupported,
-                Some(metadata.clone()),
-                None,
-                Vec::new(),
-                Some(format!(
-                    "VTF has {} frames; package limit is {MAX_PACKAGED_VTF_FRAMES}",
-                    metadata.frames
-                )),
-            ),
-            Ok(metadata) if self.selection.frame >= metadata.frames => (
-                TextureDecodeStatus::Invalid,
-                Some(metadata),
-                None,
-                Vec::new(),
-                Some(format!(
-                    "VTF frame {} is out of range",
-                    self.selection.frame
-                )),
-            ),
-            Ok(metadata) => {
-                let width = metadata
-                    .width
-                    .checked_shr(u32::from(self.selection.mip))
-                    .unwrap_or(0)
-                    .max(1) as usize;
-                let height = metadata
-                    .height
-                    .checked_shr(u32::from(self.selection.mip))
-                    .unwrap_or(0)
-                    .max(1) as usize;
-                let decoded_bytes = width
-                    .checked_mul(height)
-                    .and_then(|value| value.checked_mul(4))
-                    .and_then(|value| value.checked_mul(usize::from(metadata.frames)));
-                if decoded_bytes.is_none_or(|value| value > MAX_PACKAGED_VTF_DECODED_BYTES) {
-                    (
-                        TextureDecodeStatus::Unsupported,
-                        Some(metadata),
-                        None,
-                        Vec::new(),
-                        Some(format!(
-                            "VTF animated RGBA output exceeds the {MAX_PACKAGED_VTF_DECODED_BYTES}-byte package limit"
-                        )),
-                    )
-                } else {
-                    let decoded = (0..metadata.frames)
-                        .map(|frame| {
-                            decode_vtf(
-                                data,
-                                VtfImageSelection {
-                                    frame,
-                                    ..self.selection
-                                },
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>();
-                    match decoded {
-                        Ok(decoded) => {
-                            let frame_outputs = decoded
-                                .into_iter()
-                                .map(|decoded| self.add_decoded_output(decoded))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let output = frame_outputs
-                                .get(usize::from(self.selection.frame))
-                                .cloned();
-                            if output.is_none() {
+        let (status, metadata, output, frame_outputs, strict_subresource_outputs, error) =
+            match metadata {
+                Ok(metadata) if metadata.frames > MAX_PACKAGED_VTF_FRAMES => (
+                    TextureDecodeStatus::Unsupported,
+                    Some(metadata.clone()),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(format!(
+                        "VTF has {} frames; package limit is {MAX_PACKAGED_VTF_FRAMES}",
+                        metadata.frames
+                    )),
+                ),
+                Ok(metadata) if self.selection.frame >= metadata.frames => (
+                    TextureDecodeStatus::Invalid,
+                    Some(metadata),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(format!(
+                        "VTF frame {} is out of range",
+                        self.selection.frame
+                    )),
+                ),
+                Ok(metadata) => {
+                    let selections = strict_texture_selections(&metadata);
+                    let decoded_bytes = selections
+                        .as_ref()
+                        .ok()
+                        .and_then(|selections| strict_texture_decoded_bytes(&metadata, selections));
+                    if selections.is_err()
+                        || decoded_bytes.is_none_or(|value| value > MAX_PACKAGED_VTF_DECODED_BYTES)
+                    {
+                        (
+                            TextureDecodeStatus::Unsupported,
+                            Some(metadata),
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                            Some(format!(
+                                "VTF RGBA subresources exceed the {MAX_PACKAGED_VTF_DECODED_BYTES}-byte or {MAX_PACKAGED_VTF_SUBRESOURCES}-subresource package limit"
+                            )),
+                        )
+                    } else {
+                        let decoded = selections
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|selection| {
+                                decode_vtf(data, selection).map(|decoded| (selection, decoded))
+                            })
+                            .collect::<Result<Vec<_>, _>>();
+                        match decoded {
+                            Ok(decoded) => {
+                                let strict_subresource_outputs = decoded
+                                    .into_iter()
+                                    .map(|(selection, decoded)| {
+                                        self.add_decoded_output(decoded).map(|output| {
+                                            MaterialTextureSubresourceOutput {
+                                                frame: selection.frame,
+                                                mip: selection.mip,
+                                                face: selection.face,
+                                                slice: selection.slice,
+                                                output,
+                                            }
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let selected = |frame| {
+                                    strict_subresource_outputs
+                                        .iter()
+                                        .find(|entry| {
+                                            entry.frame == frame
+                                                && entry.mip == self.selection.mip
+                                                && entry.face == self.selection.face
+                                                && entry.slice == self.selection.slice
+                                        })
+                                        .map(|entry| entry.output.clone())
+                                };
+                                let output = selected(self.selection.frame);
+                                let frame_outputs = (0..metadata.frames)
+                                    .filter_map(selected)
+                                    .collect::<Vec<_>>();
+                                if output.is_none() {
+                                    (
+                                        TextureDecodeStatus::Invalid,
+                                        Some(metadata),
+                                        None,
+                                        Vec::new(),
+                                        Vec::new(),
+                                        Some(format!(
+                                            "VTF frame {} is out of range",
+                                            self.selection.frame
+                                        )),
+                                    )
+                                } else {
+                                    (
+                                        TextureDecodeStatus::Decoded,
+                                        Some(metadata),
+                                        output,
+                                        frame_outputs,
+                                        strict_subresource_outputs,
+                                        None,
+                                    )
+                                }
+                            }
+                            Err(decode_error) => {
+                                let status = match decode_error.kind {
+                                    VtfErrorKind::Invalid => TextureDecodeStatus::Invalid,
+                                    VtfErrorKind::Unsupported => TextureDecodeStatus::Unsupported,
+                                };
                                 (
-                                    TextureDecodeStatus::Invalid,
+                                    status,
                                     Some(metadata),
                                     None,
                                     Vec::new(),
-                                    Some(format!(
-                                        "VTF frame {} is out of range",
-                                        self.selection.frame
-                                    )),
-                                )
-                            } else {
-                                (
-                                    TextureDecodeStatus::Decoded,
-                                    Some(metadata),
-                                    output,
-                                    frame_outputs,
-                                    None,
+                                    Vec::new(),
+                                    Some(decode_error.message),
                                 )
                             }
                         }
-                        Err(decode_error) => {
-                            let status = match decode_error.kind {
-                                VtfErrorKind::Invalid => TextureDecodeStatus::Invalid,
-                                VtfErrorKind::Unsupported => TextureDecodeStatus::Unsupported,
-                            };
-                            (
-                                status,
-                                Some(metadata),
-                                None,
-                                Vec::new(),
-                                Some(decode_error.message),
-                            )
-                        }
                     }
                 }
-            }
-            Err(decode_error) => {
-                let status = match decode_error.kind {
-                    VtfErrorKind::Invalid => TextureDecodeStatus::Invalid,
-                    VtfErrorKind::Unsupported => TextureDecodeStatus::Unsupported,
-                };
-                (status, None, None, Vec::new(), Some(decode_error.message))
-            }
-        };
+                Err(decode_error) => {
+                    let status = match decode_error.kind {
+                        VtfErrorKind::Invalid => TextureDecodeStatus::Invalid,
+                        VtfErrorKind::Unsupported => TextureDecodeStatus::Unsupported,
+                    };
+                    (
+                        status,
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(decode_error.message),
+                    )
+                }
+            };
         let index = self.sources.len();
         self.source_by_path
             .insert(lookup_path.to_ascii_lowercase(), index);
@@ -1125,6 +1278,7 @@ impl TexturePackageBuilder {
             metadata,
             output,
             frame_outputs,
+            strict_subresource_outputs,
             error,
         });
         Ok(index)
@@ -1223,6 +1377,194 @@ struct MaterialBuild {
     texture_package: Option<(MaterialTextureManifest, Vec<MaterialTextureArtifact>)>,
 }
 
+#[derive(Clone, Copy)]
+struct TextureInputSpec {
+    parameter: &'static str,
+    role: &'static str,
+    semantic: TextureSemantic,
+}
+
+const MATERIAL_TEXTURE_INPUTS: &[TextureInputSpec] = &[
+    TextureInputSpec {
+        parameter: "$basetexture",
+        role: "baseTexture",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$basetexture2",
+        role: "baseTexture2",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$bumpmap",
+        role: "bumpMap",
+        semantic: TextureSemantic::Normal,
+    },
+    TextureInputSpec {
+        parameter: "$normalmap",
+        role: "normalMap",
+        semantic: TextureSemantic::Normal,
+    },
+    TextureInputSpec {
+        parameter: "$bumpmap2",
+        role: "bumpMap2",
+        semantic: TextureSemantic::Normal,
+    },
+    TextureInputSpec {
+        parameter: "$blendmodulatetexture",
+        role: "blendModulateTexture",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$detail",
+        role: "detail",
+        semantic: TextureSemantic::Detail,
+    },
+    TextureInputSpec {
+        parameter: "$envmap",
+        role: "envMap",
+        semantic: TextureSemantic::Environment,
+    },
+    TextureInputSpec {
+        parameter: "$envmapmask",
+        role: "envMapMask",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$selfillummask",
+        role: "selfIllumMask",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$flowmap",
+        role: "flowMap",
+        semantic: TextureSemantic::Flow,
+    },
+    TextureInputSpec {
+        parameter: "$dudvmap",
+        role: "dudvMap",
+        semantic: TextureSemantic::Flow,
+    },
+    TextureInputSpec {
+        parameter: "$ambientoccltexture",
+        role: "ambientOcclusionTexture",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$corneatexture",
+        role: "corneaTexture",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$emissiveblendbasetexture",
+        role: "emissiveBlendBaseTexture",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$emissiveblendflowtexture",
+        role: "emissiveBlendFlowTexture",
+        semantic: TextureSemantic::Flow,
+    },
+    TextureInputSpec {
+        parameter: "$emissiveblendtexture",
+        role: "emissiveBlendTexture",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$fleshbordertexture1d",
+        role: "fleshBorderTexture",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$fleshcubetexture",
+        role: "fleshCubeTexture",
+        semantic: TextureSemantic::Environment,
+    },
+    TextureInputSpec {
+        parameter: "$fleshinteriortexture",
+        role: "fleshInteriorTexture",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$fleshnormaltexture",
+        role: "fleshNormalTexture",
+        semantic: TextureSemantic::Normal,
+    },
+    TextureInputSpec {
+        parameter: "$fleshsubsurfacetexture",
+        role: "fleshSubsurfaceTexture",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$iris",
+        role: "iris",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$lightwarptexture",
+        role: "lightWarpTexture",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$masks1",
+        role: "masks1",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$masks2",
+        role: "masks2",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$phongexponenttexture",
+        role: "phongExponentTexture",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$phongwarptexture",
+        role: "phongWarpTexture",
+        semantic: TextureSemantic::Mask,
+    },
+    TextureInputSpec {
+        parameter: "$refracttinttexture",
+        role: "refractTintTexture",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$texture2",
+        role: "texture2",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$texture3",
+        role: "texture3",
+        semantic: TextureSemantic::Color,
+    },
+    TextureInputSpec {
+        parameter: "$wrinkle",
+        role: "wrinkle",
+        semantic: TextureSemantic::Normal,
+    },
+];
+
+fn material_texture_references(material: &VmtMaterial) -> Vec<(&TextureInputSpec, String)> {
+    MATERIAL_TEXTURE_INPUTS
+        .iter()
+        .filter_map(|spec| {
+            let reference = material.shader.inputs.get(spec.parameter)?.trim();
+            if reference.is_empty()
+                || reference.starts_with('$')
+                || reference.starts_with('[')
+                || reference.starts_with('{')
+                || reference.parse::<f64>().is_ok()
+            {
+                return None;
+            }
+            Some((spec, reference.replace('\\', "/")))
+        })
+        .collect()
+}
+
 fn build_materials(
     material_names: &[String],
     embedded_resources: &[PakResource],
@@ -1274,38 +1616,49 @@ fn build_materials(
             });
             (None, ResourceProvenance::Unresolved)
         };
-        let metadata = vmt_data
+        let resolved_vmt = vmt_data
             .as_deref()
             .map(|data| {
                 resolve_effective_vmt(data, &vmt_path, embedded_resources, &by_path, resolver)
             })
             .transpose()?;
+        let dependencies = resolved_vmt
+            .as_ref()
+            .map(|resolved| resolved.dependencies.clone())
+            .unwrap_or_default();
+        let metadata = resolved_vmt.map(|resolved| resolved.material);
         let mut textures = Vec::new();
         if let Some(material) = &metadata {
-            let references = [
-                ("baseTexture", material.textures.base_texture.as_deref()),
-                ("bumpMap", material.textures.bump_map.as_deref()),
-                ("detail", material.textures.detail.as_deref()),
-                ("envMap", material.textures.env_map.as_deref()),
-            ];
-            for (role, reference) in references {
-                let Some(reference) = reference else {
-                    continue;
+            for (spec, reference) in material_texture_references(material) {
+                let role = if spec.parameter == "$normalmap"
+                    && !material.shader.inputs.contains_key("$bumpmap")
+                {
+                    "bumpMap"
+                } else {
+                    spec.role
                 };
-                let built_in = role == "envMap"
-                    && (reference.eq_ignore_ascii_case("env_cubemap")
-                        || reference.to_ascii_lowercase().starts_with("_rt_"));
+                let built_in = reference.eq_ignore_ascii_case("env_cubemap")
+                    || reference.eq_ignore_ascii_case("editor/cubemap")
+                    || reference.to_ascii_lowercase().starts_with("_rt_");
                 if built_in {
+                    let built_in_binding = if reference.to_ascii_lowercase().starts_with("_rt_") {
+                        BuiltInTextureBinding::RenderTarget
+                    } else {
+                        BuiltInTextureBinding::EnvironmentLookup
+                    };
                     textures.push(ManifestTexture {
                         role: role.to_owned(),
-                        reference: reference.to_owned(),
+                        parameter: spec.parameter.to_owned(),
+                        semantic: spec.semantic,
+                        reference,
                         lookup_path: None,
                         provenance: ResourceProvenance::BuiltIn,
+                        built_in_binding: Some(built_in_binding),
                         package_source_index: None,
                     });
                     continue;
                 }
-                let lookup_path = source_lookup_path(reference, ".vtf")?;
+                let lookup_path = source_lookup_path(&reference, ".vtf")?;
                 let existing_source = texture_package
                     .as_ref()
                     .and_then(|package| package.source(&lookup_path));
@@ -1348,9 +1701,12 @@ fn build_materials(
                 };
                 textures.push(ManifestTexture {
                     role: role.to_owned(),
-                    reference: reference.to_owned(),
+                    parameter: spec.parameter.to_owned(),
+                    semantic: spec.semantic,
+                    reference,
                     lookup_path: Some(lookup_path),
                     provenance,
+                    built_in_binding: None,
                     package_source_index,
                 });
             }
@@ -1362,6 +1718,7 @@ fn build_materials(
                 lookup_path: vmt_path,
                 provenance: vmt_provenance,
             },
+            dependencies,
             metadata,
             textures,
         });

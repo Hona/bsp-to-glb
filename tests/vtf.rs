@@ -186,16 +186,21 @@ fn accepts_tf2_vtf_versions_70_through_75_and_versioned_cubemap_faces() {
         assert_eq!((metadata.version_major, metadata.version_minor), (7, minor));
     }
 
-    let mut legacy = vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[0; 6 * 4]);
-    put_u32(&mut legacy, 8, 0);
-    put_u32(&mut legacy, 20, 0x4000);
-    put_u16(&mut legacy, 26, u16::MAX);
-    assert_eq!(inspect_vtf(&legacy).unwrap().faces, 6);
+    let mut six_face = vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[0; 6 * 4]);
+    put_u32(&mut six_face, 8, 4);
+    put_u32(&mut six_face, 20, 0x4000);
+    put_u16(&mut six_face, 26, u16::MAX);
+    assert_eq!(inspect_vtf(&six_face).unwrap().faces, 6);
 
-    let mut current = vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[0; 7 * 4]);
+    let mut sphere_map = vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[0; 7 * 4]);
+    put_u32(&mut sphere_map, 8, 4);
+    put_u32(&mut sphere_map, 20, 0x4000);
+    assert_eq!(inspect_vtf(&sphere_map).unwrap().faces, 7);
+
+    let mut current = vtf_73(1, 1, IMAGE_FORMAT_RGBA8888, &[0; 6 * 4]);
     put_u32(&mut current, 8, 5);
     put_u32(&mut current, 20, 0x4000);
-    assert_eq!(inspect_vtf(&current).unwrap().faces, 7);
+    assert_eq!(inspect_vtf(&current).unwrap().faces, 6);
 }
 
 #[test]
@@ -640,10 +645,148 @@ fn material_package_emits_every_animated_frame_from_the_canonical_decoder() {
     .unwrap();
 
     assert_eq!(package.manifest.sources[0].frame_outputs.len(), 2);
+    assert_eq!(
+        package.manifest.sources[0].strict_subresource_outputs.len(),
+        2
+    );
+    assert_eq!(
+        package.manifest.sources[0].strict_subresource_outputs[0].frame,
+        0
+    );
+    assert_eq!(
+        package.manifest.sources[0].strict_subresource_outputs[1].frame,
+        1
+    );
     assert_eq!(package.artifacts.len(), 2);
     assert_eq!(
         package.manifest.sources[0].output,
         Some(package.manifest.sources[0].frame_outputs[0].clone())
+    );
+}
+
+#[test]
+fn material_package_emits_every_mip_face_and_slice_with_exact_semantics() {
+    let vmt = br#"WorldVertexTransition {
+        "$basetexture" "shared/color"
+        "$basetexture2" "shared/color2"
+        "$bumpmap" "shared/normal"
+        "$bumpmap2" "shared/normal2"
+        "$blendmodulatetexture" "shared/blend"
+        "$envmapmask" "shared/mask"
+        "$flowmap" "shared/flow"
+    }"#;
+    let mut cubemap = vtf_72(
+        2,
+        2,
+        IMAGE_FORMAT_RGBA8888,
+        1,
+        2,
+        0x4000,
+        &[0; (6 + 6 * 4) * 4],
+    );
+    put_u16(&mut cubemap, 26, u16::MAX);
+    let resources = [
+        PakResource {
+            path: "materials/shared/test.vmt".to_owned(),
+            kind: PakResourceKind::Vmt,
+            data: vmt.to_vec(),
+        },
+        PakResource {
+            path: "materials/shared/color.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: cubemap,
+        },
+        PakResource {
+            path: "materials/shared/color2.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: rgba_vtf([1, 2, 3, 255]),
+        },
+        PakResource {
+            path: "materials/shared/normal.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: rgba_vtf([1, 2, 3, 255]),
+        },
+        PakResource {
+            path: "materials/shared/normal2.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: rgba_vtf([1, 2, 3, 255]),
+        },
+        PakResource {
+            path: "materials/shared/blend.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: rgba_vtf([1, 2, 3, 255]),
+        },
+        PakResource {
+            path: "materials/shared/mask.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: rgba_vtf([1, 2, 3, 255]),
+        },
+        PakResource {
+            path: "materials/shared/flow.vtf".to_owned(),
+            kind: PakResourceKind::Vtf,
+            data: rgba_vtf([1, 2, 3, 255]),
+        },
+    ];
+
+    let package = build_source_material_package(
+        &["shared/test".to_owned()],
+        &resources,
+        None,
+        VtfImageSelection::default(),
+    )
+    .unwrap();
+
+    let material = &package.material_manifest.materials[0];
+    assert_eq!(
+        material
+            .textures
+            .iter()
+            .map(|texture| (
+                texture.role.as_str(),
+                texture.parameter.as_str(),
+                texture.semantic
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "baseTexture",
+                "$basetexture",
+                bsp_to_glb::TextureSemantic::Color
+            ),
+            (
+                "baseTexture2",
+                "$basetexture2",
+                bsp_to_glb::TextureSemantic::Color
+            ),
+            ("bumpMap", "$bumpmap", bsp_to_glb::TextureSemantic::Normal),
+            ("bumpMap2", "$bumpmap2", bsp_to_glb::TextureSemantic::Normal),
+            (
+                "blendModulateTexture",
+                "$blendmodulatetexture",
+                bsp_to_glb::TextureSemantic::Mask,
+            ),
+            (
+                "envMapMask",
+                "$envmapmask",
+                bsp_to_glb::TextureSemantic::Mask
+            ),
+            ("flowMap", "$flowmap", bsp_to_glb::TextureSemantic::Flow),
+        ]
+    );
+    let cubemap = &package.manifest.sources[0];
+    assert_eq!(cubemap.metadata.as_ref().unwrap().faces, 6);
+    assert_eq!(cubemap.strict_subresource_outputs.len(), 12);
+    assert!(
+        cubemap
+            .strict_subresource_outputs
+            .iter()
+            .any(|entry| entry.mip == 1)
+    );
+    assert!(
+        cubemap
+            .strict_subresource_outputs
+            .iter()
+            .any(|entry| entry.face == 5)
     );
 }
 

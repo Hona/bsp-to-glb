@@ -6,6 +6,7 @@ const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_VTF_DIMENSION: u32 = 16_384;
 const MAX_RESOURCES: usize = 32;
 const TEXTUREFLAGS_ENVMAP: u32 = 0x0000_4000;
+const TEXTUREFLAGS_SRGB: u32 = 0x0000_0040;
 const RESOURCE_NO_DATA_CHUNK: u8 = 0x02;
 const LOW_RES_IMAGE_RESOURCE: [u8; 3] = [0x01, 0, 0];
 const HIGH_RES_IMAGE_RESOURCE: [u8; 3] = [0x30, 0, 0];
@@ -93,8 +94,16 @@ pub struct VtfMetadata {
     pub faces: u8,
     pub mip_count: u8,
     pub flags: u32,
+    pub color_space: VtfColorSpace,
     pub format: VtfFormatMetadata,
     pub resources: Vec<VtfResourceMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VtfColorSpace {
+    Linear,
+    Srgb,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -508,7 +517,11 @@ fn parse_vtf(data: &[u8]) -> Result<ParsedVtf, VtfError> {
         )));
     }
     let faces = if flags & TEXTUREFLAGS_ENVMAP != 0 {
-        if version_minor < 1 { 6 } else { 7 }
+        if version_minor < 5 && start_frame != u16::MAX {
+            7
+        } else {
+            6
+        }
     } else {
         1
     };
@@ -523,6 +536,11 @@ fn parse_vtf(data: &[u8]) -> Result<ParsedVtf, VtfError> {
         faces,
         mip_count,
         flags,
+        color_space: if flags & TEXTUREFLAGS_SRGB != 0 {
+            VtfColorSpace::Srgb
+        } else {
+            VtfColorSpace::Linear
+        },
         format: VtfFormatMetadata {
             code: format_code,
             name: format.name(),

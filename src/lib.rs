@@ -30,19 +30,19 @@ pub use material_resolver::{
     MATERIAL_MOUNT_PLAN_VERSION, MaterialResolverLimits, MountedMaterialResolver,
 };
 pub use materials::{
-    EmbeddedResourceMetadata, MATERIAL_MANIFEST_VERSION, MATERIAL_TEXTURE_MANIFEST_VERSION,
-    ManifestResource, ManifestTexture, MaterialLimitations, MaterialResolver,
-    MaterialResourceProvenance, MaterialTextureArtifact, MaterialTextureManifest,
-    MaterialTextureOutput, MaterialTextureSource, PakResource, PakResourceKind,
-    ResolvedMaterialResource, ResourceProvenance, SourceMaterialEntry, SourceMaterialManifest,
-    SourceMaterialPackage, TextureDecodeStatus, UnresolvedAsset, UnsupportedMaterialFeatures,
-    VmtFeatures, VmtMaterial, VmtProxyDefinition, VmtProxyParameter, VmtShaderMetadata,
-    VmtTextureInputs, build_source_material_manifest, build_source_material_package, parse_vmt,
-    read_bsp_pak_resources,
+    BuiltInTextureBinding, EmbeddedResourceMetadata, MATERIAL_MANIFEST_VERSION,
+    MATERIAL_TEXTURE_MANIFEST_VERSION, ManifestResource, ManifestTexture, MaterialLimitations,
+    MaterialResolver, MaterialResourceProvenance, MaterialTextureArtifact, MaterialTextureManifest,
+    MaterialTextureOutput, MaterialTextureSource, MaterialTextureSubresourceOutput, PakResource,
+    PakResourceKind, ResolvedMaterialResource, ResourceProvenance, SourceMaterialEntry,
+    SourceMaterialManifest, SourceMaterialPackage, TextureDecodeStatus, TextureSemantic,
+    UnresolvedAsset, UnsupportedMaterialFeatures, VmtFeatures, VmtMaterial, VmtProxyDefinition,
+    VmtProxyParameter, VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
+    build_source_material_package, parse_vmt, read_bsp_pak_resources,
 };
 pub use vtf::{
-    DecodedVtf, VtfError, VtfErrorKind, VtfFormatMetadata, VtfImageSelection, VtfMetadata,
-    VtfResourceMetadata, decode_vtf, inspect_vtf, vtf_format_universe,
+    DecodedVtf, VtfColorSpace, VtfError, VtfErrorKind, VtfFormatMetadata, VtfImageSelection,
+    VtfMetadata, VtfResourceMetadata, decode_vtf, inspect_vtf, vtf_format_universe,
 };
 
 pub const BUILD_METADATA_SCHEMA_VERSION: u32 = 2;

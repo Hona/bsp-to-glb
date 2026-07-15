@@ -279,6 +279,11 @@ fn resolves_patch_include_insert_and_replace_case_insensitively() {
     let manifest =
         build_source_material_manifest(&["custom/child".to_owned()], &resources, None).unwrap();
     let material = manifest.materials[0].metadata.as_ref().unwrap();
+    assert_eq!(manifest.materials[0].dependencies.len(), 1);
+    assert_eq!(
+        manifest.materials[0].dependencies[0].lookup_path,
+        "materials/custom/base.vmt"
+    );
 
     assert_eq!(material.shader.name, "LIGHTMAPPEDGENERIC");
     assert_eq!(material.shader.family, "lightmappedGeneric");

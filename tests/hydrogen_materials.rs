@@ -75,7 +75,27 @@ fn hydrogen_pak_material_coverage_and_benchmark() {
         decoded + unsupported + invalid,
         package.manifest.sources.len()
     );
-    assert!(package.artifacts.len() <= decoded);
+    let packaged_subresources = package
+        .manifest
+        .sources
+        .iter()
+        .filter(|source| source.status == TextureDecodeStatus::Decoded)
+        .map(|source| source.strict_subresource_outputs.len())
+        .sum::<usize>();
+    assert_eq!(package.artifacts.len(), package.manifest.outputs.len());
+    assert!(package.artifacts.len() <= packaged_subresources);
+    assert!(package.manifest.sources.iter().all(|source| {
+        if source.status != TextureDecodeStatus::Decoded {
+            return source.strict_subresource_outputs.is_empty();
+        }
+        let metadata = source.metadata.as_ref().unwrap();
+        let expected = (0..metadata.mip_count)
+            .map(|mip| (metadata.depth >> mip).max(1) as usize)
+            .sum::<usize>()
+            * usize::from(metadata.frames)
+            * usize::from(metadata.faces);
+        source.strict_subresource_outputs.len() == expected
+    }));
     assert_eq!(parsed_manifest.materials.len(), material_names.len());
     assert_eq!(resources.len(), pak_resources.len());
     assert_eq!(resources.len(), pak_vmts + pak_vtfs);
