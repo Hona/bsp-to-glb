@@ -11,6 +11,7 @@ mod material_resolver;
 mod materials;
 pub mod phy;
 pub mod static_physics;
+pub mod studiomodel;
 mod vtf;
 
 pub use bsp_pak::{
@@ -45,6 +46,10 @@ pub use materials::{
     UnresolvedAsset, UnsupportedMaterialFeatures, VmtFeatures, VmtMaterial, VmtProxyDefinition,
     VmtProxyParameter, VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
     build_source_material_package, parse_vmt, read_bsp_pak_resources,
+};
+pub use studiomodel::{
+    STUDIO_MODEL_MDL_VERSIONS, STUDIO_MODEL_PACKAGE_VERSION, StudioModelExport, StudioModelInput,
+    StudioModelManifest, export_studio_model,
 };
 pub use vtf::{
     DecodedVtf, VtfColorSpace, VtfError, VtfErrorKind, VtfFormatMetadata, VtfImageSelection,
@@ -95,6 +100,7 @@ pub struct BuildComponentVersions {
     pub entity_graph: u32,
     pub static_physics: u32,
     pub decal_overlays: u32,
+    pub studio_model: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -130,7 +136,7 @@ pub fn build_metadata() -> BuildMetadata {
             bsp_pak_archive: BuildCapabilityStatus::Supported,
             vtf_pixel_conversion: BuildCapabilityStatus::Supported,
             prop_metadata: BuildCapabilityStatus::Supported,
-            prop_geometry: BuildCapabilityStatus::Unsupported,
+            prop_geometry: BuildCapabilityStatus::Supported,
             brush_collision: BuildCapabilityStatus::Supported,
             decoded_physics_collision: BuildCapabilityStatus::Supported,
             visibility: BuildCapabilityStatus::Supported,
@@ -149,7 +155,21 @@ pub fn build_metadata() -> BuildMetadata {
             entity_graph: ENTITY_GRAPH_VERSION,
             static_physics: static_physics::STATIC_PHYSICS_SCHEMA_VERSION,
             decal_overlays: DECAL_OVERLAY_SIDECAR_VERSION,
+            studio_model: STUDIO_MODEL_PACKAGE_VERSION,
         },
+    }
+}
+
+#[cfg(test)]
+mod studio_model_capability_tests {
+    use super::{BuildCapabilityStatus, build_metadata};
+
+    #[test]
+    fn build_metadata_requires_native_studio_model_geometry() {
+        assert!(matches!(
+            build_metadata().capabilities.prop_geometry,
+            BuildCapabilityStatus::Supported
+        ));
     }
 }
 

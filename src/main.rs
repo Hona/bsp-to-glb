@@ -1,19 +1,20 @@
 use bsp_to_glb::static_physics::{StaticPhysicsLimits, export_bsp_static_physics};
 use bsp_to_glb::{
     CollisionExportInput, ExportOptions, LightmapSet, MaterialResolver, MountedMaterialResolver,
-    VtfImageSelection, build_metadata, encode_lightmap_png, export_bsp_with_material_resolver,
-    export_bsp_with_material_resolver_and_visibility,
+    StudioModelInput, VtfImageSelection, build_metadata, encode_lightmap_png,
+    export_bsp_with_material_resolver, export_bsp_with_material_resolver_and_visibility,
     export_bsp_with_options_and_material_resolver,
     export_bsp_with_options_and_material_resolver_and_visibility, export_collision_sidecar,
-    export_entity_graph, read_bsp_pak_archive, static_prop_collision_inputs,
+    export_entity_graph, export_studio_model, read_bsp_pak_archive, static_prop_collision_inputs,
 };
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--decal-overlays-out <map.decal-overlays.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--decal-overlays-out <map.decal-overlays.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --studio-source-path <models/model.mdl> --studio-mdl <model.mdl> --studio-vvd <model.vvd> --studio-vtx <model.dx90.vtx> [--studio-ani <model.ani>] [--studio-phy <model.phy>] [--studio-skin <index>] --studio-out <model.glb> --studio-manifest <model.json>\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -54,6 +55,122 @@ fn manifest_uri(path: &Path, manifest_path: Option<&Path>) -> String {
         .replace('\\', "/")
 }
 
+fn run_studio_model(args: &[OsString]) -> Result<(), String> {
+    const MAX_STUDIO_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+    const MAX_STUDIO_SOURCE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+    let mut values = std::collections::BTreeMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index]
+            .to_str()
+            .ok_or_else(|| "StudioModel option is not valid UTF-8".to_owned())?;
+        if !matches!(
+            flag,
+            "--studio-source-path"
+                | "--studio-mdl"
+                | "--studio-vvd"
+                | "--studio-vtx"
+                | "--studio-ani"
+                | "--studio-phy"
+                | "--studio-skin"
+                | "--studio-out"
+                | "--studio-manifest"
+        ) {
+            return Err(format!("unknown StudioModel argument: {flag}\n{}", usage()));
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for {flag}\n{}", usage()))?;
+        if values.insert(flag.to_owned(), value.clone()).is_some() {
+            return Err(format!("duplicate StudioModel argument: {flag}"));
+        }
+        index += 2;
+    }
+    let required = |flag: &str| {
+        values
+            .get(flag)
+            .cloned()
+            .ok_or_else(|| format!("missing required StudioModel argument: {flag}"))
+    };
+    let source_path = required("--studio-source-path")?
+        .into_string()
+        .map_err(|_| "StudioModel source path is not valid UTF-8".to_owned())?;
+    let mdl_path = PathBuf::from(required("--studio-mdl")?);
+    let vvd_path = PathBuf::from(required("--studio-vvd")?);
+    let vtx_path = PathBuf::from(required("--studio-vtx")?);
+    let output_path = PathBuf::from(required("--studio-out")?);
+    let manifest_path = PathBuf::from(required("--studio-manifest")?);
+    let mut source_total = 0_u64;
+    let mut read = |path: &Path, role: &str| {
+        let byte_length = fs::metadata(path)
+            .map_err(|error| format!("failed to inspect {role} {}: {error}", path.display()))?
+            .len();
+        source_total = source_total
+            .checked_add(byte_length)
+            .ok_or_else(|| "StudioModel source byte total overflows".to_owned())?;
+        if byte_length > MAX_STUDIO_SOURCE_BYTES || source_total > MAX_STUDIO_SOURCE_TOTAL_BYTES {
+            return Err(format!(
+                "StudioModel {role} source exceeds bounded input limits: {} bytes",
+                path.display()
+            ));
+        }
+        fs::read(path).map_err(|error| format!("failed to read {role} {}: {error}", path.display()))
+    };
+    let mdl = read(&mdl_path, "MDL")?;
+    let vvd = read(&vvd_path, "VVD")?;
+    let vtx = read(&vtx_path, "VTX")?;
+    let ani = values
+        .get("--studio-ani")
+        .map(PathBuf::from)
+        .map(|path| read(&path, "ANI"))
+        .transpose()?;
+    let phy = values
+        .get("--studio-phy")
+        .map(PathBuf::from)
+        .map(|path| read(&path, "PHY"))
+        .transpose()?;
+    let skin = values
+        .get("--studio-skin")
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "StudioModel skin is not valid UTF-8".to_owned())?
+                .parse::<usize>()
+                .map_err(|_| "StudioModel skin must be a non-negative integer".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let exported = export_studio_model(&StudioModelInput {
+        source_path: &source_path,
+        mdl: &mdl,
+        vvd: &vvd,
+        vtx: &vtx,
+        ani: ani.as_deref(),
+        phy: phy.as_deref(),
+        skin,
+    })?;
+    let mut manifest = serde_json::to_vec_pretty(&exported.manifest)
+        .map_err(|error| format!("failed to serialize StudioModel manifest: {error}"))?;
+    manifest.push(b'\n');
+    write(&output_path, &exported.glb)?;
+    write(&manifest_path, &manifest)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "sourcePath": exported.manifest.source_path,
+            "packageContentHash": exported.manifest.package_content_hash,
+            "glbBytes": exported.glb.len(),
+            "sourceFiles": exported.manifest.source_files.len(),
+            "bodyParts": exported.manifest.body_parts.len(),
+            "bones": exported.manifest.bones.len(),
+            "animations": exported.manifest.animations.len(),
+            "sequences": exported.manifest.sequences.len(),
+            "attachments": exported.manifest.attachments.len(),
+        })
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut bsp_path: Option<PathBuf> = None;
     let mut output_path: Option<PathBuf> = None;
@@ -88,6 +205,9 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("failed to serialize build metadata: {error}"))?
         );
         return Ok(());
+    }
+    if args.iter().any(|argument| argument == "--studio-mdl") {
+        return run_studio_model(&args);
     }
     let mut index = 0;
     while index < args.len() {

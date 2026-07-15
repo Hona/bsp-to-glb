@@ -73,6 +73,21 @@ fn version_json_is_stable_machine_readable_build_metadata() {
     assert_eq!(metadata["capabilities"]["overlays"], "detectedOnly");
     assert_eq!(metadata["capabilities"]["waterOverlays"], "detectedOnly");
     assert_eq!(metadata["components"]["decalOverlays"], 1);
-    assert_eq!(metadata["capabilities"]["propGeometry"], "unsupported");
+    assert_eq!(metadata["capabilities"]["propGeometry"], "supported");
+    assert_eq!(metadata["components"]["studioModel"], 1);
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn studio_model_cli_rejects_unknown_namespaced_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
+        .args(["--studio-mdl", "model.mdl", "--studio-unknown", "value"])
+        .output()
+        .expect("bsp-to-glb should run");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unknown StudioModel argument: --studio-unknown")
+    );
 }
