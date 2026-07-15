@@ -1857,6 +1857,56 @@ fn cli_writes_requested_versioned_material_sidecar() {
 }
 
 #[test]
+fn cli_rejects_render_outputs_without_render_geometry() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "bsp-to-glb-render-output-test-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let bsp_path = directory.join("fixture.bsp");
+    fs::write(&bsp_path, synthetic_bsp(false)).unwrap();
+
+    for (index, (flag, file_name)) in [
+        ("--material-manifest", "materials.json"),
+        ("--props-out", "props.json"),
+        ("--lightmap-atlas", "lightmap.png"),
+        ("--lightmap-manifest", "lightmaps.json"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let requested_path = directory.join(file_name);
+        let entities_path = directory.join(format!("entities-{index}.json"));
+        let output = Command::new(env!("CARGO_BIN_EXE_bsp-to-glb"))
+            .args([
+                "--bsp",
+                bsp_path.to_str().unwrap(),
+                "--entities-out",
+                entities_path.to_str().unwrap(),
+                flag,
+                requested_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{flag} was silently ignored");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!("{flag} requires --out")),
+            "unexpected {flag} error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!requested_path.exists());
+        assert!(!entities_path.exists());
+    }
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn cli_rejects_a_decal_sidecar_without_render_output() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

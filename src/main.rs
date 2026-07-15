@@ -185,6 +185,18 @@ fn run() -> Result<(), String> {
     if output_path.is_none() && decal_overlay_output_path.is_some() {
         return Err("--decal-overlays-out requires --out".to_owned());
     }
+    if output_path.is_none() && material_manifest_path.is_some() {
+        return Err("--material-manifest requires --out".to_owned());
+    }
+    if output_path.is_none() && props_output_path.is_some() {
+        return Err("--props-out requires --out".to_owned());
+    }
+    if output_path.is_none() && atlas_path.is_some() {
+        return Err("--lightmap-atlas requires --out".to_owned());
+    }
+    if output_path.is_none() && manifest_path.is_some() {
+        return Err("--lightmap-manifest requires --out".to_owned());
+    }
     if texture_output_path.is_none() && texture_manifest_path.is_some() {
         return Err("--texture-manifest requires --texture-output".to_owned());
     }
